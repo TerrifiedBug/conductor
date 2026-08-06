@@ -255,8 +255,16 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
       cwd: worktreePath,
       caps,
       sessionDir,
+      ...(project.workerModel === undefined ? {} : { model: project.workerModel }),
       onTurn: (n) => store.updateRun(runId, { turns: n }),
     });
+
+    // A configured model the harness could not honour means this run was done by
+    // a different model than the operator chose. Logged per run, because it is
+    // the only place that fact is still attached to the issue it affected.
+    if (result.modelFallbackMessage !== undefined) {
+      log(`#${issue} model fallback: ${result.modelFallbackMessage}`);
+    }
 
     store.updateRun(runId, {
       state: result.state,
@@ -395,13 +403,9 @@ async function tick(d: Deps): Promise<void> {
   }
 
   const active = store.activeRuns(project.name);
-  let slots = caps.maxConcurrentWorkers - active.length;
-  let dayBudget = caps.maxIssuesPerDay - store.runsStartedSince(project.name, since);
-  if (slots <= 0 || dayBudget <= 0) {
-    log(
-      `at capacity: ${active.length}/${caps.maxConcurrentWorkers} workers, ` +
-        `${caps.maxIssuesPerDay - dayBudget}/${caps.maxIssuesPerDay} issues today`,
-    );
+  const slots = caps.maxConcurrentWorkers - active.length;
+  if (slots <= 0) {
+    log(`at capacity: ${active.length}/${caps.maxConcurrentWorkers} workers`);
     return;
   }
 
@@ -411,7 +415,7 @@ async function tick(d: Deps): Promise<void> {
 
   const admitted: { r: Routed; attempt: number }[] = [];
   for (const r of routed) {
-    if (slots <= 0 || dayBudget <= 0) break;
+    if (admitted.length >= slots) break;
     if (busy.has(r.issue.number)) continue;
 
     const prior = store.attemptsFor(project.name, r.issue.number);
@@ -432,8 +436,6 @@ async function tick(d: Deps): Promise<void> {
     }
 
     admitted.push({ r, attempt: prior + 1 });
-    slots -= 1;
-    dayBudget -= 1;
   }
 
   if (admitted.length === 0) return;
@@ -488,7 +490,7 @@ export function formatStatus(s: StatusSnapshot): string {
     "",
     "caps",
     `  workers            ${s.activeRuns.length} / ${s.caps.maxConcurrentWorkers}`,
-    `  issues today       ${s.runsToday} / ${s.caps.maxIssuesPerDay}`,
+    `  issues today       ${s.runsToday}`,
     `  spend today        $${s.spendTodayUsd.toFixed(2)} / $${s.caps.dailySpendUsd.toFixed(2)}`,
     `  worker max turns   ${s.caps.workerMaxTurns}`,
     `  worker wall clock  ${Math.round(s.caps.workerWallClockMs / 60_000)}m`,

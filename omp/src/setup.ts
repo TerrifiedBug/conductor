@@ -25,6 +25,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { configPath, resolveCaps, stateDir } from "./config.ts";
 import {
+  CONFIG_VERSION,
   DEFAULT_CAPS,
   type Caps,
   type ConductorConfig,
@@ -48,6 +49,12 @@ export interface SetupAnswers {
   routingLabelPrefix: string;
   targetRepos: { name: string; cloneUrl: string; defaultBranch: string; gates: { cmd: string; cwd: string }[] }[];
   caps: Partial<Caps>;
+  /**
+   * Model pattern for worker sessions, in omp's model/role syntax. Absent means
+   * the harness default, which is the answer for anyone who has not deliberately
+   * pinned one.
+   */
+  workerModel?: string;
   telegramChatId?: string;
   fallbackToIssueComment: boolean;
   /** How loud the supervising orchestrator session should be. */
@@ -347,6 +354,9 @@ function buildProject(a: SetupAnswers): ProjectConfig {
     stateLabels: { ...a.stateLabels },
     routing: { labelPrefix: a.routingLabelPrefix, repos },
     caps,
+    ...(a.workerModel !== undefined && a.workerModel.trim().length > 0
+      ? { workerModel: a.workerModel.trim() }
+      : {}),
     escalation,
     reporting: { scope: a.reportScope },
     // Both under the state dir so one `rm -rf ~/.omp/conductor` is a complete
@@ -369,7 +379,7 @@ export function buildConfig(a: SetupAnswers, existing?: ConductorConfig): Conduc
   const previous = existing?.projects ?? [];
 
   return {
-    version: 1,
+    version: CONFIG_VERSION,
     // Answered caps land on the project, not here: on a re-run the global block
     // is also the baseline every other project inherits, and one project's
     // answers must never quietly re-budget its neighbour. An existing global
@@ -585,6 +595,9 @@ export function summarisePlan(
   for (const [key, value] of Object.entries(effective)) {
     const answered = Object.hasOwn(project.caps, key) ? "  (answered)" : "";
     lines.push(`  ${key.padEnd(22)}${String(value)}${answered}`);
+  }
+  if (a.workerModel !== undefined && a.workerModel.trim().length > 0) {
+    lines.push(`  ${"worker model".padEnd(22)}${a.workerModel.trim()}  (answered)`);
   }
 
   lines.push("", "escalation");

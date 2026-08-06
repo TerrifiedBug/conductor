@@ -346,7 +346,7 @@ async function collectAnswers(
   const caps: Partial<Caps> = { ...prior?.caps };
   const tuneCaps = await ctx.ui.confirm(
     "Caps",
-    `Defaults: ${DEFAULT_CAPS.maxConcurrentWorkers} workers, ${DEFAULT_CAPS.maxIssuesPerDay} issues/day, ` +
+    `Defaults: ${DEFAULT_CAPS.maxConcurrentWorkers} workers, ` +
       `$${DEFAULT_CAPS.dailySpendUsd}/day, ${DEFAULT_CAPS.workerMaxTurns} turns and ` +
       `${Math.round(DEFAULT_CAPS.workerWallClockMs / 60000)} min per worker, ` +
       `${DEFAULT_CAPS.maxAttemptsPerIssue} attempts per issue. Change them?`,
@@ -358,11 +358,6 @@ async function collectAnswers(
       ctx,
       "Max concurrent workers",
       caps.maxConcurrentWorkers ?? DEFAULT_CAPS.maxConcurrentWorkers,
-    );
-    caps.maxIssuesPerDay = await askNumber(
-      ctx,
-      "Max issues claimed per rolling day",
-      caps.maxIssuesPerDay ?? DEFAULT_CAPS.maxIssuesPerDay,
     );
     caps.dailySpendUsd = await askNumber(ctx, "Spend ceiling per rolling day (USD)", caps.dailySpendUsd ?? DEFAULT_CAPS.dailySpendUsd);
     caps.workerMaxTurns = await askNumber(ctx, "Turn ceiling per worker", caps.workerMaxTurns ?? DEFAULT_CAPS.workerMaxTurns);
@@ -377,6 +372,15 @@ async function collectAnswers(
       caps.maxAttemptsPerIssue ?? DEFAULT_CAPS.maxAttemptsPerIssue,
     );
   }
+
+  // Outside the caps block: a model is not a ceiling, and an operator who left
+  // the caps alone may still want workers on a cheaper model.
+  const answeredModel = await ask(
+    ctx,
+    "Worker model pattern (blank = harness default)",
+    prior?.workerModel ?? "",
+  );
+  const workerModel = answeredModel.trim().length > 0 ? answeredModel.trim() : undefined;
 
   const telegram = detectTelegram();
   let telegramChatId = prior?.escalation.telegramChatId;
@@ -421,6 +425,7 @@ async function collectAnswers(
     writeOrchestratorBrief: false,
   };
   if (telegramChatId !== undefined) answers.telegramChatId = telegramChatId;
+  if (workerModel !== undefined) answers.workerModel = workerModel;
   return { ...answers, writeOrchestratorBrief: await askOrchestratorBrief(ctx, answers) };
 }
 

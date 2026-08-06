@@ -163,15 +163,53 @@ test("the brief defaults to never releasing, and says the section is the operato
   const text = renderOrchestratorBrief(answers());
 
   // The package's own boundary: whatever an operator writes later, the shipped
-  // default must never read as permission to release.
+  // default must never read as permission to release or to merge.
   expect(text).toContain("## Releases (yours to define)");
-  expect(text).toContain("never tag, pin, deploy,");
+  expect(text).toContain("**Default: humans release, and you do not merge.**");
   expect(text).toContain("YOURS TO EDIT");
   // And the fixed half stays fixed: duties, tiers, evidence.
   expect(text).toContain("## Duty 1 — drain");
   expect(text).toContain("## Duty 2 — groom");
   expect(text).toContain("## Duty 3 — report");
   expect(text).toContain("Every claim cites evidence");
+});
+
+test("a worker's release prohibition is fixed, while the orchestrator's is policy", () => {
+  const text = renderOrchestratorBrief(answers());
+  const banner = text.indexOf("YOURS TO EDIT");
+  const fixed = text.slice(0, banner);
+  const editable = text.slice(banner);
+
+  // A worker sees one issue, so it can never judge a release. That has to sit above
+  // the banner, where an operator rewriting their own policy cannot reach it.
+  expect(fixed).toContain("Workers stop at a green PR.");
+  expect(fixed).toContain("delegated downward");
+  // The concurrency invariant binds whoever merges, so it is fixed too — otherwise
+  // a delegated release could land two PRs at once and clobber them.
+  expect(fixed).toContain("PRs land one at a time");
+
+  // The orchestrator's own authority is deliberately NOT a hard boundary: an
+  // operator who delegates releases must be able to say so without the brief
+  // contradicting itself, and the Learning loop forbids relaxing hard boundaries.
+  expect(fixed).toContain("**Your own** merge and release authority is not decided here.");
+  expect(editable).toContain("it is the only place your merge");
+});
+
+test("the rendered brief ships the amendment protocol above the operator's half", () => {
+  const text = renderOrchestratorBrief(answers());
+
+  // The loop is only self-amending if the protocol is in the shipped half: an
+  // operator who rewrites their own sections must not be able to delete it.
+  expect(text).toContain("## Learning loop");
+  expect(text.indexOf("## Learning loop")).toBeLessThan(text.indexOf("YOURS TO EDIT"));
+  // Approval is the whole safety property — an unapproved self-edit is a session
+  // rewriting its own boundaries.
+  expect(text).toContain("single yes/no question");
+  expect(text).toContain("## Amendments");
+  // Hard boundaries stay hand-edited, or the loop can widen its own mandate.
+  expect(text).toContain("You never propose relaxing **Hard boundaries**");
+  // A human's question is answered as a question, not folded into tick narration.
+  expect(text).toContain("## Human messages");
 });
 
 test("the brief names the chosen scope while still spelling both out", () => {
@@ -257,7 +295,7 @@ test("the plan shows effective caps, marking the ones that were answered", () =>
   expect(text).toContain("maxConcurrentWorkers");
   expect(text).toMatch(/maxConcurrentWorkers\s+5\s+\(answered\)/);
   // Unanswered caps still show, at the shipped default, so nothing is implicit.
-  expect(text).toMatch(new RegExp(`maxIssuesPerDay\\s+${DEFAULT_CAPS.maxIssuesPerDay}$`, "m"));
+  expect(text).toMatch(new RegExp(`workerMaxTurns\\s+${DEFAULT_CAPS.workerMaxTurns}$`, "m"));
 });
 
 test("the plan names both reporting answers, so neither is applied unseen", () => {
