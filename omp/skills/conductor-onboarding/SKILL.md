@@ -130,8 +130,8 @@ Not "can it release" — *where does its leg stop*. A boundary you cannot state 
 one sentence is not a boundary, and an orchestrator with a vague release mandate
 is one that eventually publishes something at 03:00.
 
-Give them a worked answer so they can calibrate. The Veltro deployment's answer:
-**the agent's leg ends at the merged suite pin.** It may open and land the PR that
+Give them a worked answer so they can calibrate. One real deployment's answer:
+**the agent's leg ends at the merged version pin.** It may open and land the PR that
 bumps the module image tags, because that artefact is reviewable, reversible by a
 revert, and its correctness is checkable by a named CI check. Deploying that pin
 to prod is **operator territory** — it needs a person who can watch it, and who
@@ -275,7 +275,8 @@ has a safe fleet. Your job is to raise it to *this* fleet.
 The file has a hard line in it — an HTML comment banner reading
 `YOURS TO EDIT`. Respect it in both directions:
 
-**Above the banner — leave it alone.** Duties (drain, groom, report), the
+**Above the banner — leave it alone.** The three duties — drain (unstick what is
+stuck), groom (keep the queue worth draining), report — the
 escalation-tier table, and the hard boundaries describe how the package already
 behaves. Rewriting them makes the brief disagree with the code, and the code wins.
 The evidence rule in particular is not negotiable: *every claim cites evidence — a
@@ -451,8 +452,5 @@ real ticks.** Bring three things to that review — the escalations that arrived
 the issues that came back unroutable, and any tick where the report was either
 noise or a surprise. Each of those maps to one line in the brief.
 
-That loop is currently manual, and productising it is the known next step:
-[issue #12](https://github.com/TerrifiedBug/conductor/issues/12) proposes a v2 where
-the daily digest itself **proposes brief amendments** from observed friction —
-repeated skip reasons, recurring unroutable patterns — for the operator to approve.
-Until then, the review is a calendar entry. Suggest they make one.
+That loop is manual today: nothing watches for those signals, and nothing drafts
+the amendment for them. So the review is a calendar entry. Suggest they make one.

@@ -119,7 +119,7 @@ and create any missing labels):
 | Key | Meaning |
 | --- | --- |
 | `tracker.repo` | The **one** `owner/repo` whose issue list is the queue. This is your planning repo — it does not have to contain any code. |
-| `queueLabel` | Open issues in `tracker.repo` carrying this label (default `ready-for-agent`) are the work queue. Nothing else is ever read. |
+| `queueLabel` | Open issues in `tracker.repo` carrying this label are the work queue. Nothing else is ever read. Required: the wizard pre-fills `ready-for-agent`, but a config that omits the key is rejected, not defaulted. |
 | `routing.repos` + `repo:<name>` labels | Each queued issue must also carry exactly one routing label naming which code repo the work lands in. The conductor cuts the worktree and PR there, from `routing.repos[name].cloneUrl`. An issue with zero or two routing labels is reported as unroutable and skipped — never guessed. |
 
 So: one tracker repo supplies the queue, routing labels fan issues out to any
@@ -499,13 +499,13 @@ it never gets prompted, so it never runs anything — installing
 
 The heartbeat is **inert unless the session's cwd contains
 `.conductor-tick.json`**, so it costs an ordinary session nothing. Drop the file
-in the orchestrator's working directory (on the fleet host, `/root/fleet`):
+in the orchestrator's working directory:
 
 ```json
 {
   "intervalSeconds": 900,
   "armedFile": "state/armed",
-  "accessFile": "/root/.omp/agent/telegram/access.json",
+  "accessFile": "/home/fleet/.omp/agent/telegram/access.json",
   "message": "Run your standing loop from ORCHESTRATOR.md now."
 }
 ```
