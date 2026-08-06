@@ -69,15 +69,36 @@ second, explicit confirmation. It is a starting point, not a contract:
 | Reporting | **Yours**, seeded from the scope you chose in setup. |
 
 Reporting is the one half of that the config also knows about, because the wizard
-has to ask something in order to seed the brief:
+has to ask something in order to seed the brief — and the one half the runtime
+acts on:
 
-| `reporting.scope` | What the orchestrator says unprompted |
-| --- | --- |
-| `material` (default) | Escalations, plus every material event: a run reaching a green PR, a run that failed twice, an issue pulled off the queue, a cap that stopped the fleet. |
-| `escalations` | Escalations when they happen, plus one daily digest. Silent otherwise. |
+| `reporting.scope` | What the orchestrator says unprompted | The line every tick carries |
+| --- | --- | --- |
+| `material` (default) | Escalations, plus every material event: a run reaching a green PR, a run that failed twice, an issue pulled off the queue, a cap that stopped the fleet. | `Report material events per your brief.` |
+| `escalations` | Escalations when they happen, plus one daily digest. Silent otherwise. | `Report NOTHING this turn except a Tier 1/2 escalation or a release you cut; everything else waits for the daily digest.` |
 
-Changing the key later does not rewrite an `ORCHESTRATOR.md` you already have —
-edit its Reporting section too, or the session keeps honouring what it was handed.
+**What the scope does:** the [orchestrator heartbeat](#orchestrator-tick) appends
+that line to every tick it sends, so the reporting contract arrives with the
+prompt instead of only in a brief the session read hours ago. It is re-read from
+`~/.omp/conductor/config.json` on **every** tick, so turning the volume up or
+down — `/conductor setup` again, or an edit to the file — binds the next tick
+without restarting the session. Three cases fall back to `material`: no config
+yet, an unreadable or invalid one, and several projects with none named — the
+same ambiguity `status` refuses to guess through. Stopping the heartbeat over a
+reporting preference would be the worse trade, so it ticks on the default and
+logs the reason once.
+
+**What it does not do:** there is no hard outbound filter. Nothing inspects the
+orchestrator's messages and drops the ones your scope did not ask for, so a
+session that ignores its constraint line still reaches you. Scope is a
+constraint the model is handed each turn, not a gate it is held to — the
+enforcement roadmap (a tool-call tripwire, and config-versus-behaviour drift in
+the daily digest) is
+[issue #4](https://github.com/TerrifiedBug/conductor/issues/4).
+
+Changing the key later does not rewrite an `ORCHESTRATOR.md` you already have:
+the tick line changes, the brief does not. Edit its Reporting section too, or the
+session is carrying two versions of your policy.
 
 ## Where issues come from
 
@@ -409,7 +430,7 @@ Field notes:
 | `gates` | The exact cheap commands CI also runs, each with the `cwd` it runs from (`cwd` defaults to `.`). Running the real gate locally is what makes an unattended push safe — a subset lets an error outside the source dir reach the runners. |
 | `caps` | Per-project overrides; omit it or pin only the fields you want to change. |
 | `escalation.fallbackToIssueComment` | Defaults to `true`. Absent means "yes, still tell me". |
-| `reporting.scope` | Optional; `"material"` (default) or `"escalations"` — see [Your workflow vs. the package](#your-workflow-vs-the-package). A config written without the key keeps reporting material events. Any other value is an error, never folded to the default. |
+| `reporting.scope` | Optional; `"material"` (default) or `"escalations"`. Every orchestrator tick appends the matching constraint line to its prompt, re-read from this file each tick — see [Your workflow vs. the package](#your-workflow-vs-the-package). It constrains what the session is told to report; it is not an outbound filter. A config written without the key keeps reporting material events. Any other value is an error, never folded to the default. |
 | `workspaceRoot` / `mirrorRoot` | Optional; default to `worktrees/` and `mirrors/` under the state directory. `~` is expanded. |
 
 Prefer an SSH `cloneUrl`, or an https URL backed by a credential helper. A clone URL
@@ -441,11 +462,14 @@ in the orchestrator's working directory (on the fleet host, `/root/fleet`):
 | `intervalSeconds` | yes | — | Whole seconds between ticks, minimum `60`. A tick costs a full turn of a frontier model, so a sub-minute period is refused rather than obeyed. |
 | `armedFile` | no | none — the gate passes | Path to the arm marker. A tick does nothing while the file is missing. Relative paths resolve against the session cwd, so `state/armed` means `<cwd>/state/armed`. |
 | `accessFile` | no | none — the gate passes | Path to the Telegram bridge's `access.json`. Every tick re-reads it and requires `enabled: true` with exactly one entry in `allowFrom`. Relative paths resolve against the session cwd. **Configure this on any fleet deploy** — see below. |
-| `message` | no | `Tick <ISO timestamp>: run your standing loop from ORCHESTRATOR.md now. Report only material events.` | Sent verbatim when set. The default carries the timestamp, which is what makes two consecutive ticks distinguishable in the session log. |
+| `message` | no | `Tick <ISO timestamp>: run your standing loop from ORCHESTRATOR.md now.` followed by the `reporting.scope` line | Sent verbatim when set — and then it owns the whole contract: no scope line is appended to a prompt you wrote yourself. The default carries the timestamp, which is what makes two consecutive ticks distinguishable in the session log. |
 
 A tick sends one message (`customType` `omp-conductor.tick`, attributed to the
-user) and starts a turn if the session is idle; while a turn is streaming it is
-queued as a follow-up and consumed when that turn ends. It sends **nothing** when:
+user): the standing-loop prompt, plus the one constraint line the project's
+[`reporting.scope`](#your-workflow-vs-the-package) resolves to, re-read from the
+conductor config on every tick. It starts a turn if the session is idle; while a
+turn is streaming it is queued as a follow-up and consumed when that turn ends.
+It sends **nothing** when:
 
 - `/conductor pause` (or `omp-conductor pause`) holds the pause flag — the same
   flag the dispatch loop reads, so pausing the fleet pauses its heartbeat;
@@ -479,7 +503,10 @@ Every tick — sent or skipped — is logged with its reason (`paused`, `not arm
 deliberately silent in the UI: a paused fleet would otherwise raise a notification
 every interval, forever. The one exception is a malformed `.conductor-tick.json`,
 which notifies once at session start and leaves the heartbeat off; silent failure
-there is the failure mode the heartbeat exists to prevent.
+there is the failure mode the heartbeat exists to prevent. A conductor config that
+cannot supply a reporting scope logs `tick reporting scope: using material` once
+per session — once, not once per interval, because the file is unlikely to fix
+itself between two ticks.
 
 ## CLI reference
 

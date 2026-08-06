@@ -12,15 +12,18 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { configPath, stateDir } from "./config.ts";
 import { setPaused } from "./daemon.ts";
 import orchestratorTickExtension, {
   MIN_INTERVAL_SECONDS,
   readTickConfig,
   TICK_CONFIG_FILE,
   TICK_CUSTOM_TYPE,
+  TICK_SCOPE_CONSTRAINTS,
   defaultTickMessage,
   tickDecision,
 } from "./orchestrator-tick.ts";
+import type { ReportScope } from "./types.ts";
 
 const HOME_KEY = "OMP_CONDUCTOR_HOME";
 
@@ -332,6 +335,9 @@ test("firing the captured callback sends one tick with the documented delivery",
 
 test("a configured message is sent verbatim in place of the default", () => {
   writeTickConfig({ intervalSeconds: 600, message: "loop now" });
+  // A scope that would otherwise append a line of its own: an operator who
+  // wrote their own prompt gets exactly that prompt, contract included.
+  writeConductorConfig({ name: "fleet", scope: "escalations" });
   const pi = fakeHost();
   orchestratorTickExtension(pi);
   pi.start();
@@ -342,8 +348,10 @@ test("a configured message is sent verbatim in place of the default", () => {
 
 test("the default message carries the tick timestamp", () => {
   const at = new Date("2026-08-06T12:00:00.000Z");
+  // No reporting clause of its own: the scope line below owns that contract, and
+  // two spellings of it would contradict each other inside one prompt.
   expect(defaultTickMessage(at)).toBe(
-    "Tick 2026-08-06T12:00:00.000Z: run your standing loop from ORCHESTRATOR.md now. Report only material events.",
+    "Tick 2026-08-06T12:00:00.000Z: run your standing loop from ORCHESTRATOR.md now.",
   );
 });
 
@@ -511,4 +519,116 @@ test("an unconfigured accessFile leaves the channel gate open", () => {
 
   pi.fire();
   expect(pi.sent).toHaveLength(1);
+});
+
+// --------------------------------------------------------- reporting scope
+//
+// The scope comes from the conductor config (`$OMP_CONDUCTOR_HOME/config.json`),
+// not from `.conductor-tick.json`, and is read again on every tick: an operator
+// re-runs `/conductor setup` while the orchestrator session lives.
+
+/** A conductor config the loader accepts, carrying the scope under test. */
+function writeConductorConfig(...projects: { name: string; scope?: ReportScope }[]): void {
+  mkdirSync(stateDir(), { recursive: true });
+  writeFileSync(
+    configPath(),
+    JSON.stringify({
+      version: 1,
+      projects: projects.map((p) => ({
+        name: p.name,
+        tracker: { kind: "github", repo: `acme/${p.name}` },
+        queueLabel: "ready-for-agent",
+        routing: { repos: { api: { cloneUrl: "git@github.com:acme/api.git" } } },
+        ...(p.scope === undefined ? {} : { reporting: { scope: p.scope } }),
+      })),
+    }),
+  );
+}
+
+/** An armed, unpaused session whose only variable is the conductor config. */
+function scopeHost() {
+  writeTickConfig({ intervalSeconds: 600 });
+  const pi = fakeHost();
+  orchestratorTickExtension(pi);
+  pi.start();
+  return pi;
+}
+
+test("both constraint lines are pinned verbatim: they are the contract the turn reads", () => {
+  expect(TICK_SCOPE_CONSTRAINTS.material).toBe("Report material events per your brief.");
+  expect(TICK_SCOPE_CONSTRAINTS.escalations).toBe(
+    "Report NOTHING this turn except a Tier 1/2 escalation or a release you cut; everything else waits for the daily digest.",
+  );
+});
+
+test("scope escalations sends the silence-by-default line, and only that one", () => {
+  writeConductorConfig({ name: "fleet", scope: "escalations" });
+  const pi = scopeHost();
+
+  pi.fire();
+  const content = pi.sent[0]?.message.content ?? "";
+  expect(content).toContain(TICK_SCOPE_CONSTRAINTS.escalations);
+  expect(content).not.toContain(TICK_SCOPE_CONSTRAINTS.material);
+  // Appended to the standing prompt, not in place of it.
+  expect(content).toContain("ORCHESTRATOR.md");
+});
+
+test("scope material — and a config written before the key existed — send the material line", () => {
+  writeConductorConfig({ name: "fleet", scope: "material" });
+  const pi = scopeHost();
+
+  pi.fire();
+  expect(pi.sent[0]?.message.content).toContain(TICK_SCOPE_CONSTRAINTS.material);
+
+  writeConductorConfig({ name: "fleet" });
+  pi.fire();
+  expect(pi.sent[1]?.message.content).toContain(TICK_SCOPE_CONSTRAINTS.material);
+});
+
+test("no conductor config at all: the tick still fires on the default scope, and says so once", () => {
+  // `$OMP_CONDUCTOR_HOME` is an empty temp directory — `loadConfig()` throws.
+  const pi = scopeHost();
+
+  expect(() => pi.fire()).not.toThrow();
+  expect(pi.sent[0]?.message.content).toContain(TICK_SCOPE_CONSTRAINTS.material);
+
+  pi.fire();
+  expect(pi.sent).toHaveLength(2);
+  expect(pi.sent[1]?.message.content).toContain(TICK_SCOPE_CONSTRAINTS.material);
+  // One line per session about the missing config, not one per interval forever.
+  expect(pi.logs.filter((l) => l.includes("tick reporting scope"))).toHaveLength(1);
+});
+
+test("an unparseable conductor config falls back instead of stopping the heartbeat", () => {
+  mkdirSync(stateDir(), { recursive: true });
+  writeFileSync(configPath(), '{ "version": 1, "projects": [');
+  const pi = scopeHost();
+
+  pi.fire();
+  expect(pi.sent[0]?.message.content).toContain(TICK_SCOPE_CONSTRAINTS.material);
+  expect(pi.notices).toHaveLength(0);
+});
+
+test("several projects with none named is ambiguous, so the default scope is used", () => {
+  writeConductorConfig({ name: "fleet", scope: "escalations" }, { name: "homelab", scope: "escalations" });
+  const pi = scopeHost();
+
+  pi.fire();
+  // Guessing between them would inject one project's reporting contract into a
+  // session that supervises both.
+  expect(pi.sent[0]?.message.content).toContain(TICK_SCOPE_CONSTRAINTS.material);
+});
+
+test("the scope is re-read every tick, so a setup re-run binds the next heartbeat", () => {
+  writeConductorConfig({ name: "fleet", scope: "material" });
+  const pi = scopeHost();
+
+  pi.fire();
+  expect(pi.sent[0]?.message.content).toContain(TICK_SCOPE_CONSTRAINTS.material);
+
+  // The operator turns the volume down hours later, without restarting anything.
+  writeConductorConfig({ name: "fleet", scope: "escalations" });
+  pi.fire();
+  expect(pi.sent[1]?.message.content).toContain(TICK_SCOPE_CONSTRAINTS.escalations);
+  expect(pi.sent[1]?.message.content).not.toContain(TICK_SCOPE_CONSTRAINTS.material);
 });
