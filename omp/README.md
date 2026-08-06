@@ -317,10 +317,14 @@ Per tick, for the daemon's project:
    the configured repo names. These are never dispatched.
 5. **Check spend.** If spend since local midnight has reached `dailySpendUsd`, the
    daemon **pauses itself**, pages at Tier 2, and returns.
-6. **Check capacity.** `maxConcurrentWorkers` minus active runs gives the free
-   slots. If none are free, the tick logs and returns.
+6. **Check capacity.** `maxConcurrentWorkers` minus *live* workers (runs in
+   `claimed` or `running`) gives the free slots. A green PR awaiting a human
+   merge occupies its issue but not a slot: its worker is finished, and counting
+   it would let two green PRs stop the fleet. If no slot is free, the tick logs
+   and returns.
 7. **Admit issues** up to the free slots, skipping any issue that already has
-   an active run. An issue that has used `maxAttemptsPerIssue` escalates at Tier 1
+   an active run — including a green PR, so a second attempt can never land on a
+   live PR. An issue that has used `maxAttemptsPerIssue` escalates at Tier 1
    instead of being admitted.
 8. **Dispatch** the admitted issues concurrently.
 
@@ -330,9 +334,9 @@ Then, per admitted issue:
    This ordering is the whole crash-safety story: the label, not the local
    database, is the guard against dispatching the same issue twice. If the process
    dies at any later point, the next daemon sees the label, eligibility filters the
-   issue out, and a human decides what to do with the orphan. A store that is lost
-   can be rebuilt from the tracker; a label that was written too late cannot undo a
-   duplicate PR.
+   issue out, and the orchestrator's drain duty triages the orphan (see below). A
+   store that is lost can be rebuilt from the tracker; a label that was written too
+   late cannot undo a duplicate PR.
 2. Create the run row (`claimed`).
 3. Clear any stale tree for this issue, then add a fresh worktree at
    `<workspaceRoot>/<issue>` cut from the bare mirror at `<mirrorRoot>/<repo>.git`,
@@ -353,6 +357,26 @@ Then, per admitted issue:
    Label swaps add the new label before removing the old one: the reverse order
    leaves a window in which the issue carries no state label at all, which is
    exactly the shape eligibility reads as fresh work.
+
+### What a restart does to runs that were in flight
+
+A `claimed` or `running` row is a promise that a worker process exists, and a
+daemon that just started knows that promise is broken: its workers died with the
+previous process. At startup — unless another daemon is alive, so a foreground
+`daemon --once` cannot orphan a running daemon's real workers — every such row is
+moved to `orphaned`, with a log line naming the issue, the attempt and the
+worktree. That frees the slots immediately; a fleet must never resume as
+deadlocked as it crashed.
+
+Only the rows change. The issue keeps `agent:in-progress` — the label is the
+crash guard against double-dispatch — and deciding what the dead worker's remains
+are worth is the orchestrator's drain-duty judgement, spelled out in its brief:
+an open green PR goes to the merge path, a dirty tree is reported before anything
+destroys it (uncommitted edits have no other copy; unpushed *commits* are safe on
+the run's branch in the mirror, which a retry deliberately reattaches), and a
+clean orphan has its label released so the next tick re-claims it. Orphaned
+attempts still count toward `maxAttemptsPerIssue`, so a crash loop escalates
+instead of redispatching forever.
 
 ### Branch names
 
@@ -766,10 +790,10 @@ Known and deliberate in this version:
   (the orchestrator's) no matter how many workers are running, and no amount of
   `maxConcurrentWorkers` changes that.
 
-  The cap does work. The admission loop (`src/daemon.ts:405-445`) computes
-  `slots = maxConcurrentWorkers - active runs`, admits at most that many issues per
-  tick, and dispatches them together. To see them, read `omp-conductor status`,
-  which lists every active run, or follow `daemon.log`.
+  The cap does work. The admission loop (`src/daemon.ts:410-448`) computes
+  `slots = maxConcurrentWorkers - live workers`, admits at most that many issues
+  per tick, and dispatches them together. To see them, read `omp-conductor
+  status`, which lists every occupied issue, or follow `daemon.log`.
 - **Merges, releases and deploys are human-only, by design.** The conductor
   produces green PRs and stops.
 

@@ -60,6 +60,21 @@ describe("openStore", () => {
     ]);
   });
 
+  it("counts a green PR as an occupied issue but never as a live worker", () => {
+    const running = store.createRun(draft({ issue: 1, state: "running" }));
+    const claimed = store.createRun(draft({ issue: 2, state: "claimed", startedAt: 2_000 }));
+    const pushed = store.createRun(draft({ issue: 3, state: "pushed-green", startedAt: 3_000 }));
+    store.createRun(draft({ issue: 4, state: "orphaned", startedAt: 4_000 }));
+
+    // The busy set must contain the green PR (a second attempt on that issue
+    // would land on a live PR)...
+    expect(store.activeRuns(PROJECT).map((r) => r.id)).toEqual([running.id, claimed.id, pushed.id]);
+    // ...but capacity must not: a green PR holds no worker process, and with a
+    // cap of 2, two green PRs awaiting a human merge would otherwise stop the
+    // fleet forever.
+    expect(store.liveRuns(PROJECT).map((r) => r.id)).toEqual([running.id, claimed.id]);
+  });
+
   it("counts every attempt for an issue, including terminal ones", () => {
     store.createRun(draft({ issue: 7, attempt: 1, state: "failed" }));
     store.createRun(draft({ issue: 7, attempt: 2, state: "merged" }));

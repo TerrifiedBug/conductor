@@ -170,7 +170,9 @@ export type RunState =
   | "merged"
   | "blocked"
   | "failed"
-  | "killed";
+  | "killed"
+  /** In flight when its daemon process died; reconciled at the next startup. */
+  | "orphaned";
 
 /**
  * One attempt at one issue. Persisted so a daemon restart can reconcile
@@ -207,7 +209,10 @@ export interface Store {
   createRun(r: Omit<RunRecord, "id">): RunRecord;
   updateRun(id: string, patch: Partial<RunRecord>): void;
   getRun(id: string): RunRecord | undefined;
+  /** Runs whose issue is occupied: a live worker, or a green PR awaiting merge. */
   activeRuns(project: string): RunRecord[];
+  /** Runs backed by a worker process — what capacity counts. Subset of {@link Store.activeRuns}. */
+  liveRuns(project: string): RunRecord[];
   attemptsFor(project: string, issue: number): number;
   runsStartedSince(project: string, sinceEpochMs: number): number;
   spendSince(project: string, sinceEpochMs: number): number;

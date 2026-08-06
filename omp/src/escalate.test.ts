@@ -94,6 +94,7 @@ function makeStore() {
     },
     getRun: () => undefined,
     activeRuns: () => [],
+    liveRuns: () => [],
     attemptsFor: () => 0,
     runsStartedSince: () => 0,
     spendSince: () => 0,

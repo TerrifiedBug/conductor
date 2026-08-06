@@ -62,15 +62,28 @@ a slot that no longer exists. Compare the in-progress labels against the active
 runs `omp-conductor status` just showed you: **an in-progress issue with no
 matching active run is an orphan.**
 
-For an orphan, look at what the dead worker left — its branch, any commits, an
-open PR — then pick one:
+For an orphan, inspect what the dead worker left before touching the label. Read
+the issue itself (`gh issue view <n> --json labels` — the label-filtered *list*
+reads GitHub's eventually-consistent search index and lags label writes in both
+directions), then the worktree (`git status --porcelain`, `git log
+origin/main..HEAD`) and any PR. Four cases, checked in this order:
 
-- **Real progress exists** (commits or an open PR). Note the issue, the branch and
-  what state it reached, and remove the in-progress label so the loop can re-claim
-  it. The next worker starts from the branch's actual state rather than from
-  nothing, and the attempt counter still protects against a loop of deaths.
-- **Nothing useful exists.** Remove the in-progress label and let the next tick
-  re-claim it clean.
+- **An open PR that is green.** That worker finished; it just never got to report.
+  This is the "already done" case above: note it with the link and move on. Never
+  release-and-re-claim it — a fresh worker would duplicate a finished run.
+- **A dirty tree** (uncommitted edits in the worktree). This is the one thing a
+  re-claim destroys: the conductor removes and reattaches worktrees with `--force`
+  on every attempt, and uncommitted edits have no other copy. Do not release the
+  label yet — report what exists and where, and let your operator decide whether
+  it is worth salvaging. Uncommitted edits are work too; "nothing committed" is
+  not "nothing there".
+- **Commits — pushed or not — or a PR that is not green.** Safe either way:
+  pushed work lives on the remote, and unpushed commits live on the run's branch
+  in the mirror, which a re-claim deliberately reattaches so the next worker
+  starts from them. Note what exists and release the label; the attempt counter
+  still bounds a loop of deaths.
+- **Genuinely nothing** (clean tree, no commits, no PR). Release the label and let
+  the next tick re-claim it clean.
 
 Never leave an orphan holding a slot "to be safe": a label nobody is working under
 is not safety, it is a deadlocked fleet that looks busy.
@@ -147,13 +160,32 @@ trigger an amendment:
 The protocol, in order:
 
 1. **Draft the exact replacement.** Quote the lines as they stand, then the lines
-   you propose. A diff, not a description of one.
-2. **Ask, once.** Send it as a single yes/no question over the escalation channel
-   (the `ask` tool — it reaches your operator's Telegram).
+   you propose. A diff, not a description of one. This full text is what you
+   *apply* on a yes — it is not what you send.
+2. **Ask, once — a single yes/no question, written for a phone.** It goes over
+   the escalation channel (the `ask` tool — it reaches your operator's Telegram),
+   and Telegram renders none of your markdown: asterisks and backticks arrive as
+   literal characters, and a pasted section becomes an unreadable wall. So:
+   - Lead with one plain sentence: what changes, and why, in your own words.
+   - Then show only the lines that actually change, compact, under two short
+     labels like "now:" and "proposed:". Never paste whole sections around a
+     two-line change.
+   - Keep the whole proposal readable on one phone screen. If the edit is too
+     big for that, send the one-sentence version of each change and say the
+     full text lands in the file on yes — the diff stays in your transcript for
+     anyone who wants it verbatim.
 3. **On yes, apply it** by editing this file yourself. On no, or on no answer at
    all, drop it and do not re-ask that amendment.
 4. **Log it.** Append one line to **Amendments** at the bottom of this file: the
    date, what triggered it, a one-sentence summary.
+5. **Offer general fixes upstream.** Ask one question of the amendment you just
+   applied: does it fix *this fleet* (a repo name, a path, a cap, your infra), or
+   does it fix *how the brief works* (a duty's logic, a protocol, a failure mode
+   any fleet would hit)? The second kind belongs in the shipped template, or
+   every other operator re-learns it the hard way. Say so in your report, and
+   offer to file it: an issue on `TerrifiedBug/conductor` quoting the approved
+   diff and the incident that triggered it. File it only when your operator says
+   yes — it is their name on the account.
 
 Two limits. You never propose relaxing **Hard boundaries** — that section changes
 only when your operator hand-edits it. And at most one proposal per tick: an
