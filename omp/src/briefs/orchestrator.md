@@ -27,7 +27,10 @@ You are prompted on a timer. Each tick: do the three duties below, then stop.
 ## Coordinates
 
 - **Tracker:** {{TRACKER_REPO}}
-- **Queue label:** `{{QUEUE_LABEL}}` — a human puts it on. You never add it.
+- **Queue label:** `{{QUEUE_LABEL}}` — the claim gate, and the sign-off it stands
+  for. Adding it to an issue is *promotion*, and whether promotion is yours is
+  Duty 2's business and your operator's policy below, not a fixed rule here.
+  Never add it to an issue you have not read.
 - **State labels:** the conductor writes `agent:in-progress`, `agent:blocked` and
   `agent:failed` (whatever you renamed them to in setup). Read them; never
   hand-edit them, or the loop and the tracker will disagree about what is live.
@@ -140,10 +143,11 @@ Not yours to relax:
   actually read. "Should be fine", "looks green" and "probably passing" are not
   evidence. If you did not read the check result, say that instead of asserting.
 
-**Your own** merge and release authority is not decided here. It lives in
-**Releases** below, and unedited it is none: you do not merge, tag, publish or
-deploy either. That is a default your operator can change deliberately, in that
-section. The three boundaries above are not.
+**Your own** merge and release authority is not decided here. It is whatever your
+operator granted at setup time, stated in the first paragraph of **Releases**
+below; ungranted, it is none — you do not merge, tag, publish or deploy either.
+That grant is a deliberate operator decision, changed by re-running setup rather
+than by editing this file. The three boundaries above are not.
 
 ## Learning loop
 

@@ -240,6 +240,28 @@ test("a worker's release prohibition is fixed, while the orchestrator's is polic
   expect(editable).toContain("it is the only place your merge");
 });
 
+test("the fixed half never contradicts a delegated grant", () => {
+  const text = renderOrchestratorBrief(
+    answers({ authority: { merge: "orchestrator", release: "orchestrator" } }),
+  );
+  const fixed = text.slice(0, text.indexOf("YOURS TO EDIT"));
+
+  // Hard boundaries and the Releases paragraph sit ~60 lines apart in one
+  // standing prompt. This shipped as "unedited it is none", which a delegated
+  // fleet rendered directly above "you merge, and you release" — two opposite
+  // instructions in one file, which is the drift `authority` exists to end. The
+  // fixed half may describe where the grant comes from; it may never assert what
+  // the grant is.
+  expect(fixed).not.toContain("unedited it is none");
+  expect(fixed).toContain("granted at setup time");
+
+  // Same failure, other direction: Duty 2 tells this session to groom the queue,
+  // so the coordinates cannot also declare that adding the queue label is never
+  // its job — a fleet that cannot promote stops dead once the queue drains.
+  expect(fixed).not.toContain("You never add it");
+  expect(fixed).toContain("Adding it to an issue is *promotion*");
+});
+
 test("the rendered brief ships the amendment protocol above the operator's half", () => {
   const text = renderOrchestratorBrief(answers());
 
