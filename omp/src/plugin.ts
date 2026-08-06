@@ -10,8 +10,9 @@
  * tested; this file turns answers into questions and back again. The invariant
  * worth protecting is on `setup()` below — nothing is written before the confirm.
  */
-import { existsSync } from "node:fs";
-import { configPath, loadConfig, saveConfig } from "./config.ts";
+import { existsSync, readFileSync } from "node:fs";
+import { checkBrief, formatBriefStatus, writeMergedBrief } from "./brief-upgrade.ts";
+import { configPath, findProject, loadConfig, saveConfig } from "./config.ts";
 import {
   armConductor,
   formatStatus,
@@ -25,12 +26,14 @@ import {
   ORCHESTRATOR_BRIEF_NAME,
   REPORT_SCOPE_CHOICES,
   SETUP_DEFAULTS,
+  briefPathForProject,
   buildConfig,
   checkTokenScopes,
   createMissingLabels,
   detectTelegram,
   orchestratorBriefPath,
   planLabels,
+  renderBriefForProject,
   summarisePlan,
   writeOrchestratorBrief,
   type SetupAnswers,
@@ -100,13 +103,19 @@ const SUBCOMMANDS: Completion[] = [
   { value: "status", label: "status", description: "pause state, caps, active runs, today's usage" },
   { value: "pause", label: "pause", description: "stop claiming new work" },
   { value: "resume", label: "resume", description: "allow claiming again" },
+  {
+    value: "brief-upgrade",
+    label: "brief-upgrade",
+    description: "check ORCHESTRATOR.md against the brief this version ships",
+  },
 ];
 
 const USAGE = [
-  "/conductor setup [project]   create or update a project, then arm after you confirm",
-  "/conductor status [project]  pause state, caps, active runs, today's usage",
-  "/conductor pause             stop claiming new work",
-  "/conductor resume            allow claiming again",
+  "/conductor setup [project]         create or update a project, then arm after you confirm",
+  "/conductor status [project]        pause state, caps, active runs, today's usage",
+  "/conductor pause                   stop claiming new work",
+  "/conductor resume                  allow claiming again",
+  "/conductor brief-upgrade [project] check ORCHESTRATOR.md against the shipped brief",
 ].join("\n");
 
 /**
@@ -587,6 +596,34 @@ export default function conductorPlugin(pi: PluginApi): void {
             setPaused(false);
             ctx.ui.notify("Conductor resumed — work will be claimed on the next tick.", "info");
             break;
+
+          case "brief-upgrade": {
+            const p = findProject(loadConfig(), project);
+            const path = briefPathForProject(p);
+            if (!existsSync(path)) {
+              ctx.ui.notify(
+                `No brief at ${path} — run /conductor setup and say yes to writing ${ORCHESTRATOR_BRIEF_NAME}.`,
+                "warning",
+              );
+              break;
+            }
+            const status = checkBrief(readFileSync(path, "utf8"), renderBriefForProject(p));
+            ctx.ui.notify(formatBriefStatus(path, status), status.kind === "current" ? "info" : "warning");
+            // Confirmed here rather than applied on sight: this file is a standing
+            // prompt the operator may have spent an hour on, so the diff they just
+            // read is the thing they are agreeing to.
+            if (status.kind === "mergeable") {
+              const apply = await ctx.ui.confirm(
+                "Upgrade the brief?",
+                "Replace the half above the YOURS TO EDIT banner with the one this version ships? Everything below the banner is kept exactly as it is, and the current file is backed up first.",
+              );
+              if (apply) {
+                const backup = writeMergedBrief(path, status.merged);
+                ctx.ui.notify(`Brief upgraded. Previous version kept at ${backup}.`, "info");
+              }
+            }
+            break;
+          }
 
           default:
             ctx.ui.notify(

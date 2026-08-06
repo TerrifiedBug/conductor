@@ -212,6 +212,48 @@ turned on you can also invoke it directly:
 Nothing about the wizard changes: `/conductor setup` on its own remains a
 complete, supported path, and the brief it renders is safe unedited.
 
+### Keeping a brief current
+
+Upgrading the package does not upgrade a brief you are already running, and it is
+worth knowing exactly which half of that sentence is true.
+
+| What | Updates on `omp plugin install`? |
+| --- | --- |
+| `skills/conductor-onboarding/SKILL.md` | Yes. The session reads it from the installed package. |
+| `src/briefs/worker.md` | Yes. It is read per run, so the next worker gets the new text. |
+| `src/briefs/orchestrator.md` | Yes, but it is only a *template*: it is read when the wizard renders a brief. |
+| Your rendered `ORCHESTRATOR.md` | **No.** It was written once and is yours from then on. |
+
+That last row is the point. Once the wizard renders your brief, nothing in this
+package reads it back or rewrites it, so a later version that ships a new protocol
+above the `YOURS TO EDIT` banner is invisible to every fleet already running:
+
+```bash
+omp-conductor brief-upgrade              # report only
+omp-conductor brief-upgrade --apply      # replace the shipped half, keep yours
+```
+
+The banner is what makes this safe. Everything above it belongs to the package and
+everything below it belongs to you, so an upgrade replaces the first and copies the
+second across untouched, keeping the previous file as
+`ORCHESTRATOR.md.bak-<timestamp>`. Three cases where it will not write at all:
+
+- **Your brief has no banner** (hand-written, or predating the split). There is no
+  way to tell which lines are yours, so it lists the sections the template has and
+  yours does not, and leaves the file alone. Retitled sections count as present, so
+  `## Reporting (low noise)` is not reported as a missing `## Reporting`.
+- **No config resolved**, so the template still carries its `{{PLACEHOLDER}}`
+  coordinates. Merging it would write those literals into a live prompt.
+- **Nothing changed.** It says so and exits.
+
+`--file PATH` checks a brief that is not where the wizard would have put it, which
+is the normal case on a dedicated fleet host: the supervising session runs from its
+own directory, and that host may never have configured a dispatch daemon.
+
+A brief with the **Learning loop** section has a second route. The session running
+from it can propose the missing sections itself, as a diff, for you to approve with
+a yes over Telegram, which is the same protocol it uses for any other amendment.
+
 ## Quick start
 
 1. Write a config (see [Configuration](#configuration)) at
@@ -620,6 +662,7 @@ omp-conductor status [--project NAME]
 omp-conductor daemon [--once] [--port N] [--project NAME]
 omp-conductor pause
 omp-conductor resume
+omp-conductor brief-upgrade [--apply] [--file PATH] [--project NAME]
 omp-conductor help
 ```
 
@@ -635,6 +678,9 @@ omp-conductor help
 | `--project NAME` | Pick the project to service. One daemon process serves exactly one project; with several configured projects the name is required. |
 | `pause` | Stop claiming new work. The running daemon notices on its next tick; runs already in flight finish. |
 | `resume` | Allow claiming again. |
+| `brief-upgrade` | Compare a project's `ORCHESTRATOR.md` against the brief this version of the package ships. Reports by default; see [Keeping a brief current](#keeping-a-brief-current). |
+| `--apply` | Only for `brief-upgrade`. Replaces the half above the `YOURS TO EDIT` banner and keeps everything below it, backing the previous file up first. Ignored when the brief cannot be split or the template is unrendered. |
+| `--file PATH` | Only for `brief-upgrade`. Check a brief that is not where the wizard would have put it, on a host that may have no config at all. |
 | `help`, `--help`, `-h` | Print usage. An unknown or missing verb prints it too, and exits `2`. |
 
 Pause is a flag file under the state directory, so it applies to every project and
