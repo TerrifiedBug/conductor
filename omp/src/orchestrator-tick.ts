@@ -24,13 +24,20 @@
  *   would stack prompts on a session that is already behind. `hasPendingMessages()`
  *   makes the tick idempotent under slow turns.
  *
+ * Beyond those four gates, every tick carries the project's `reporting.scope`
+ * as one explicit constraint line, re-read from the conductor config on each
+ * tick so a `/conductor setup` change binds the next heartbeat rather than
+ * waiting for a session restart.
+ *
  * The extension is inert unless `<cwd>/.conductor-tick.json` exists, so shipping
  * it inside `omp-conductor` costs an ordinary session nothing.
  */
 
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
+import { findProject, loadConfig } from "./config.ts";
 import { isPaused } from "./daemon.ts";
+import { DEFAULT_REPORT_SCOPE, type ReportScope } from "./types.ts";
 
 /** The activation file. Absent means "this is not an orchestrator session". */
 export const TICK_CONFIG_FILE = ".conductor-tick.json";
@@ -135,10 +142,56 @@ export type TickConfigResult =
   | { kind: "invalid"; path: string; problem: string }
   | { kind: "ok"; path: string; config: TickConfig };
 
-/** The prompt when the config names none. The timestamp is what makes two
- *  consecutive ticks distinguishable in the session log. */
+/**
+ * The prompt when the config names none. The timestamp is what makes two
+ * consecutive ticks distinguishable in the session log.
+ *
+ * Deliberately silent about reporting volume: that clause is
+ * {@link TICK_SCOPE_CONSTRAINTS}, appended per tick from the configured scope.
+ * A second spelling of it here would contradict the first inside one prompt the
+ * moment a fleet chose `escalations`.
+ */
 export function defaultTickMessage(now: Date): string {
-  return `Tick ${now.toISOString()}: run your standing loop from ORCHESTRATOR.md now. Report only material events.`;
+  return `Tick ${now.toISOString()}: run your standing loop from ORCHESTRATOR.md now.`;
+}
+
+/**
+ * The reporting contract, one line per scope, appended to the tick prompt.
+ *
+ * This is the whole of what `reporting.scope` does at tick time: it constrains
+ * what the turn is allowed to say, in the session that reads it. It is not an
+ * outbound filter — nothing downstream drops a report the orchestrator decides
+ * to send anyway.
+ *
+ * A mapped type rather than a plain object, so adding a member to
+ * `REPORT_SCOPES` fails to compile here instead of resolving to `undefined` at
+ * the point of use.
+ */
+export const TICK_SCOPE_CONSTRAINTS: { readonly [K in ReportScope]: string } = {
+  material: "Report material events per your brief.",
+  escalations:
+    "Report NOTHING this turn except a Tier 1/2 escalation or a release you cut; everything else waits for the daily digest.",
+};
+
+/**
+ * The scope this tick carries, and — when it had to fall back — why.
+ *
+ * Read on every tick rather than cached at session start, for the reason the
+ * channel gate is: the operator re-runs `/conductor setup` while this session
+ * lives, and a heartbeat holding a startup snapshot would keep injecting the
+ * old contract until somebody restarted it.
+ *
+ * Every fault collapses to {@link DEFAULT_REPORT_SCOPE}: no config written yet,
+ * an unreadable or invalid one, or several projects with none named — the same
+ * ambiguity `findProject` refuses to guess through for `status`. Stopping the
+ * heartbeat over a reporting preference would be the worse trade.
+ */
+export function resolveTickScope(): { scope: ReportScope; fallback?: string } {
+  try {
+    return { scope: findProject(loadConfig()).reporting?.scope ?? DEFAULT_REPORT_SCOPE };
+  } catch (err) {
+    return { scope: DEFAULT_REPORT_SCOPE, fallback: err instanceof Error ? err.message : String(err) };
+  }
 }
 
 /**
@@ -281,8 +334,13 @@ function channelIsUp(path: string): boolean {
  * One tick: gather the four facts, ask `tickDecision`, log the reason either
  * way. Skips are deliberately silent in the UI — a paused fleet would otherwise
  * emit a notification every interval, forever.
+ *
+ * `session` holds the only thing one tick remembers for the next: whether the
+ * scope fallback has been logged. Without it, a host with no conductor config
+ * would repeat the same line about the same missing file every interval, for as
+ * long as the session lives.
  */
-function tick(pi: TickApi, ctx: TickContext, config: TickConfig): void {
+function tick(pi: TickApi, ctx: TickContext, config: TickConfig, session: { scopeFallbackLogged: boolean }): void {
   const decision = tickDecision({
     paused: isPaused(),
     armed: config.armedFile === undefined || existsSync(config.armedFile),
@@ -295,7 +353,18 @@ function tick(pi: TickApi, ctx: TickContext, config: TickConfig): void {
     return;
   }
 
-  const content = config.message ?? defaultTickMessage(new Date());
+  // A configured message owns the whole contract, reporting clause included: an
+  // operator who wrote their own prompt did not ask for ours appended to it.
+  let content = config.message;
+  if (content === undefined) {
+    const scope = resolveTickScope();
+    if (scope.fallback !== undefined && !session.scopeFallbackLogged) {
+      session.scopeFallbackLogged = true;
+      pi.logger.info(`[omp-conductor] tick reporting scope: using ${DEFAULT_REPORT_SCOPE} — ${scope.fallback}`);
+    }
+    content = `${defaultTickMessage(new Date())}\n${TICK_SCOPE_CONSTRAINTS[scope.scope]}`;
+  }
+
   pi.sendMessage(
     { customType: TICK_CUSTOM_TYPE, content, display: true, attribution: "user" },
     { triggerTurn: true, deliverAs: "followUp" },
@@ -307,6 +376,10 @@ export default function orchestratorTickExtension(pi: TickApi): void {
   // Scoped to this registration rather than the module, so a second
   // `session_start` cannot install a second heartbeat on the same session.
   let armed = false;
+  // Held per registration for the same reason: the "using the default reporting
+  // scope, because ..." line is logged once for this heartbeat, and a second
+  // session in the same process starts with its own count.
+  const session = { scopeFallbackLogged: false };
 
   pi.on("session_start", (_event, ctx) => {
     if (armed) return;
@@ -343,7 +416,7 @@ export default function orchestratorTickExtension(pi: TickApi): void {
     }
 
     const config = result.config;
-    ctx.setInterval(() => tick(pi, ctx, config), config.intervalSeconds * 1000);
+    ctx.setInterval(() => tick(pi, ctx, config, session), config.intervalSeconds * 1000);
     armed = true;
     // Both gates are named at startup: "why is it not ticking?" is answered by
     // looking at the files this line lists, and an unset channel gate on a fleet
