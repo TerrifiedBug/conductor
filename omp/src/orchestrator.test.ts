@@ -110,16 +110,16 @@ function scratchDir(): string {
 
 const blocked: Escalation = {
   tier: 1,
-  project: "veltro",
+  project: "demo",
   issue: 4211,
   summary: "worker blocked twice on the same failing gate",
-  detail: "bun test: 2 failing in warden/tests/test_runbooks.py",
+  detail: "bun test: 2 failing in worker/tests/test_runbooks.py",
   runId: "run_abc",
 };
 
 const conflict: Escalation = {
   tier: 1,
-  project: "veltro",
+  project: "demo",
   issue: 4300,
   summary: "branch conflicts with main after a force-push",
   runId: "run_def",
@@ -135,7 +135,7 @@ describe("startOrchestrator", () => {
       sessionDir: dir,
       createSessionImpl: fake.create,
     });
-    await orchestrator.deliver(blocked, "veltro");
+    await orchestrator.deliver(blocked, "demo");
 
     // Resumed, not fresh: a restarted daemon must not forget what it escalated.
     expect(fake.created.length).toBe(1);
@@ -163,7 +163,7 @@ describe("startOrchestrator", () => {
     fake.emit("turn_start");
     expect(orchestrator.busy()).toBe(true);
 
-    await orchestrator.deliver(blocked, "veltro");
+    await orchestrator.deliver(blocked, "demo");
 
     expect(fake.prompts.length).toBe(1);
     // Queued behind the turn in flight rather than interrupting it — a bare
@@ -209,8 +209,8 @@ describe("startOrchestrator", () => {
     });
     // Exactly what one tick does when it finds two stuck runs: fire both and
     // await them together. Neither may be dropped or merged into the other.
-    const first = orchestrator.deliver(blocked, "veltro");
-    const second = orchestrator.deliver(conflict, "veltro");
+    const first = orchestrator.deliver(blocked, "demo");
+    const second = orchestrator.deliver(conflict, "demo");
     await Promise.all([first, second]);
 
     expect(fake.prompts.length).toBe(2);
@@ -231,9 +231,9 @@ describe("startOrchestrator", () => {
 
     // Rejected, never thrown synchronously: the escalator catches this and
     // falls back to an issue comment instead of losing the escalation.
-    await expect(orchestrator.deliver(blocked, "veltro")).rejects.toThrow(/not accepting/);
+    await expect(orchestrator.deliver(blocked, "demo")).rejects.toThrow(/not accepting/);
     // One bad injection must not poison the queue behind it.
-    await orchestrator.deliver(conflict, "veltro");
+    await orchestrator.deliver(conflict, "demo");
     expect(fake.prompts.length).toBe(2);
   });
 
@@ -247,8 +247,8 @@ describe("startOrchestrator", () => {
       brief: "STANDING ORDERS: re-brief workers, never edit product code.",
       createSessionImpl: fake.create,
     });
-    await orchestrator.deliver(blocked, "veltro");
-    await orchestrator.deliver(conflict, "veltro");
+    await orchestrator.deliver(blocked, "demo");
+    await orchestrator.deliver(conflict, "demo");
 
     expect(fake.prompts[0]?.text).toContain("STANDING ORDERS");
     expect(fake.prompts[0]?.text).toContain("#4211");
@@ -269,7 +269,7 @@ describe("startOrchestrator", () => {
     await orchestrator.dispose();
     await orchestrator.dispose();
 
-    await expect(orchestrator.deliver(blocked, "veltro")).rejects.toThrow(/disposed/);
+    await expect(orchestrator.deliver(blocked, "demo")).rejects.toThrow(/disposed/);
     expect(fake.prompts.length).toBe(0);
   });
 
@@ -286,7 +286,7 @@ describe("startOrchestrator", () => {
 
     // Accepted: the harness took the prompt, so the tick is free to move on
     // even though this turn will run for minutes.
-    const receipt = await orchestrator.deliver(blocked, "veltro");
+    const receipt = await orchestrator.deliver(blocked, "demo");
     expect(fake.prompts.length).toBe(1);
 
     // ...and then the turn dies. The failure belongs to #4211 and comes back on
@@ -296,7 +296,7 @@ describe("startOrchestrator", () => {
     await expect(receipt.settled).rejects.toThrow(/died mid-turn/);
 
     // The next escalation carries none of that: accepted, and clean.
-    const next = await orchestrator.deliver(conflict, "veltro");
+    const next = await orchestrator.deliver(conflict, "demo");
     await next.settled;
     expect(fake.prompts.length).toBe(2);
     expect(fake.prompts[1]?.text).toContain("#4300");
@@ -315,10 +315,10 @@ describe("startOrchestrator", () => {
 
     // Never accepted, so there is no receipt to watch: the caller's catch is
     // the whole signal, and it fires before the escalator has marked anything.
-    await expect(orchestrator.deliver(blocked, "veltro")).rejects.toThrow(/not accepting/);
+    await expect(orchestrator.deliver(blocked, "demo")).rejects.toThrow(/not accepting/);
 
     // The session is usable again, and the next delivery gets a real receipt.
-    const receipt = await orchestrator.deliver(conflict, "veltro");
+    const receipt = await orchestrator.deliver(conflict, "demo");
     await receipt.settled;
     expect(fake.prompts.length).toBe(2);
   });
@@ -326,7 +326,7 @@ describe("startOrchestrator", () => {
 
 describe("formatInjection", () => {
   test("names the tier, the issue, the summary and the no-editing rule", () => {
-    const text = formatInjection(blocked, "veltro");
+    const text = formatInjection(blocked, "demo");
 
     expect(text).toContain("tier 1");
     expect(text).toContain("#4211");
@@ -342,7 +342,7 @@ describe("formatInjection", () => {
   });
 
   test("a tier-2 injection says the human is already being paged", () => {
-    const text = formatInjection({ ...blocked, tier: 2 }, "veltro");
+    const text = formatInjection({ ...blocked, tier: 2 }, "demo");
 
     expect(text).toContain("tier 2");
     expect(text).toContain("Do not edit product code");

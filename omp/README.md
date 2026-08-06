@@ -43,6 +43,30 @@ The first two are thin wrappers over the same `daemon.ts`, so the plugin and the
 CLI cannot disagree about what a cap means or where the state lives. The heartbeat
 reads the same pause flag both of them write.
 
+## Where issues come from
+
+**GitHub Issues is the only supported tracker in v1.** `tracker.kind` accepts
+exactly one value, `"github"`, and every tracker operation shells out to your
+already-authenticated `gh` CLI — the conductor never stores a token of its own.
+Gitea, Jira, and file-based trackers are not supported yet; the seam for them is
+`src/tracker/github.ts`, which implements the whole six-method `Tracker`
+interface in `src/types.ts` (`listReady`, `addLabel`, `removeLabel`, `comment`,
+`close`, `linkParent`) that a future backend would swap in.
+
+You tell the conductor where to look with three keys, all in
+`~/.omp/conductor/config.json` (the [Configuration](#configuration) section has
+the full annotated example, and `/conductor setup` will interview you for these
+and create any missing labels):
+
+| Key | Meaning |
+| --- | --- |
+| `tracker.repo` | The **one** `owner/repo` whose issue list is the queue. This is your planning repo — it does not have to contain any code. |
+| `queueLabel` | Open issues in `tracker.repo` carrying this label (default `ready-for-agent`) are the work queue. Nothing else is ever read. |
+| `routing.repos` + `repo:<name>` labels | Each queued issue must also carry exactly one routing label naming which code repo the work lands in. The conductor cuts the worktree and PR there, from `routing.repos[name].cloneUrl`. An issue with zero or two routing labels is reported as unroutable and skipped — never guessed. |
+
+So: one tracker repo supplies the queue, routing labels fan issues out to any
+number of code repos, and both label names are yours to configure.
+
 ## Install
 
 ```bash
@@ -281,8 +305,8 @@ A complete, valid config for one project with two target repos:
   },
   "projects": [
     {
-      "name": "veltro",
-      "tracker": { "kind": "github", "repo": "TerrifiedBug/veltro" },
+      "name": "demo",
+      "tracker": { "kind": "github", "repo": "acme/planning" },
       "queueLabel": "ready-for-agent",
       "stateLabels": {
         "inProgress": "agent:in-progress",
@@ -292,19 +316,18 @@ A complete, valid config for one project with two target repos:
       "routing": {
         "labelPrefix": "repo:",
         "repos": {
-          "chad": {
-            "name": "chad",
-            "cloneUrl": "git@github.com:TerrifiedBug/chad.git",
+          "api": {
+            "name": "api",
+            "cloneUrl": "git@github.com:acme/api.git",
             "defaultBranch": "main",
             "gates": [
-              { "cmd": "bun run lint", "cwd": "frontend" },
-              { "cmd": "bun run typecheck", "cwd": "frontend" },
-              { "cmd": "pytest -q", "cwd": "backend" }
+              { "cmd": "bun run lint", "cwd": "." },
+              { "cmd": "bun test", "cwd": "." }
             ]
           },
-          "warden": {
-            "name": "warden",
-            "cloneUrl": "git@github.com:TerrifiedBug/warden.git",
+          "worker": {
+            "name": "worker",
+            "cloneUrl": "git@github.com:acme/worker.git",
             "defaultBranch": "main",
             "gates": [
               { "cmd": "ruff check .", "cwd": "." },
@@ -455,7 +478,7 @@ curl -s localhost:8787/healthz
 ```
 
 ```json
-{ "ok": true, "paused": false, "activeRuns": 1, "project": "veltro" }
+{ "ok": true, "paused": false, "activeRuns": 1, "project": "demo" }
 ```
 
 Any other path or method returns `404`. Note that `ok` reports that the process is

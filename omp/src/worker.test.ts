@@ -13,18 +13,18 @@ describe("renderBrief", () => {
   test("substitutes every known placeholder, including repeats", () => {
     const rendered = renderBrief(
       "Fix #{{ISSUE_NUMBER}} in {{REPO}} on branch {{BRANCH}}.\nPR must target {{REPO}}.",
-      { ISSUE_NUMBER: "412", REPO: "chad", BRANCH: "fix/flaky-gate" },
+      { ISSUE_NUMBER: "412", REPO: "api", BRANCH: "fix/flaky-gate" },
     );
 
-    expect(rendered).toBe("Fix #412 in chad on branch fix/flaky-gate.\nPR must target chad.");
+    expect(rendered).toBe("Fix #412 in api on branch fix/flaky-gate.\nPR must target api.");
   });
 
   test("leaves an unknown placeholder verbatim", () => {
     const rendered = renderBrief("Repo {{REPO}}, acceptance {{ACCEPTANCE_CRITERIA}}.", {
-      REPO: "warden",
+      REPO: "worker",
     });
 
-    expect(rendered).toBe("Repo warden, acceptance {{ACCEPTANCE_CRITERIA}}.");
+    expect(rendered).toBe("Repo worker, acceptance {{ACCEPTANCE_CRITERIA}}.");
     expect(rendered).not.toContain("undefined");
   });
 });
@@ -33,13 +33,13 @@ describe("deriveResult", () => {
   test("reads pushed-green and the PR url out of a green report", () => {
     const report = [
       "state: pushed-green",
-      "pr: https://github.com/TerrifiedBug/chad/pull/1487",
+      "pr: https://github.com/acme/api/pull/1487",
       "gates: all green",
     ].join("\n");
 
     expect(deriveResult(report)).toEqual({
       state: "pushed-green",
-      prUrl: "https://github.com/TerrifiedBug/chad/pull/1487",
+      prUrl: "https://github.com/acme/api/pull/1487",
     });
   });
 

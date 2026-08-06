@@ -46,7 +46,7 @@ const DEFAULT_STATE_LABELS: ProjectConfig["stateLabels"] = {
 };
 
 /**
- * Default routing prefix. Namespaced rather than empty: a bare `chad` label
+ * Default routing prefix. Namespaced rather than empty: a bare `api` label
  * would collide with ordinary topic labels and route work by accident.
  */
 const DEFAULT_LABEL_PREFIX = "repo:";

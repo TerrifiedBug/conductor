@@ -56,15 +56,15 @@ afterEach(() => {
 /** A complete set of answers, as the wizard would hand them over. */
 function answers(overrides: Partial<SetupAnswers> = {}): SetupAnswers {
   return {
-    projectName: "veltro",
-    trackerRepo: "TerrifiedBug/veltro",
+    projectName: "demo",
+    trackerRepo: "acme/demo",
     queueLabel: "ready-for-agent",
     stateLabels: { inProgress: "agent:in-progress", blocked: "agent:blocked", failed: "agent:failed" },
     routingLabelPrefix: "repo:",
     targetRepos: [
       {
-        name: "chad",
-        cloneUrl: "git@github.com:TerrifiedBug/chad.git",
+        name: "api",
+        cloneUrl: "git@github.com:acme/api.git",
         defaultBranch: "main",
         gates: [{ cmd: "bun run check", cwd: "." }],
       },
@@ -93,26 +93,26 @@ test("a config built from answers survives its own validator", () => {
 
   expect(loaded).toEqual(built);
   const project = loaded.projects[0];
-  expect(project?.tracker).toEqual({ kind: "github", repo: "TerrifiedBug/veltro" });
+  expect(project?.tracker).toEqual({ kind: "github", repo: "acme/demo" });
   expect(project?.caps).toEqual({ maxConcurrentWorkers: 3, dailySpendUsd: 40 });
   expect(project?.escalation).toEqual({ fallbackToIssueComment: false, telegramChatId: "424242" });
-  expect(project?.routing.repos["chad"]?.gates).toEqual([{ cmd: "bun run check", cwd: "." }]);
+  expect(project?.routing.repos["api"]?.gates).toEqual([{ cmd: "bun run check", cwd: "." }]);
   expect(loaded.defaults).toEqual(DEFAULT_CAPS);
 });
 
 test("re-running setup for one project replaces it and leaves the others alone", () => {
-  const first = buildConfig(answers({ projectName: "veltro" }));
-  const both = buildConfig(answers({ projectName: "homelab", trackerRepo: "TerrifiedBug/homelab" }), first);
-  expect(both.projects.map((p) => p.name)).toEqual(["veltro", "homelab"]);
+  const first = buildConfig(answers({ projectName: "demo" }));
+  const both = buildConfig(answers({ projectName: "homelab", trackerRepo: "acme/homelab" }), first);
+  expect(both.projects.map((p) => p.name)).toEqual(["demo", "homelab"]);
 
   const rerun = buildConfig(
-    answers({ projectName: "veltro", trackerRepo: "TerrifiedBug/veltro-next", queueLabel: "queued" }),
+    answers({ projectName: "demo", trackerRepo: "acme/demo-next", queueLabel: "queued" }),
     both,
   );
 
   // Replaced in place, not appended and not deduplicated away.
-  expect(rerun.projects.map((p) => p.name)).toEqual(["veltro", "homelab"]);
-  expect(rerun.projects[0]?.tracker.repo).toBe("TerrifiedBug/veltro-next");
+  expect(rerun.projects.map((p) => p.name)).toEqual(["demo", "homelab"]);
+  expect(rerun.projects[0]?.tracker.repo).toBe("acme/demo-next");
   expect(rerun.projects[0]?.queueLabel).toBe("queued");
   // The neighbour is byte-identical to what it was before this run.
   expect(rerun.projects[1]).toEqual(both.projects[1]!);
@@ -145,7 +145,7 @@ function labelPlan(): LabelPlan[] {
 const NO_TELEGRAM: TelegramPresence = { available: false, stateDir: "/nowhere", hasToken: false };
 
 test("the plan names every label it would create", () => {
-  const scopes: ScopeCheck = { ok: true, login: "TerrifiedBug", scopes: ["repo", "project"], missing: [] };
+  const scopes: ScopeCheck = { ok: true, login: "acme", scopes: ["repo", "project"], missing: [] };
 
   const text = summarisePlan(answers(), scopes, labelPlan(), NO_TELEGRAM);
 
@@ -160,7 +160,7 @@ test("the plan names every label it would create", () => {
 });
 
 test("a missing token scope is a prominent warning, not a footnote", () => {
-  const scopes: ScopeCheck = { ok: false, login: "TerrifiedBug", scopes: ["gist"], missing: ["repo", "project"] };
+  const scopes: ScopeCheck = { ok: false, login: "acme", scopes: ["gist"], missing: ["repo", "project"] };
 
   const text = summarisePlan(answers(), scopes, labelPlan(), NO_TELEGRAM);
 
@@ -171,7 +171,7 @@ test("a missing token scope is a prominent warning, not a footnote", () => {
 });
 
 test("the plan shows effective caps, marking the ones that were answered", () => {
-  const scopes: ScopeCheck = { ok: true, login: "TerrifiedBug", scopes: ["repo", "project"], missing: [] };
+  const scopes: ScopeCheck = { ok: true, login: "acme", scopes: ["repo", "project"], missing: [] };
 
   const text = summarisePlan(answers({ caps: { maxConcurrentWorkers: 5 } }), scopes, labelPlan(), NO_TELEGRAM);
 

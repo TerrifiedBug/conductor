@@ -26,7 +26,7 @@ export type UnroutableReason =
 
 /**
  * `labels` carries the prefixed labels actually seen, so the escalation can
- * quote them back ("saw repo:chad, repo:warden") instead of telling a human to
+ * quote them back ("saw repo:api, repo:worker") instead of telling a human to
  * go and look.
  */
 export type Unroutable = {

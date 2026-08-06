@@ -15,11 +15,11 @@ function target(name: string): RepoTarget {
   };
 }
 
-const chad = target("chad");
-const warden = target("warden");
+const api = target("api");
+const worker = target("worker");
 
 const project: ProjectConfig = {
-  name: "veltro",
+  name: "demo",
   tracker: { kind: "github", repo: "acme/queue" },
   queueLabel: QUEUE,
   stateLabels: {
@@ -27,7 +27,7 @@ const project: ProjectConfig = {
     blocked: "agent:blocked",
     failed: "agent:failed",
   },
-  routing: { labelPrefix: "repo:", repos: { chad, warden } },
+  routing: { labelPrefix: "repo:", repos: { api, worker } },
   caps: {},
   escalation: { fallbackToIssueComment: true },
   workspaceRoot: "/tmp/conductor/ws",
@@ -53,9 +53,9 @@ function issue(
 
 describe("isEligible", () => {
   test("requires the queue label", () => {
-    expect(isEligible(issue(1, "t", ["repo:chad"]), project)).toBe(true);
+    expect(isEligible(issue(1, "t", ["repo:api"]), project)).toBe(true);
     expect(
-      isEligible(issue(1, "t", ["repo:chad"], { queued: false }), project),
+      isEligible(issue(1, "t", ["repo:api"], { queued: false }), project),
     ).toBe(false);
   });
 
@@ -68,13 +68,13 @@ describe("isEligible", () => {
 
 describe("route", () => {
   test("exactly one known repo label routes to that target", () => {
-    const i = issue(10, "Fix percolator drift", ["repo:chad"]);
+    const i = issue(10, "Fix percolator drift", ["repo:api"]);
     const { routed, unroutable } = route([i], project);
 
     expect(unroutable).toEqual([]);
     expect(routed).toHaveLength(1);
     expect(routed[0]!.issue.number).toBe(10);
-    expect(routed[0]!.repo).toBe(chad);
+    expect(routed[0]!.repo).toBe(api);
   });
 
   test("zero prefixed labels is no-repo-label", () => {
@@ -89,8 +89,8 @@ describe("route", () => {
 
   test("two prefixed labels is multiple-repo-labels and is never routed", () => {
     const i = issue(12, "Bump shared package everywhere", [
-      "repo:chad",
-      "repo:warden",
+      "repo:api",
+      "repo:worker",
     ]);
     const { routed, unroutable } = route([i], project);
 
@@ -98,21 +98,21 @@ describe("route", () => {
     expect(unroutable).toHaveLength(1);
     expect(unroutable[0]!.reason).toBe("multiple-repo-labels");
     // Reported verbatim so the escalation can name what it saw.
-    expect(unroutable[0]!.labels).toEqual(["repo:chad", "repo:warden"]);
+    expect(unroutable[0]!.labels).toEqual(["repo:api", "repo:worker"]);
   });
 
   test("one prefixed label with an unknown suffix is unknown-repo", () => {
-    const i = issue(13, "Retire the old shim", ["repo:vectorflow"]);
+    const i = issue(13, "Retire the old shim", ["repo:frontend"]);
     const { routed, unroutable } = route([i], project);
 
     expect(routed).toEqual([]);
     expect(unroutable[0]!.reason).toBe("unknown-repo");
-    expect(unroutable[0]!.labels).toEqual(["repo:vectorflow"]);
+    expect(unroutable[0]!.labels).toEqual(["repo:frontend"]);
   });
 
   test("an in-progress issue is in neither bucket", () => {
     // Otherwise perfectly routable: the state label is the only difference.
-    const i = issue(14, "Already claimed", ["repo:chad", IN_PROGRESS]);
+    const i = issue(14, "Already claimed", ["repo:api", IN_PROGRESS]);
     const { routed, unroutable } = route([i], project);
 
     expect(routed).toEqual([]);
@@ -141,20 +141,20 @@ describe("route", () => {
 
   test("a repeated label is one repo, not an ambiguity", () => {
     const { routed, unroutable } = route(
-      [issue(17, "Dup label", ["repo:chad", "repo:chad"])],
+      [issue(17, "Dup label", ["repo:api", "repo:api"])],
       project,
     );
 
     expect(unroutable).toEqual([]);
-    expect(routed[0]!.repo).toBe(chad);
+    expect(routed[0]!.repo).toBe(api);
   });
 
   test("each issue is decided independently within one batch", () => {
     const { routed, unroutable } = route(
       [
-        issue(20, "Good", ["repo:warden"]),
-        issue(21, "Ambiguous", ["repo:chad", "repo:warden"]),
-        issue(22, "Claimed", ["repo:chad", IN_PROGRESS]),
+        issue(20, "Good", ["repo:worker"]),
+        issue(21, "Ambiguous", ["repo:api", "repo:worker"]),
+        issue(22, "Claimed", ["repo:api", IN_PROGRESS]),
         issue(23, "Unlabelled"),
       ],
       project,
