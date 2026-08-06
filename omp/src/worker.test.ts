@@ -1,13 +1,103 @@
 /**
- * Deterministic worker logic only: brief rendering, the report -> state
- * derivation, and the `agent_end` completion rule. Nothing here starts a
- * session, so the suite never touches the network or the omp peer dependency.
- * Whether two real sessions run side by side is an integration question — a
- * fake SDK here would only ever test the fake.
+ * Deterministic worker logic: brief rendering, the report -> state derivation,
+ * the `agent_end` completion rule, and what `runWorker` hands its session
+ * factory. Nothing here reaches the omp peer dependency — the session factory is
+ * injected, so the tests exercise the real `runWorker` against a fake harness
+ * rather than a fake of themselves. Whether two *real* sessions run side by side
+ * stays an integration question.
  */
 
 import { describe, expect, test } from "bun:test";
-import { deriveResult, renderBrief, shouldComplete } from "./worker.ts";
+import type { AgentSessionLike } from "./omp.ts";
+import { deriveResult, renderBrief, runWorker, shouldComplete, type WorkerOpts } from "./worker.ts";
+import { DEFAULT_CAPS } from "./types.ts";
+
+/**
+ * A session that settles immediately with the report it was handed. Records the
+ * options it was created with, which is the only way to prove `runWorker` passes
+ * a configured model through instead of dropping it.
+ */
+function fakeHarness(opts?: { report?: string; modelFallbackMessage?: string }) {
+  const received: { cwd?: string; sessionDir?: string; model?: string }[] = [];
+  const handlers = new Map<string, ((e: unknown) => void)[]>();
+
+  const session: AgentSessionLike = {
+    prompt: async () => {
+      for (const cb of handlers.get("message_end") ?? []) {
+        cb({ message: { role: "assistant", content: opts?.report ?? "state: pushed-green" } });
+      }
+      for (const cb of handlers.get("agent_end") ?? []) cb({ isTerminal: true });
+    },
+    on: (event, cb) => {
+      const list = handlers.get(event) ?? [];
+      list.push(cb);
+      handlers.set(event, list);
+    },
+    abort: () => {},
+    ...(opts?.modelFallbackMessage === undefined
+      ? {}
+      : { modelFallbackMessage: opts.modelFallbackMessage }),
+  };
+
+  return {
+    received,
+    deps: {
+      createSession: async (o: { cwd: string; sessionDir?: string; model?: string }) => {
+        received.push(o);
+        return session;
+      },
+    },
+  };
+}
+
+const workerOpts = (over: Partial<WorkerOpts> = {}): WorkerOpts => ({
+  brief: "Fix the flaky gate.",
+  cwd: "/tmp/worktree",
+  caps: DEFAULT_CAPS,
+  ...over,
+});
+
+describe("runWorker session options", () => {
+  test("passes a configured model pattern to the session factory", async () => {
+    const harness = fakeHarness();
+
+    await runWorker(workerOpts({ model: "smol" }), harness.deps);
+
+    // The whole point of the per-project setting: omp resolves the pattern, so
+    // dropping it here is invisible until someone reads a transcript.
+    expect(harness.received).toHaveLength(1);
+    expect(harness.received[0]?.model).toBe("smol");
+  });
+
+  test("omits the model entirely when the project pinned none", async () => {
+    const harness = fakeHarness();
+
+    await runWorker(workerOpts(), harness.deps);
+
+    // Absent, not empty-string: the harness reads its own default only when the
+    // key is missing.
+    expect(harness.received[0]).not.toHaveProperty("model");
+  });
+
+  test("carries a model downgrade out on the result so the daemon can log it", async () => {
+    const harness = fakeHarness({ modelFallbackMessage: "opus unavailable, used sonnet" });
+
+    const result = await runWorker(workerOpts({ model: "opus" }), harness.deps);
+
+    // A run done by a different model than the operator chose is a fact about
+    // that run; swallowing it makes a downgraded run look merely unlucky.
+    expect(result.modelFallbackMessage).toBe("opus unavailable, used sonnet");
+    expect(result.state).toBe("pushed-green");
+  });
+
+  test("leaves the downgrade field absent when the harness honoured the model", async () => {
+    const harness = fakeHarness();
+
+    const result = await runWorker(workerOpts({ model: "smol" }), harness.deps);
+
+    expect(result.modelFallbackMessage).toBeUndefined();
+  });
+});
 
 describe("renderBrief", () => {
   test("substitutes every known placeholder, including repeats", () => {

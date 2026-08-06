@@ -2,7 +2,7 @@
 
 Two native plugins that keep a 24/7 omp fleet session working, hosted in a Herdr
 pane. They are independent installs on two different hosts' surfaces, and they do
-not import each other — one lives inside the session, the other outside it.
+not import each other: one lives inside the session, the other outside it.
 
 | Directory | Package / id | Host | What it owns |
 | --- | --- | --- | --- |
@@ -10,14 +10,24 @@ not import each other — one lives inside the session, the other outside it.
 | [`herdr/`](herdr) | `herdr-conductor` | Herdr | Bringing that session *back*: after a Herdr restart or a pane exit it resumes the exact omp session in its pane, or pages a human. |
 
 The split follows the failure it handles. A session that is running but idle needs
-a nudge from inside — that is the omp plugin's heartbeat. A session that is not
+a nudge from inside; that is the omp plugin's heartbeat. A session that is not
 running at all cannot nudge itself; only the terminal multiplexer hosting it can,
 and that is the Herdr plugin.
 
 ## Install
 
-Each half installs natively on its own host. They are useful separately, and there
-is no shared runtime, config file, or state directory between them.
+From a checkout, one script does both halves:
+
+```bash
+./setup.sh preflight   # check the machine, change nothing
+./setup.sh             # preflight, then link or install both plugins
+```
+
+It checks every prerequisite before installing anything and prints the fix beside
+each failure. Re-running it is the refresh path.
+
+Or install each half by hand. They are useful separately, and share no runtime,
+config file, or state directory:
 
 ```bash
 # inside omp — from npm
@@ -28,12 +38,29 @@ herdr plugin install TerrifiedBug/conductor/herdr
 ```
 
 `herdr plugin install` takes **GitHub shorthand only** (`owner/repo/subdir`).
-Herdr plugins v1 has no npm install path — `herdr plugin install herdr-conductor`
-is not a thing, and there is no `plugin update`: reinstalling from GitHub is how
+Herdr plugins v1 has no npm install path: `herdr plugin install herdr-conductor`
+is not a thing, and there is no `plugin update`. Reinstalling from GitHub is how
 you refresh the managed checkout.
 
-Per-half requirements, configuration and limitations live in each half's own
-README: [`omp/README.md`](omp/README.md), [`herdr/README.md`](herdr/README.md).
+### Prerequisites
+
+- **omp** and **bun**. Both plugins run inside the harness.
+- **git** and an authenticated **gh** (`gh auth login`, scopes `repo` and
+  `project`). Every run cuts a worktree and reads the tracker through `gh`.
+- **[omp-telegram](https://www.npmjs.com/package/omp-telegram)**, installed and
+  paired. It stays a separate package; conductor borrows its bot token from
+  `~/.omp/agent/telegram/.env` to page you, and the fleet heartbeat reads its
+  `access.json` to confirm a human is still reachable before it lets unattended
+  dispatch continue.
+
+  Tier-2 paging works with the borrowed token alone. The interactive channel —
+  answering an escalation from your phone, approving a brief amendment — is what
+  needs the paired `access.json`.
+- **herdr**, for the half that resumes the fleet pane. Without it `setup.sh`
+  installs the omp half and says so.
+
+Per-half configuration and limitations live in each half's own README:
+[`omp/README.md`](omp/README.md), [`herdr/README.md`](herdr/README.md).
 
 ## The fleet host
 

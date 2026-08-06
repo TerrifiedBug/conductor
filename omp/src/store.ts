@@ -16,12 +16,21 @@ import { dirname } from "node:path";
 import type { RunRecord, RunState, Store } from "./types.ts";
 
 /**
- * States that consume a worker slot. `pushed-green` counts: the branch is
- * pushed and CI is green but nothing is merged, so the worktree, the branch
- * and the issue claim are all still held.
+ * States backed by a worker process. These are what worker capacity counts:
+ * a slot is a process, and only a claimed or running attempt has one.
  */
-const ACTIVE_STATES: readonly RunState[] = ["claimed", "running", "pushed-green"];
+const LIVE_STATES: readonly RunState[] = ["claimed", "running"];
 
+/**
+ * States that keep an *issue* occupied. `pushed-green` belongs here but not in
+ * {@link LIVE_STATES}: its worker is finished and its worktree already removed,
+ * so it must not consume a slot — two green PRs awaiting a human merge would
+ * otherwise stop the whole fleet — but its issue has a live PR that a second
+ * attempt must not land on.
+ */
+const ACTIVE_STATES: readonly RunState[] = [...LIVE_STATES, "pushed-green"];
+
+const LIVE_PLACEHOLDERS = LIVE_STATES.map(() => "?").join(", ");
 const ACTIVE_PLACEHOLDERS = ACTIVE_STATES.map(() => "?").join(", ");
 
 /**
@@ -165,6 +174,11 @@ export function openStore(dbPath: string): Store {
       WHERE project = ? AND state IN (${ACTIVE_PLACEHOLDERS})
       ORDER BY startedAt ASC`,
   );
+  const selectLive = db.query<RunRow, SqlValue[]>(
+    `SELECT * FROM runs
+      WHERE project = ? AND state IN (${LIVE_PLACEHOLDERS})
+      ORDER BY startedAt ASC`,
+  );
   const countAttempts = db.query<{ n: number }, [string, number]>(
     `SELECT COUNT(*) AS n FROM runs WHERE project = ? AND issue = ?`,
   );
@@ -231,6 +245,10 @@ export function openStore(dbPath: string): Store {
 
     activeRuns(project: string): RunRecord[] {
       return selectActive.all(project, ...ACTIVE_STATES).map(toRecord);
+    },
+
+    liveRuns(project: string): RunRecord[] {
+      return selectLive.all(project, ...LIVE_STATES).map(toRecord);
     },
 
     attemptsFor(project: string, issue: number): number {

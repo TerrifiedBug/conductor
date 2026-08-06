@@ -11,6 +11,7 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { configPath, findProject, loadConfig, resolveCaps, stateDir } from "./config.ts";
 import { createEscalator } from "./escalate.ts";
+import { livingDaemon } from "./lifecycle.ts";
 import { startOrchestrator } from "./orchestrator.ts";
 import type { OrchestratorHandle } from "./orchestrator.ts";
 import { branchName, route } from "./routing.ts";
@@ -255,8 +256,16 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
       cwd: worktreePath,
       caps,
       sessionDir,
+      ...(project.workerModel === undefined ? {} : { model: project.workerModel }),
       onTurn: (n) => store.updateRun(runId, { turns: n }),
     });
+
+    // A configured model the harness could not honour means this run was done by
+    // a different model than the operator chose. Logged per run, because it is
+    // the only place that fact is still attached to the issue it affected.
+    if (result.modelFallbackMessage !== undefined) {
+      log(`#${issue} model fallback: ${result.modelFallbackMessage}`);
+    }
 
     store.updateRun(runId, {
       state: result.state,
@@ -394,24 +403,22 @@ async function tick(d: Deps): Promise<void> {
     return;
   }
 
-  const active = store.activeRuns(project.name);
-  let slots = caps.maxConcurrentWorkers - active.length;
-  let dayBudget = caps.maxIssuesPerDay - store.runsStartedSince(project.name, since);
-  if (slots <= 0 || dayBudget <= 0) {
-    log(
-      `at capacity: ${active.length}/${caps.maxConcurrentWorkers} workers, ` +
-        `${caps.maxIssuesPerDay - dayBudget}/${caps.maxIssuesPerDay} issues today`,
-    );
+  // Two different questions, deliberately two queries. Capacity counts worker
+  // *processes*, so a green PR awaiting a human merge must not consume a slot —
+  // two of those would otherwise stop the fleet. The busy set protects *issues*,
+  // so that same green PR must be in it, or a second attempt lands on a live PR.
+  const live = store.liveRuns(project.name);
+  const slots = caps.maxConcurrentWorkers - live.length;
+  if (slots <= 0) {
+    log(`at capacity: ${live.length}/${caps.maxConcurrentWorkers} workers`);
     return;
   }
 
-  // activeRuns includes pushed-green work that is still waiting on a human
-  // merge, so this also stops a second attempt landing on a live PR.
-  const busy = new Set(active.map((r) => r.issue));
+  const busy = new Set(store.activeRuns(project.name).map((r) => r.issue));
 
   const admitted: { r: Routed; attempt: number }[] = [];
   for (const r of routed) {
-    if (slots <= 0 || dayBudget <= 0) break;
+    if (admitted.length >= slots) break;
     if (busy.has(r.issue.number)) continue;
 
     const prior = store.attemptsFor(project.name, r.issue.number);
@@ -432,8 +439,6 @@ async function tick(d: Deps): Promise<void> {
     }
 
     admitted.push({ r, attempt: prior + 1 });
-    slots -= 1;
-    dayBudget -= 1;
   }
 
   if (admitted.length === 0) return;
@@ -451,7 +456,10 @@ export interface StatusSnapshot {
   stateDir: string;
   paused: boolean;
   caps: Caps;
+  /** Occupied issues: live workers plus green PRs awaiting a human merge. */
   activeRuns: RunRecord[];
+  /** Runs backed by a worker process — the number capacity compares against. */
+  liveWorkers: number;
   runsToday: number;
   spendTodayUsd: number;
 }
@@ -472,6 +480,7 @@ export function statusSnapshot(project?: string): StatusSnapshot {
       paused: isPaused(),
       caps: resolveCaps(p, cfg.defaults),
       activeRuns: store.activeRuns(p.name),
+      liveWorkers: store.liveRuns(p.name).length,
       runsToday: store.runsStartedSince(p.name, since),
       spendTodayUsd: store.spendSince(p.name, since),
     };
@@ -487,8 +496,8 @@ export function formatStatus(s: StatusSnapshot): string {
     `state     ${s.stateDir}`,
     "",
     "caps",
-    `  workers            ${s.activeRuns.length} / ${s.caps.maxConcurrentWorkers}`,
-    `  issues today       ${s.runsToday} / ${s.caps.maxIssuesPerDay}`,
+    `  workers            ${s.liveWorkers} / ${s.caps.maxConcurrentWorkers}`,
+    `  issues today       ${s.runsToday}`,
     `  spend today        $${s.spendTodayUsd.toFixed(2)} / $${s.caps.dailySpendUsd.toFixed(2)}`,
     `  worker max turns   ${s.caps.workerMaxTurns}`,
     `  worker wall clock  ${Math.round(s.caps.workerWallClockMs / 60_000)}m`,
@@ -562,6 +571,38 @@ export function armConductor(): void {
   setPaused(false);
 }
 
+/**
+ * Settles the runs a previous daemon process left in flight.
+ *
+ * A `claimed` or `running` row is a promise that a worker exists in *some*
+ * process. This is called from a freshly started daemon, so when no other
+ * daemon is alive every such row is a worker that died with the previous
+ * process. Left "active", those rows deadlock admission forever: the slot
+ * count reads full while nothing runs, and the fleet looks busy doing nothing
+ * (found live, after a host restart killed two workers mid-run).
+ *
+ * Only the rows change. The issue keeps its in-progress label — that label is
+ * the crash guard against double-dispatch, and deciding what a dead worker's
+ * remains are worth (an open PR? unpushed commits? a dirty tree?) is the
+ * orchestrator's drain-duty judgement, not something to automate here. The
+ * rows also keep counting toward `maxAttemptsPerIssue`, so a loop of deaths
+ * still escalates instead of retrying forever.
+ *
+ * `pushed-green` rows are deliberately left alone: they hold no process — they
+ * are finished work waiting on a human merge, and they must keep occupying the
+ * issue so a second attempt cannot land on a live PR.
+ */
+export function reconcileOrphanedRuns(store: Store, project: string): RunRecord[] {
+  // Live runs only: `pushed-green` holds no process, so it cannot be orphaned by
+  // a process dying — it is finished work waiting on a human merge.
+  const stale = store.liveRuns(project);
+  const endedAt = Date.now();
+  for (const r of stale) {
+    store.updateRun(r.id, { state: "orphaned", endedAt });
+  }
+  return stale;
+}
+
 // ------------------------------------------------------------------- the daemon
 
 export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
@@ -570,6 +611,21 @@ export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
   const caps = resolveCaps(project, cfg.defaults);
   const store = openStore(dbPath());
   const tracker = makeTracker(project);
+
+  // Before the first tick, settle what the last process left behind — unless
+  // another daemon is alive (a foreground `daemon --once` beside a running
+  // daemon must not orphan that daemon's real, live workers).
+  const alive = livingDaemon();
+  if (alive === undefined || alive.pid === process.pid) {
+    for (const r of reconcileOrphanedRuns(store, project.name)) {
+      log(
+        `#${r.issue} orphaned by a previous daemon (attempt ${r.attempt}, was ${r.state}, worktree ${r.worktree}) — ` +
+          `slot freed; the ${project.stateLabels.inProgress} label stays until the orchestrator triages what the worker left`,
+      );
+    }
+  } else {
+    log(`skipping orphan reconciliation: daemon pid ${alive.pid} is alive and owns the active runs`);
+  }
 
   // Standing orders. The orchestrator holds none of this file's context, so
   // everything it needs to act — which tracker, which labels, what the fleet

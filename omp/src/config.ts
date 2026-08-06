@@ -16,8 +16,10 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, wri
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
+  CONFIG_VERSION,
   DEFAULT_CAPS,
   DEFAULT_REPORT_SCOPE,
+  READABLE_CONFIG_VERSIONS,
   REPORT_SCOPES,
   type Caps,
   type ConductorConfig,
@@ -140,7 +142,6 @@ export function resolveCaps(p: ProjectConfig, defaults: Caps): Caps {
   const o: Partial<Caps> = p.caps ?? {};
   return {
     maxConcurrentWorkers: o.maxConcurrentWorkers ?? defaults.maxConcurrentWorkers,
-    maxIssuesPerDay: o.maxIssuesPerDay ?? defaults.maxIssuesPerDay,
     dailySpendUsd: o.dailySpendUsd ?? defaults.dailySpendUsd,
     workerMaxTurns: o.workerMaxTurns ?? defaults.workerMaxTurns,
     workerWallClockMs: o.workerWallClockMs ?? defaults.workerWallClockMs,
@@ -185,13 +186,20 @@ function validate(parsed: unknown, path: string): ConductorConfig {
   const problems: string[] = [];
 
   const version = root["version"];
-  if (version !== 1) {
+  // A v1 file predates the retirement of a cap key, so its caps are read
+  // leniently and the result is normalised up to v2. Any other version is a
+  // config this build cannot honestly claim to understand.
+  const legacyCaps = version === 1;
+  if (!READABLE_CONFIG_VERSIONS.some((v) => v === version)) {
     problems.push(
-      `"version" must be 1, found ${JSON.stringify(version)} — this config was written by a different conductor`,
+      `"version" must be ${READABLE_CONFIG_VERSIONS.join(" or ")}, found ${JSON.stringify(version)} — this config was written by a different conductor`,
     );
   }
 
-  const defaults: Caps = { ...DEFAULT_CAPS, ...coerceCaps(root["defaults"], `"defaults"`, problems) };
+  const defaults: Caps = {
+    ...DEFAULT_CAPS,
+    ...coerceCaps(root["defaults"], `"defaults"`, problems, legacyCaps),
+  };
 
   const rawProjects = root["projects"];
   const projects: ProjectConfig[] = [];
@@ -199,7 +207,7 @@ function validate(parsed: unknown, path: string): ConductorConfig {
     problems.push(`"projects" must be a non-empty array — the dispatcher has nothing to service otherwise`);
   } else {
     rawProjects.forEach((p: unknown, i) => {
-      const project = normalizeProject(p, i, problems);
+      const project = normalizeProject(p, i, problems, legacyCaps);
       if (project !== undefined) projects.push(project);
     });
   }
@@ -211,11 +219,18 @@ function validate(parsed: unknown, path: string): ConductorConfig {
     );
   }
 
-  return { version: 1, defaults, projects };
+  // Always v2 out: a loaded v1 config is migrated in memory, and the next
+  // `saveConfig` is what persists the migration. `loadConfig` stays read-only.
+  return { version: CONFIG_VERSION, defaults, projects };
 }
 
 /** Returns `undefined` when the project was too broken to shape; problems are appended. */
-function normalizeProject(parsed: unknown, index: number, problems: string[]): ProjectConfig | undefined {
+function normalizeProject(
+  parsed: unknown,
+  index: number,
+  problems: string[],
+  legacyCaps: boolean,
+): ProjectConfig | undefined {
   const at = `projects[${index}]`;
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     problems.push(`${at} must be an object`);
@@ -260,8 +275,13 @@ function normalizeProject(parsed: unknown, index: number, problems: string[]): P
   };
   if (nonEmptyString(chatId)) escalation.telegramChatId = chatId;
 
-  const caps = coerceCaps(raw["caps"], `${label}: caps`, problems);
+  const caps = coerceCaps(raw["caps"], `${label}: caps`, problems, legacyCaps);
   const reporting = normalizeReporting(raw["reporting"], label, problems);
+  // A hint passed to the harness, not a budget guard: an unusable value is
+  // dropped rather than reported, and the session's own model-fallback notice
+  // (logged by `runWorker`) is what tells the operator the pattern missed.
+  const rawWorkerModel = raw["workerModel"];
+  const workerModel = nonEmptyString(rawWorkerModel) ? rawWorkerModel : undefined;
 
   if (problems.length > before) return undefined;
 
@@ -276,6 +296,7 @@ function normalizeProject(parsed: unknown, index: number, problems: string[]): P
     },
     routing: { labelPrefix, repos },
     caps,
+    ...(workerModel === undefined ? {} : { workerModel }),
     escalation,
     reporting,
     workspaceRoot: expandHome(pickString(raw["workspaceRoot"], join(stateDir(), "worktrees"))),
@@ -299,8 +320,9 @@ function normalizeReporting(parsed: unknown, label: string, problems: string[]):
 
   const unknownKeys = Object.keys(raw).filter((k) => k !== "scope");
   if (unknownKeys.length > 0) {
-    // Same reasoning as an unknown cap key: the operator believes they set
-    // something, and the block that ignores it looks configured either way.
+    // Stricter than caps, which tolerate a retired key: `reporting` has exactly
+    // one member, so an unrecognised key here is a typo every time, and the
+    // block that ignores it looks configured either way.
     problems.push(`${label}: reporting has unknown key(s): ${unknownKeys.join(", ")}`);
   }
 
@@ -367,8 +389,17 @@ function normalizeGates(parsed: unknown, label: string, problems: string[]): { c
   return gates;
 }
 
-/** Keeps only well-formed numeric caps; anything else is reported, not coerced. */
-function coerceCaps(parsed: unknown, label: string, problems: string[]): Partial<Caps> {
+/**
+ * Keeps only well-formed numeric caps; a value of the wrong shape is always
+ * reported, because a ceiling the daemon cannot read is worth stopping for.
+ *
+ * `legacy` decides what an *unrecognised* key means. In a v1 file it is a cap
+ * this version retired, so it is dropped and the config still loads — refusing
+ * would strand a fleet on upgrade. In a v2 file every key this build writes is
+ * current, so an unknown one is a typo and is reported: otherwise a mistyped
+ * `dailySpendUsd` reads as configured while the real ceiling is the default.
+ */
+function coerceCaps(parsed: unknown, label: string, problems: string[], legacy: boolean): Partial<Caps> {
   const out: Partial<Caps> = {};
   if (parsed === undefined) return out;
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
@@ -387,11 +418,13 @@ function coerceCaps(parsed: unknown, label: string, problems: string[]): Partial
     out[key] = v;
   }
 
-  const unknownKeys = Object.keys(raw).filter((k) => !(CAP_KEYS as string[]).includes(k));
-  if (unknownKeys.length > 0) {
-    // Loud, because a typo'd cap key otherwise reads as "budget enforced" while
-    // the real ceiling is still the default.
-    problems.push(`${label} has unknown key(s): ${unknownKeys.join(", ")}`);
+  if (!legacy) {
+    const unknownKeys = Object.keys(raw).filter((k) => !(CAP_KEYS as string[]).includes(k));
+    if (unknownKeys.length > 0) {
+      problems.push(
+        `${label} has unknown key(s): ${unknownKeys.join(", ")} — remove them, or drop "version" to 1 if they are caps an older conductor wrote`,
+      );
+    }
   }
 
   return out;

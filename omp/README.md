@@ -14,16 +14,16 @@ and then stops. Merging is a human act; the conductor never performs it.
 
 One issue, one green PR. That is the whole remit.
 
-Merging is a human act, and so is releasing. Releases are **batched** — cut from a
-coherent group of merged work by a human-supervised decision, never one per PR — so
+Merging is a human act, and so is releasing. Releases are **batched**: cut from a
+coherent group of merged work by a human-supervised decision, never one per PR. So
 nothing in this package tags, pins, deploys or publishes, and no worker is ever
 asked to. A worker whose change needs releasing reports that and stops.
 
-Every limit that decides whether work starts is counted in code, not asked of the
-model: concurrency, issues per day, dollars per day, turns and wall clock per
-worker, attempts per issue. A worker asked to respect a budget eventually talks
-itself out of it, so the dispatcher enforces the budget before anything is claimed
-and kills anything over the line.
+Code counts every limit that decides whether work starts: concurrency, dollars per
+day, turns and wall clock per worker, attempts per issue. None of it is left to the
+model. A worker asked to respect a budget eventually talks itself out of it, so the
+dispatcher enforces the budget before anything is claimed and kills anything over
+the line.
 
 When a run does get stuck, the first responder is not you. A tier-1 escalation is
 injected into a long-lived **orchestrator session** that can read the issue and the
@@ -55,13 +55,13 @@ holds no opinion about it that it could act on.
 Your opinion goes in `ORCHESTRATOR.md`, the standing prompt for the long-lived
 session that supervises the fleet. That file is yours: the conductor renders it
 once, on request, and then never reads it back, never rewrites it and never
-enforces a word of it. What you write there binds your orchestrator session, not
-this package.
+enforces a word of it. What you write there binds your orchestrator session and
+nothing else in this package.
 
 `/conductor setup` offers to render the shipped template
 (`src/briefs/orchestrator.md`) to `<workspaceRoot>/ORCHESTRATOR.md` with your
 project's coordinates filled in, and never replaces an existing file without a
-second, explicit confirmation. It is a starting point, not a contract:
+second, explicit confirmation. It is a starting point rather than a contract:
 
 | Section | Whose |
 | --- | --- |
@@ -70,8 +70,8 @@ second, explicit confirmation. It is a starting point, not a contract:
 | Reporting | **Yours**, seeded from the scope you chose in setup. |
 
 Reporting is the one half of that the config also knows about, because the wizard
-has to ask something in order to seed the brief — and the one half the runtime
-acts on:
+has to ask something in order to seed the brief, and it is the one half the
+runtime acts on:
 
 | `reporting.scope` | What the orchestrator says unprompted | The line every tick carries |
 | --- | --- | --- |
@@ -84,17 +84,17 @@ prompt instead of only in a brief the session read hours ago. It is re-read from
 `~/.omp/conductor/config.json` on **every** tick, so turning the volume up or
 down — `/conductor setup` again, or an edit to the file — binds the next tick
 without restarting the session. Three cases fall back to `material`: no config
-yet, an unreadable or invalid one, and several projects with none named — the
-same ambiguity `status` refuses to guess through. Stopping the heartbeat over a
+yet, an unreadable or invalid one, and several projects with none named (the same
+ambiguity `status` refuses to guess through). Stopping the heartbeat over a
 reporting preference would be the worse trade, so it ticks on the default and
 logs the reason once.
 
 **What it does not do:** there is no hard outbound filter. Nothing inspects the
 orchestrator's messages and drops the ones your scope did not ask for, so a
 session that ignores its constraint line still reaches you. Scope is a
-constraint the model is handed each turn, not a gate it is held to — the
-enforcement roadmap (a tool-call tripwire, and config-versus-behaviour drift in
-the daily digest) is
+constraint the model is handed each turn. It is not a gate the model is held to.
+The enforcement roadmap (a tool-call tripwire, and config-versus-behaviour drift
+in the daily digest) is
 [issue #11](https://github.com/TerrifiedBug/conductor/issues/11).
 
 Changing the key later does not rewrite an `ORCHESTRATOR.md` you already have:
@@ -131,15 +131,37 @@ number of code repos, and both label names are yours to configure.
 omp plugin install omp-conductor
 ```
 
+From a checkout of the monorepo, `./setup.sh` links this plugin and the Herdr half
+after checking everything below.
+
+### Prerequisites
+
 `@oh-my-pi/pi-coding-agent` (`>=17.1.4`) is a **peer dependency** and must already
 be present. If you run omp, it is.
 
 Also required on the host:
 
-- `bun` — the CLI and the daemon run on it (`Bun.serve` backs `/healthz`).
-- `gh`, already authenticated — every tracker operation shells out to it, so the
+- `bun`: the CLI and the daemon run on it (`Bun.serve` backs `/healthz`).
+- `gh`, already authenticated: every tracker operation shells out to it, so the
   daemon never handles a GitHub token itself.
-- `git` — mirrors and worktrees.
+- `git`: mirrors and worktrees.
+- **[omp-telegram](https://www.npmjs.com/package/omp-telegram)**, for the
+  escalation channel. It is a separate package and is not vendored here.
+
+  Two different things depend on it, and they need different amounts of it:
+
+  - **Tier-2 paging** needs only its bot token. This package reads
+    `TELEGRAM_BOT_TOKEN` out of `$OMP_TELEGRAM_STATE_DIR/.env` (default
+    `~/.omp/agent/telegram/.env`) and posts to the chat id you configure. No
+    pairing required, and no token ever passes through this package's own config.
+  - **The interactive channel** — replying to an escalation, approving a brief
+    amendment from your phone — needs omp-telegram actually paired, which is what
+    writes `access.json`. The fleet heartbeat also reads that file and refuses to
+    tick unless exactly one owner is paired, on the grounds that unattended
+    dispatch is only defensible while a tier-2 page can reach a person.
+
+  With neither, tier 2 degrades to a comment on the issue. Nothing is broken in
+  that configuration: it is supported, just slower to reach you.
 
 ## Onboarding
 
@@ -164,8 +186,8 @@ So the skill does the part a dialog cannot:
   values your answer actually maps to.
 - **Reads your repos instead of asking about them.** It opens each routing repo's
   CI workflows, `package.json` scripts and `Makefile`/`justfile`, then *proposes*
-  the exact pre-push [gates](#configuration) with the `cwd` each runs from — so
-  the gates match what CI runs, rather than what you remembered it runs.
+  the exact pre-push [gates](#configuration) with the `cwd` each runs from, so the
+  gates match what CI runs.
 - **Tailors `ORCHESTRATOR.md`** from the shipped template. The template is the
   floor: it rewrites the Releases and Reporting sections from your answers, adds
   the hard boundaries only you know about (infra directories, off-limits repos),
@@ -178,7 +200,7 @@ So the skill does the part a dialog cannot:
 - **Then finishes through the wizard**, so the dry run and the consent gate still
   do the writing.
 
-From an omp session with the plugin installed, just say what you want — "help me
+From an omp session with the plugin installed, just say what you want: "help me
 set up conductor", "onboard me", "configure the fleet" all reach it, because that
 is what the skill's description matches on. With `skills.enableSkillCommands`
 turned on you can also invoke it directly:
@@ -189,6 +211,48 @@ turned on you can also invoke it directly:
 
 Nothing about the wizard changes: `/conductor setup` on its own remains a
 complete, supported path, and the brief it renders is safe unedited.
+
+### Keeping a brief current
+
+Upgrading the package does not upgrade a brief you are already running, and it is
+worth knowing exactly which half of that sentence is true.
+
+| What | Updates on `omp plugin install`? |
+| --- | --- |
+| `skills/conductor-onboarding/SKILL.md` | Yes. The session reads it from the installed package. |
+| `src/briefs/worker.md` | Yes. It is read per run, so the next worker gets the new text. |
+| `src/briefs/orchestrator.md` | Yes, but it is only a *template*: it is read when the wizard renders a brief. |
+| Your rendered `ORCHESTRATOR.md` | **No.** It was written once and is yours from then on. |
+
+That last row is the point. Once the wizard renders your brief, nothing in this
+package reads it back or rewrites it, so a later version that ships a new protocol
+above the `YOURS TO EDIT` banner is invisible to every fleet already running:
+
+```bash
+omp-conductor brief-upgrade              # report only
+omp-conductor brief-upgrade --apply      # replace the shipped half, keep yours
+```
+
+The banner is what makes this safe. Everything above it belongs to the package and
+everything below it belongs to you, so an upgrade replaces the first and copies the
+second across untouched, keeping the previous file as
+`ORCHESTRATOR.md.bak-<timestamp>`. Three cases where it will not write at all:
+
+- **Your brief has no banner** (hand-written, or predating the split). There is no
+  way to tell which lines are yours, so it lists the sections the template has and
+  yours does not, and leaves the file alone. Retitled sections count as present, so
+  `## Reporting (low noise)` is not reported as a missing `## Reporting`.
+- **No config resolved**, so the template still carries its `{{PLACEHOLDER}}`
+  coordinates. Merging it would write those literals into a live prompt.
+- **Nothing changed.** It says so and exits.
+
+`--file PATH` checks a brief that is not where the wizard would have put it, which
+is the normal case on a dedicated fleet host: the supervising session runs from its
+own directory, and that host may never have configured a dispatch daemon.
+
+A brief with the **Learning loop** section has a second route. The session running
+from it can propose the missing sections itself, as a diff, for you to approve with
+a yes over Telegram, which is the same protocol it uses for any other amendment.
 
 ## Quick start
 
@@ -210,7 +274,7 @@ complete, supported path, and the brief it renders is safe unedited.
 
    Two of its questions are about you rather than the fleet: how loud the
    orchestrator should be (`reporting.scope`), and whether to write an
-   `ORCHESTRATOR.md` you then own — see
+   `ORCHESTRATOR.md` you then own. See
    [Your workflow vs. the package](#your-workflow-vs-the-package). If you would
    rather be interviewed through those two, and have the brief tailored and your
    gates read out of your CI config, start from
@@ -253,11 +317,14 @@ Per tick, for the daemon's project:
    the configured repo names. These are never dispatched.
 5. **Check spend.** If spend since local midnight has reached `dailySpendUsd`, the
    daemon **pauses itself**, pages at Tier 2, and returns.
-6. **Check capacity.** `maxConcurrentWorkers` minus active runs gives the free
-   slots; `maxIssuesPerDay` minus runs started today gives the day budget. If
-   either is exhausted, the tick logs and returns.
-7. **Admit issues** up to those two counters, skipping any issue that already has
-   an active run. An issue that has used `maxAttemptsPerIssue` escalates at Tier 1
+6. **Check capacity.** `maxConcurrentWorkers` minus *live* workers (runs in
+   `claimed` or `running`) gives the free slots. A green PR awaiting a human
+   merge occupies its issue but not a slot: its worker is finished, and counting
+   it would let two green PRs stop the fleet. If no slot is free, the tick logs
+   and returns.
+7. **Admit issues** up to the free slots, skipping any issue that already has
+   an active run — including a green PR, so a second attempt can never land on a
+   live PR. An issue that has used `maxAttemptsPerIssue` escalates at Tier 1
    instead of being admitted.
 8. **Dispatch** the admitted issues concurrently.
 
@@ -267,9 +334,9 @@ Then, per admitted issue:
    This ordering is the whole crash-safety story: the label, not the local
    database, is the guard against dispatching the same issue twice. If the process
    dies at any later point, the next daemon sees the label, eligibility filters the
-   issue out, and a human decides what to do with the orphan. A store that is lost
-   can be rebuilt from the tracker; a label that was written too late cannot undo a
-   duplicate PR.
+   issue out, and the orchestrator's drain duty triages the orphan (see below). A
+   store that is lost can be rebuilt from the tracker; a label that was written too
+   late cannot undo a duplicate PR.
 2. Create the run row (`claimed`).
 3. Clear any stale tree for this issue, then add a fresh worktree at
    `<workspaceRoot>/<issue>` cut from the bare mirror at `<mirrorRoot>/<repo>.git`,
@@ -290,6 +357,26 @@ Then, per admitted issue:
    Label swaps add the new label before removing the old one: the reverse order
    leaves a window in which the issue carries no state label at all, which is
    exactly the shape eligibility reads as fresh work.
+
+### What a restart does to runs that were in flight
+
+A `claimed` or `running` row is a promise that a worker process exists, and a
+daemon that just started knows that promise is broken: its workers died with the
+previous process. At startup — unless another daemon is alive, so a foreground
+`daemon --once` cannot orphan a running daemon's real workers — every such row is
+moved to `orphaned`, with a log line naming the issue, the attempt and the
+worktree. That frees the slots immediately; a fleet must never resume as
+deadlocked as it crashed.
+
+Only the rows change. The issue keeps `agent:in-progress` — the label is the
+crash guard against double-dispatch — and deciding what the dead worker's remains
+are worth is the orchestrator's drain-duty judgement, spelled out in its brief:
+an open green PR goes to the merge path, a dirty tree is reported before anything
+destroys it (uncommitted edits have no other copy; unpushed *commits* are safe on
+the run's branch in the mirror, which a retry deliberately reattaches), and a
+clean orphan has its label released so the next tick re-claims it. Orphaned
+attempts still count toward `maxAttemptsPerIssue`, so a crash loop escalates
+instead of redispatching forever.
 
 ### Branch names
 
@@ -321,8 +408,9 @@ This is deliberate. A request that spans two repos, taken whole by one worker, i
 the precise failure this guard exists to prevent: the worker cannot open a PR
 against two checkouts, so it improvises — it vendors a copy, edits the wrong repo,
 or produces a PR that cannot be merged without the other half. Splitting a
-multi-repo request is a human decision about contracts, not something to infer from
-a label. Sending the issue back costs a label edit; guessing costs a bad merge.
+multi-repo request is a human decision about contracts; it is not something to
+infer from a label. Sending the issue back costs a label edit; guessing costs a
+bad merge.
 
 ## Caps
 
@@ -333,7 +421,6 @@ rest. `0` is a real value (a hard stop), not "unset".
 | Cap | Default | What it protects |
 | --- | --- | --- |
 | `maxConcurrentWorkers` | `2` | Parallel omp sessions. Two, because **CI runner slots, not model tokens, are the usual throughput ceiling** — a third worker would starve its own PR checks on a small self-hosted runner pool. Raise it only if you actually have the runners. |
-| `maxIssuesPerDay` | `6` | Blast radius per rolling day: how much unattended churn a bad label sweep can push into the tracker before a human sees it. |
 | `dailySpendUsd` | `25` | Rolling-day spend ceiling. The one cap that stops the fleet rather than deferring work. |
 | `workerMaxTurns` | `120` | Turn ceiling for one worker. Catches a session looping without converging. |
 | `workerWallClockMs` | `5400000` (90 minutes) | Wall-clock ceiling for one worker. A session that is merely stuck spends no turns, so turns alone cannot detect it. |
@@ -341,14 +428,36 @@ rest. `0` is a real value (a hard stop), not "unset".
 
 Days are counted from **local midnight**, matching how a human reads "today".
 
-Hitting `dailySpendUsd` is not the same as hitting the other caps. Concurrency and
-daily-volume limits simply defer work to a later tick. The spend cap **pauses the
-daemon and pages at Tier 2**: a loop that is burning money has to halt itself,
-because waiting for someone to notice tomorrow is how a runaway becomes expensive.
+Hitting `dailySpendUsd` is not the same as hitting the other caps. A concurrency
+limit simply defers work to a later tick. The spend cap **pauses the daemon and
+pages at Tier 2**: a loop that is burning money has to halt itself, because
+waiting for someone to notice tomorrow is how a runaway becomes expensive.
 Work resumes only after `omp-conductor resume` (or `/conductor resume`).
 
 `workerMaxTurns` and `workerWallClockMs` are enforced inside the session driver: the
 run is aborted, recorded as `killed`, and the escalation names which ceiling fired.
+
+## Worker model
+
+`workerModel` on a project pins the model its workers run on, as a pattern in
+omp's own model/role syntax (whatever `/model` accepts). It sits beside `caps`
+rather than inside them, because it is not a ceiling:
+
+```json
+"workerModel": "smol"
+```
+
+Omit it and the harness picks, which is the right answer until you have a reason.
+The pattern is passed through unresolved: omp resolves it after its extensions
+load, so a name this package has never heard of still works. If the harness cannot
+honour the pattern it says so, and the daemon logs that per run:
+
+```text
+#412 model fallback: <what the harness substituted>
+```
+
+Worth reading the log for. A run that quietly used a weaker model than you chose
+otherwise looks like a run that was merely unlucky.
 
 ## Escalation tiers
 
@@ -363,27 +472,27 @@ directory, deliberately not a checkout. Delivery resolves when the harness *acce
 the prompt, not when the model answers it, so a tick never parks behind a model; an
 injection arriving mid-thought queues as a follow-up instead of interrupting the
 turn in flight. Its standing orders are explicit: re-brief the worker, file or
-comment on issues, or promote to tier 2 — and never edit product code, push a branch
+comment on issues, or promote to tier 2, and never edit product code, push a branch
 or merge a PR. If it fails to start, the daemon logs a warning and runs on, with
 tier-1 escalations degraded to issue comments.
 
 Tier 2 borrows the bot token that `omp-telegram` already owns, at
 `~/.omp/agent/telegram/.env` (or `$OMP_TELEGRAM_STATE_DIR/.env`). If you run that
 bot, Tier 2 needs no extra configuration beyond the chat id. If the token is
-absent, Tier 2 degrades to the issue comment rather than failing. The token is
+absent, Tier 2 degrades to the issue comment instead of failing. The token is
 never logged, and it is redacted out of any error text that could reach a public
 issue comment.
 
 **Escalations are deduplicated.** The dispatcher re-notices the same unroutable
 issue on every poll, so a ledger in the store — keyed by project, issue, tier and
-summary — makes a recurring condition page **once**, not every five minutes. The
-marker is recorded only on successful delivery, so a page that could not be
-delivered is retried on the next tick instead of being written off as sent. The
-spend-cap summary carries the date, so the same cap pages again tomorrow but only
-once per day.
+summary — makes a recurring condition page **once** and suppresses the five-minute
+repeats. The marker is recorded only on successful delivery, so a page that could
+not be delivered is retried on the next tick instead of being written off as sent.
+The spend-cap summary carries the date, so the same cap pages again tomorrow but
+only once per day.
 
 If `fallbackToIssueComment` is off and no Telegram transport is configured,
-delivery throws rather than dropping silently — the failure is logged and retried,
+delivery throws instead of dropping silently. The failure is logged and retried,
 because a swallowed escalation looks exactly like a healthy fleet.
 
 ## Configuration
@@ -405,14 +514,19 @@ The file is validated on every read. A malformed config produces one readable er
 listing every fault, and the daemon refuses to start rather than running with half
 a project.
 
+`version` is `2`. A `version: 1` file still loads: caps it names that this build no
+longer enforces are dropped rather than treated as typos, and the next save writes
+it back as `2`. In a `version: 2` file an unrecognised cap key **is** an error,
+because there is nothing left to retire — a mistyped `dailySpendUSD` would
+otherwise read as configured while the real ceiling stayed the default.
+
 A complete, valid config for one project with two target repos:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "defaults": {
     "maxConcurrentWorkers": 2,
-    "maxIssuesPerDay": 6,
     "dailySpendUsd": 25,
     "workerMaxTurns": 120,
     "workerWallClockMs": 5400000,
@@ -452,9 +566,10 @@ A complete, valid config for one project with two target repos:
         }
       },
       "caps": {
-        "maxIssuesPerDay": 4,
+        "maxConcurrentWorkers": 1,
         "dailySpendUsd": 15
       },
+      "workerModel": "smol",
       "escalation": {
         "telegramChatId": "123456789",
         "fallbackToIssueComment": true
@@ -473,7 +588,7 @@ Field notes:
 
 | Field | Notes |
 | --- | --- |
-| `version` | Must be `1`. Present from day one so a format change can be migrated instead of silently misread. |
+| `version` | Must be `2`. A `version: 1` file still loads, drops the caps this build no longer enforces, and is rewritten as `2` on the next save. Present from day one so a format change can be migrated instead of silently misread. |
 | `defaults` | Every `Caps` field. Anything omitted falls back to the built-in default. |
 | `tracker.repo` | `owner/repo`. `tracker.kind` may be omitted; `"github"` is the only accepted value. |
 | `queueLabel` | The one label meaning "a human has signed this off as agent-ready". Matched exactly, case-sensitively. |
@@ -494,7 +609,7 @@ would be for a hand-run clone.
 
 The escalation path above assumes an orchestrator session that is actually
 running its loop. A 24/7 omp session with a standing brief and nobody typing into
-it never gets prompted, so it never runs anything — installing
+it never gets prompted, so it never runs anything. Installing
 `omp plugin install omp-conductor` also installs a heartbeat that prompts it.
 
 The heartbeat is **inert unless the session's cwd contains
@@ -524,7 +639,7 @@ conductor config on every tick. It starts a turn if the session is idle; while a
 turn is streaming it is queued as a follow-up and consumed when that turn ends.
 It sends **nothing** when:
 
-- `/conductor pause` (or `omp-conductor pause`) holds the pause flag — the same
+- `/conductor pause` (or `omp-conductor pause`) holds the pause flag, the same
   flag the dispatch loop reads, so pausing the fleet pauses its heartbeat;
 - `armedFile` is configured and missing;
 - `accessFile` is configured and the escalation channel is not verifiably up;
@@ -534,16 +649,16 @@ It sends **nothing** when:
 ### The escalation channel is a gate, and it fails closed
 
 Unattended dispatch is only defensible while a tier-2 escalation can reach a
-person. So `accessFile` is checked on **every** tick, not cached at session start:
-the bridge is reconfigured out-of-band, and a heartbeat that trusted a startup
-snapshot would keep dispatching for days after the channel went away. A stale arm
-marker must not outlive the channel that makes running unattended safe.
+person. So `accessFile` is checked on **every** tick and never cached at session
+start: the bridge is reconfigured out-of-band, and a heartbeat that trusted a
+startup snapshot would keep dispatching for days after the channel went away. A
+stale arm marker must not outlive the channel that makes running unattended safe.
 
 The check passes only when the file parses to an object with `enabled: true` and
 exactly one `allowFrom` entry. Everything else stops the heartbeat: file missing,
 unreadable or truncated; not JSON, or JSON that is not an object; `enabled`
-absent or false; zero owners paired (nobody to page) or more than one (ambiguous
-— the conductor refuses to guess which human is on the hook). Failure modes are
+absent or false; zero owners paired (nobody to page) or more than one (ambiguous:
+the conductor refuses to guess which human is on the hook). Failure modes are
 deliberately not distinguished in the decision: each one means a page lands
 nowhere.
 
@@ -558,7 +673,7 @@ every interval, forever. The one exception is a malformed `.conductor-tick.json`
 which notifies once at session start and leaves the heartbeat off; silent failure
 there is the failure mode the heartbeat exists to prevent. A conductor config that
 cannot supply a reporting scope logs `tick reporting scope: using material` once
-per session — once, not once per interval, because the file is unlikely to fix
+per session. The interval does not re-log it, because the file is unlikely to fix
 itself between two ticks.
 
 ## CLI reference
@@ -571,6 +686,7 @@ omp-conductor status [--project NAME]
 omp-conductor daemon [--once] [--port N] [--project NAME]
 omp-conductor pause
 omp-conductor resume
+omp-conductor brief-upgrade [--apply] [--file PATH] [--project NAME]
 omp-conductor help
 ```
 
@@ -586,6 +702,9 @@ omp-conductor help
 | `--project NAME` | Pick the project to service. One daemon process serves exactly one project; with several configured projects the name is required. |
 | `pause` | Stop claiming new work. The running daemon notices on its next tick; runs already in flight finish. |
 | `resume` | Allow claiming again. |
+| `brief-upgrade` | Compare a project's `ORCHESTRATOR.md` against the brief this version of the package ships. Reports by default; see [Keeping a brief current](#keeping-a-brief-current). |
+| `--apply` | Only for `brief-upgrade`. Replaces the half above the `YOURS TO EDIT` banner and keeps everything below it, backing the previous file up first. Ignored when the brief cannot be split or the template is unrendered. |
+| `--file PATH` | Only for `brief-upgrade`. Check a brief that is not where the wizard would have put it, on a host that may have no config at all. |
 | `help`, `--help`, `-h` | Print usage. An unknown or missing verb prints it too, and exits `2`. |
 
 Pause is a flag file under the state directory, so it applies to every project and
@@ -606,8 +725,9 @@ curl -s localhost:8787/healthz
 { "ok": true, "paused": false, "activeRuns": 1, "project": "demo" }
 ```
 
-Any other path or method returns `404`. Note that `ok` reports that the process is
-serving, not that the fleet is doing work — read `paused` to tell those apart.
+Any other path or method returns `404`. Note that `ok` reports only that the
+process is serving. It does not report that the fleet is doing work: read
+`paused` to tell those apart.
 
 ## What a worker may and may not do
 
@@ -625,7 +745,7 @@ dispatcher. The brief is explicit about the boundary:
 | Escalate: ambiguity, a cross-repo contract, a needed credential, a product or data-migration decision, a blocking existing test, CI red twice, or most of the wall-clock budget burned. | **Cut a release**, push a tag, publish to npm, edit a deployment pin, deploy, or touch infrastructure or secrets — permanently out of scope. Releases are batched and decided outside this loop, so "this needs releasing" is a thing to report, never a task to take on. |
 
 The worker ends with a six-line evidence report (issue, pr, state, gates, changed,
-next). `pushed-green` means it watched the checks go green, not that it expects
+next). `pushed-green` means it watched the checks go green rather than expecting
 them to.
 
 ## Limitations
@@ -641,7 +761,7 @@ Known and deliberate in this version:
   it is a paging one.
 - **Spend accounting depends on harness telemetry.** Cost arrives only when the
   harness run carries it; without it `spendUsd` reads `0`, `status` shows `$0.00`,
-  and the daily-spend cap never fires — the turn and wall-clock ceilings are what
+  and the daily-spend cap never fires. The turn and wall-clock ceilings are what
   actually bound a runaway in that case. Do not treat `$0.00` as proof that nothing
   was spent.
 - **GitHub is the only tracker.** The internal `Tracker` port is deliberately
@@ -649,7 +769,7 @@ Known and deliberate in this version:
 - **One project per daemon process.** Several projects means several processes,
   each with `--project` and its own `--port`.
 - **Labels are matched exactly and case-sensitively.** `Ready-For-Agent` is not
-  `ready-for-agent`, and the mismatch is silent — the issue is simply never picked
+  `ready-for-agent`, and the mismatch is silent: the issue is simply never picked
   up.
 - **No cross-process lock on the mirrors.** Two dispatch loops fetching the same
   repo at the same instant can collide on git's ref locks; the run fails and is
@@ -664,6 +784,16 @@ Known and deliberate in this version:
   running, but tier-1 escalations then land in issue comments — which is exactly the
   "nobody reads it until morning" path the orchestrator exists to avoid. The warning
   is in `daemon.log`; nothing pages you about it.
+- **Workers are not terminal panes, so you cannot watch them.** A worker is an
+  in-process omp session inside the daemon, started by `createSession` and driven
+  concurrently via `Promise.allSettled`. Herdr therefore shows exactly one pane
+  (the orchestrator's) no matter how many workers are running, and no amount of
+  `maxConcurrentWorkers` changes that.
+
+  The cap does work. The admission loop (`src/daemon.ts:410-448`) computes
+  `slots = maxConcurrentWorkers - live workers`, admits at most that many issues
+  per tick, and dispatches them together. To see them, read `omp-conductor
+  status`, which lists every occupied issue, or follow `daemon.log`.
 - **Merges, releases and deploys are human-only, by design.** The conductor
   produces green PRs and stops.
 
