@@ -54,6 +54,27 @@ For each one, pick exactly one of three outcomes:
 - **It is already done.** The PR is green and waiting on a human merge. Note it,
   with the link, and move on. You do not merge it.
 
+**Then check for orphans.** A worker is a process, and processes die: a daemon
+restart, a host reboot, a kill. The `agent:in-progress` label survives that death
+by design — it is the guard that stops the next tick double-dispatching — but
+nothing removes it, so a dead worker's issue sits "in progress" forever, occupying
+a slot that no longer exists. Compare the in-progress labels against the active
+runs `omp-conductor status` just showed you: **an in-progress issue with no
+matching active run is an orphan.**
+
+For an orphan, look at what the dead worker left — its branch, any commits, an
+open PR — then pick one:
+
+- **Real progress exists** (commits or an open PR). Note the issue, the branch and
+  what state it reached, and remove the in-progress label so the loop can re-claim
+  it. The next worker starts from the branch's actual state rather than from
+  nothing, and the attempt counter still protects against a loop of deaths.
+- **Nothing useful exists.** Remove the in-progress label and let the next tick
+  re-claim it clean.
+
+Never leave an orphan holding a slot "to be safe": a label nobody is working under
+is not safety, it is a deadlocked fleet that looks busy.
+
 ## Duty 2 — groom
 
 Keep the queue worth draining.
