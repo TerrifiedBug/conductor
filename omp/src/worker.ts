@@ -37,7 +37,21 @@ export interface WorkerOpts {
    * location; either way the real path comes back on {@link WorkerResult}.
    */
   sessionDir?: string;
+  /**
+   * Model pattern for this session, in omp's model/role syntax. Omitted leaves
+   * the harness to pick, which is what an unconfigured project wants.
+   */
+  model?: string;
   onTurn?: (n: number) => void;
+}
+
+/**
+ * The one collaborator worth injecting: starting a session is the only thing
+ * `runWorker` does that needs a real harness. Defaulted, so production callers
+ * never pass it and a test can hand over a fake without a live peer dependency.
+ */
+export interface RunWorkerDeps {
+  createSession: typeof createSession;
 }
 
 export interface WorkerResult {
@@ -53,6 +67,12 @@ export interface WorkerResult {
    * cleaned up.
    */
   sessionFile?: string;
+  /**
+   * Set when the harness could not honour {@link WorkerOpts.model} and used
+   * another. Carried out rather than swallowed: a run that quietly read dumber
+   * is otherwise indistinguishable from a run that was merely unlucky.
+   */
+  modelFallbackMessage?: string;
 }
 
 /**
@@ -112,21 +132,30 @@ export function shouldComplete(event: { isTerminal?: boolean }): boolean {
  * failed run — a rejected `prompt()` is reported as `state: "failed"` so the
  * dispatcher's retry/escalate logic has one shape to reason about.
  */
-export async function runWorker(o: WorkerOpts): Promise<WorkerResult> {
+export async function runWorker(
+  o: WorkerOpts,
+  deps: RunWorkerDeps = { createSession },
+): Promise<WorkerResult> {
   // Read the caps once, by value: `o.caps` belongs to the caller's config.
   const { workerMaxTurns, workerWallClockMs } = o.caps;
 
-  const session = await createSession({
+  const session = await deps.createSession({
     cwd: o.cwd,
     ...(o.sessionDir === undefined ? {} : { sessionDir: o.sessionDir }),
+    ...(o.model === undefined ? {} : { model: o.model }),
   });
 
-  // Every exit below reports the transcript the same way: the path the session
-  // actually opened, or nothing. Read at return time so a session that
-  // materialises its file late is still reported honestly.
-  const withTranscript = (result: WorkerResult): WorkerResult => {
-    const sessionFile = session.sessionFile;
-    return sessionFile === undefined ? result : { ...result, sessionFile };
+  // Every exit below reports the session's own facts the same way: the
+  // transcript it actually opened, and any model downgrade it announced. Read at
+  // return time so a session that materialises either late is still reported
+  // honestly.
+  const withSessionFacts = (result: WorkerResult): WorkerResult => {
+    const { sessionFile, modelFallbackMessage } = session;
+    return {
+      ...result,
+      ...(sessionFile === undefined ? {} : { sessionFile }),
+      ...(modelFallbackMessage === undefined ? {} : { modelFallbackMessage }),
+    };
   };
 
   let turns = 0;
@@ -209,7 +238,7 @@ export async function runWorker(o: WorkerOpts): Promise<WorkerResult> {
     // Our own abort surfaces here on some paths; that is a kill, not a crash.
     if (killedBy === undefined) {
       const detail = cause instanceof Error ? cause.message : String(cause);
-      return withTranscript({
+      return withSessionFacts({
         state: "failed",
         turns,
         spendUsd,
@@ -228,11 +257,11 @@ export async function runWorker(o: WorkerOpts): Promise<WorkerResult> {
   }
 
   if (killedBy !== undefined) {
-    return withTranscript({ state: "killed", turns, spendUsd, report, killedBy });
+    return withSessionFacts({ state: "killed", turns, spendUsd, report, killedBy });
   }
 
   const { state, prUrl } = deriveResult(report);
-  return withTranscript(
+  return withSessionFacts(
     prUrl === undefined
       ? { state, turns, spendUsd, report }
       : { state, prUrl, turns, spendUsd, report },

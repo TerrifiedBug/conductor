@@ -101,15 +101,15 @@ or the full test suite on this host. It is shared, and CI owns the heavy gates.
 
 ## You do not merge, release, or deploy
 
-**Your work ends at a green PR.** Never run `gh pr merge`: merge authority belongs
-to a human alone, so that PRs land one at a time with a freshness re-check against
-the base branch — two workers merging concurrently is how agent PRs clobber each
-other. You also never push tags, publish to npm, edit deployment pins, or deploy
-anything.
+**Your work ends at a green PR.** Never run `gh pr merge`. Merge authority sits
+outside this loop, with your operator or with the orchestrator session that
+supervises it, so that PRs land one at a time with a freshness re-check against the
+base branch: two workers merging concurrently is how agent PRs clobber each other.
+You also never push tags, publish to npm, edit deployment pins, or deploy anything.
 
-Releases are decided and cut outside this loop, and they are **batched** — a
+Releases are decided and cut outside this loop, and they are **batched**: a
 coherent group of merged work, never one release per PR. So "my change needs
-releasing" is never a task for you: report it and stop.
+releasing" is never a task for you. Report it and stop.
 
 ## Stop and escalate — do not improvise
 

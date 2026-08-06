@@ -1,6 +1,6 @@
 ---
 name: conductor-onboarding
-description: Interview-driven onboarding for omp-conductor. Use when the user wants to set up conductor, onboard a new fleet or project, configure the fleet, asks for conductor setup help, or asks what belongs in ORCHESTRATOR.md. Interviews the operator on release policy, escalation taste and reporting scope, reads each routing repo's CI to propose the real pre-push gates, tailors ORCHESTRATOR.md from the shipped template, verifies the worker brief's assumptions against the actual repos, then finishes through the deterministic /conductor setup wizard.
+description: Interview-driven onboarding for omp-conductor. Use when the user wants to set up conductor, onboard a new fleet or project, configure the fleet, asks for conductor setup help, asks what belongs in ORCHESTRATOR.md, or wants an agent's release and merge authority scoped and written down. Interviews the operator on release policy, escalation taste and reporting scope, reads each routing repo's CI to propose the real pre-push gates, learns the product and roadmap the fleet will groom, scaffolds the release procedure from the repo's own release workflows rather than from the operator's memory, tailors ORCHESTRATOR.md from the shipped template, verifies the worker brief's assumptions against the actual repos, then finishes through the deterministic /conductor setup wizard.
 ---
 
 # Onboarding a conductor fleet
@@ -110,21 +110,29 @@ would for a hand-run clone; say that out loud if you see one.
 
 ### Release policy — the question that actually matters
 
-This is the decision the shipped brief exists to protect, so give it room. Frame
-it as **three** options, in this order, and name the default:
+This is the decision the shipped brief exists to protect, so give it room.
+
+First, settle who is even a candidate, because operators assume it is the workers
+and it never is. A worker is scoped to one issue: it cannot judge whether a release
+is worth cutting, and it stops at a green PR permanently. **The only two candidates
+are the orchestrator and a human.** The orchestrator is the right agent for it if
+any agent is: it is long-lived, it can see everything that merged since the last
+release, and batching is exactly the judgement a per-issue session cannot make.
+
+So frame it as **three** options, in this order, and name the default:
 
 1. **Humans release.** *(default, and what the package ships)* Work ends at a
    green PR. Merging is a separate human action; releasing is a separate human
    action after that. Neither a worker nor the orchestrator ever tags, pins,
    publishes, or deploys. "This needs releasing" becomes something the
    orchestrator *reports*.
-2. **The agent releases up to a named boundary.** Delegating part of the release,
-   with the stopping line written down.
-3. **The agent releases fully.**
+2. **The orchestrator releases up to a named boundary.** Delegating part of the
+   release to the supervising session, with the stopping line written down.
+3. **The orchestrator releases fully.**
 
 Then ask the question that makes option 2 real:
 
-> **"Where does the agent's leg END?"**
+> **"Where does the orchestrator's leg END?"**
 
 Not "can it release" — *where does its leg stop*. A boundary you cannot state in
 one sentence is not a boundary, and an orchestrator with a vague release mandate
@@ -161,6 +169,13 @@ If they choose option 3, do not just write it down. Warn, concretely:
 
 Push back once if the answer is option 3 and the reasoning is "it'll be fine".
 Then record what they decide. It is their fleet.
+
+**Then stop, and do not write the section yet.** What you have is the operator's
+*intent*: how much they want to delegate, and where they want the line. The
+*steps* on their side of that line come from the repo's own release machinery, not
+from this conversation. Step 4 reads that machinery and turns the intent into a
+procedure. Writing release steps from an interview answer is how a brief ends up
+prescribing a hand-rolled release the repo's own policy forbids.
 
 ### Escalation taste
 
@@ -266,7 +281,140 @@ Three warnings to carry, every time:
 
 ---
 
-## Step 3 — tailor the brief, and show the diff first
+## Step 3 — learn the product
+
+The duties assume an orchestrator that understands what it is grooming. Duty 2
+asks it to judge whether acceptance criteria are readable and whether an issue is
+worth claiming at all; neither is answerable by a session that knows only the repo
+names. So learn the product now, and write what you learn into the brief.
+
+Read, per routing repo:
+
+- the `README` — what the thing is for, and who uses it;
+- whatever top-level architecture doc exists (`docs/`, `ARCHITECTURE.md`, an ADR
+  directory), enough to say which repo owns which concern;
+- `AGENTS.md` / `CONTRIBUTING.md` for the repo's own rules, which outrank the
+  brief.
+
+Then read the tracker as a roadmap rather than as a queue:
+
+```bash
+gh issue list --repo <tracker> --state open --limit 100 --json number,title,labels,milestone
+gh api repos/<tracker>/milestones --jq '.[] | "\(.title) — \(.open_issues) open"'
+gh label list --repo <tracker>
+```
+
+Milestones and the label taxonomy are what separate a theme from a one-off. Epics
+usually surface as one or the other.
+
+Then ask the operator exactly one question, because it is the one thing none of
+that reading answers:
+
+> **"Where does the roadmap live, and what is the current priority?"**
+
+*Why:* a tracker shows what is open, never what matters. An orchestrator that
+cannot rank work grooms by recency, and that is how a stale issue outranks the
+thing the operator is actually shipping this month.
+
+**Write the findings into the brief** as a `## Project context` section, in the
+editable half beside Releases — the template ships a stub for it. Keep it under 40
+lines: it is read on every tick, and a brief nobody finishes reading is a brief
+that gets skimmed. It needs four things.
+
+1. **The product in one paragraph.** What it does, for whom. Not a feature list.
+2. **A repo map** — one line per routing key, naming what that repo owns in the
+   operator's vocabulary. This is what turns a routing label into a judgement.
+3. **Grooming guidance for Duty 2.** Which repos ship together, so a change in one
+   is known to need a matching PR in the other. And which kinds of issue touch the
+   same files: those must not be queued concurrently, because two workers editing
+   one file produce two PRs that cannot both merge.
+4. **Where the roadmap lives, and how to judge priority against it** — the pointer
+   the operator just gave you, in one line.
+
+Same order of operations as Step 5: draft it now, and apply it to the brief after
+the wizard has written the file.
+
+---
+
+## Step 4 — scaffold the release process from the repo, not from memory
+
+The interview gave you a boundary. This step turns it into steps the operator's
+repos will actually accept, for the same reason Step 2 reads CI instead of asking
+about gates: an operator describes the release they *remember*, and a release is
+the one procedure where being approximately right is worst.
+
+Skip this step only for option 1 (humans release). There is nothing to scaffold:
+the shipped paragraph is already correct and the brief keeps it verbatim.
+
+### Find the release authority
+
+Per repo that can be released, read:
+
+```bash
+gh api repos/<owner>/<repo>/contents/.github/workflows --jq '.[].name'
+gh release list --repo <owner>/<repo> --limit 10
+git tag --list --sort=-v:refname | head
+```
+
+and then, in the checkout:
+
+- **every workflow that publishes anything** — a release, a tag, an image, a
+  package, a deployment. For each, the **trigger** is the fact that matters:
+  - `workflow_dispatch` → the release is *dispatched*. That workflow is the
+    authority, and the correct instruction is "dispatch it with the planned
+    version", never "do what it does".
+  - `on: push: tags:` → a pushed tag is the trigger, so tagging *is* releasing.
+  - `on: release: published` → the GitHub Release is the trigger.
+- **what the workflow enforces.** Many reject a tag unless several version files
+  agree. That constraint belongs in the brief, quoted, because it is the failure
+  the agent will otherwise hit at 03:00.
+- **`AGENTS.md`, `CONTRIBUTING.md`, and any release runbook.** An explicit policy
+  outranks anything you infer from a workflow, and it is usually where the
+  *forbidden* paths are named.
+- **whether a release needs a human by construction.** An `npm publish` behind
+  interactive 2FA cannot be delegated to an unattended session at all, whatever the
+  operator would like. Say so rather than writing a step that cannot run.
+
+### Then write three things, and one of them is the forbidden list
+
+Present this back as a proposal, in the repo's own commands, before it goes in the
+brief:
+
+1. **The authority, named.** One sentence: which workflow or command ships this
+   repo, and how it is invoked. If it is a protected workflow, the brief says
+   *dispatch it and verify the run* and stops there.
+2. **The steps on the agent's side of the boundary**, as commands, in order, each
+   with the check that proves it worked. A step whose success cannot be read from
+   a named check is not a step the agent can own.
+3. **What is forbidden, and why, with the citation.** This is the part that decays
+   silently, so it is the part to write down hardest. Cite the file and the line:
+   `never mutate the deployment directly or reimplement the release by hand
+   (repos/<repo>/AGENTS.md)`. A forbidden path with a source attached survives a
+   future session's improvisation; "be careful with releases" does not.
+
+### Ask two things the repo cannot tell you
+
+- **"What is a release worth cutting?"** The batching unit, in the repo's own
+  vocabulary: a sprint, an epic's children all closed, N merged issues waiting, N
+  days elapsed, or urgency. Without this the orchestrator either releases per merge
+  (a stream of meaningless versions burning shared runners) or never releases at
+  all.
+- **"Who owns the rollback?"** If the answer is a person, that person owns the
+  release, and the boundary belongs before the irreversible step regardless of
+  what option 2 sounded like in the interview.
+
+### And make it self-correcting
+
+A release process is the section most likely to go stale: workflows get replaced,
+and a brief describing the old one still reads plausible. So tell the operator
+plainly, and make sure the brief's own **Learning loop** covers it: when the
+release workflow changes, the brief contradicts repo reality, which is exactly an
+amendment trigger. The session proposes the corrected steps and they approve with
+a yes.
+
+---
+
+## Step 5 — tailor the brief, and show the diff first
 
 `src/briefs/orchestrator.md` in this package is the **floor**, not the deliverable.
 It ships deliberately conservative so that an operator who never edits it still
@@ -282,15 +430,26 @@ The evidence rule in particular is not negotiable: *every claim cites evidence �
 PR URL, an issue number, or a named check actually read.* "Should be fine",
 "looks green" and "probably passing" are not evidence.
 
+Know what is *not* up there, though, because operators expect it to be: the
+orchestrator's own merge and release authority is **not** a hard boundary. It is
+policy, it lives in Releases, and it defaults to none. What is fixed above the
+banner is that a *worker* never merges or releases, and that PRs land one at a time
+with a freshness re-check. Delegating a release to the orchestrator does not touch
+either of those, so it needs no negotiation with the shipped half.
+
 **Below the banner — rewrite from the interview.**
 
-- **Releases.** Replace the section with the decision from Step 1. If they chose
+- **Releases.** Replace the section with the procedure you scaffolded in Step 4. If
   humans-release, say so in one short paragraph and stop; do not leave the "replace
   this paragraph if you are delegating" instructions in a finished brief, because
   a standing prompt full of alternatives it did not choose is a standing prompt
   the session has to guess its way through. If they chose a boundary, write the
   boundary as a sentence with an end — *"your leg ends at the merged pin PR; you
-  never deploy it"* — followed by the five captured specifics as a list.
+  never deploy it"* — then the scaffolded steps, then the forbidden list with its
+  citations. State the merge authority explicitly either way: a brief that
+  prescribes landing a release PR without ever saying the orchestrator may merge is
+  a brief the session has to infer permission from, and it will infer wrong in one
+  direction or the other.
 - **Reporting.** Rewrite it as the one scope they chose, in the second person,
   concretely. Delete the description of the scope they did not choose: it is
   useful in a template and noise in a live prompt. Keep the closing constraint
@@ -319,14 +478,14 @@ will ever get.
 
 **Order of operations matters here.** The wizard writes the *template* (with
 coordinates substituted) at the path it owns. So: draft and agree the tailored
-sections now, let the wizard write the rendered floor in Step 4, and apply the
+sections now, let the wizard write the rendered floor in Step 7, and apply the
 agreed edits to that file immediately afterwards. Do not pre-write the file to a
 path you guessed, and do not skip the wizard's brief-writing step — you would
 lose the substituted coordinates and the overwrite confirmation.
 
 ---
 
-## Step 4 — check the worker brief's assumptions against reality
+## Step 6 — check the worker brief's assumptions against reality
 
 The worker brief makes concrete claims to a session that has no other context. If
 a claim is wrong, the worker cannot tell — it just fails in a confusing way. Check
@@ -367,7 +526,7 @@ finding. "CI should trigger" is not.
 
 ---
 
-## Step 5 — finish through the wizard
+## Step 7 — finish through the wizard
 
 Now hand the collected answers to the deterministic path:
 
@@ -395,10 +554,11 @@ Two things about the end of it that you must not smooth over:
   no state database, no arm. If they decline, the machine is untouched. Never
   answer that confirm on their behalf.
 
-Say yes to writing `ORCHESTRATOR.md`, then **immediately apply the Step 3 edits**
-to the file it wrote, and tell them the path. Note the trap for later: a future
-`/conductor setup` re-run offers to overwrite that file, and accepting loses every
-tailored word. Their brief is now a file worth keeping a copy of.
+Say yes to writing `ORCHESTRATOR.md`, then **immediately apply the edits you
+drafted in Steps 3, 4 and 5** to the file it wrote, and tell them the path. Note
+the trap for later: a future `/conductor setup` re-run offers to overwrite that
+file, and accepting loses every tailored word. Their brief is now a file worth
+keeping a copy of.
 
 ### Then walk arm, pause, and disarm — they are three different things
 
@@ -435,7 +595,7 @@ Operators conflate these, and the failure modes are not the same.
 
 ---
 
-## Step 6 — say the thing about iteration
+## Step 8 — hand over the learning loop
 
 Finish by telling the operator the truth about what they just wrote:
 
@@ -446,13 +606,21 @@ something: a reporting scope that turned out too loud, a release boundary drawn 
 the wrong place, an escalation that should have been a digest line, a hard
 boundary nobody thought to name until an agent walked into it.
 
-So set the expectation concretely: **revisit the brief after the first week of
-real ticks.** Bring three things to that review — the escalations that arrived,
-the issues that came back unroutable, and any tick where the report was either
-noise or a surprise. Each of those maps to one line in the brief.
+The brief closes that gap itself now. Point them at its **Learning loop** section
+and say what it means in practice:
 
-That loop is currently manual, and productising it is the known next step:
-[issue #8](https://github.com/TerrifiedBug/conductor/issues/8) proposes a v2 where
-the daily digest itself **proposes brief amendments** from observed friction —
-repeated skip reasons, recurring unroutable patterns — for the operator to approve.
-Until then, the review is a calendar entry. Suggest they make one.
+- **Their corrections are the trigger.** When they tell the orchestrator to work
+  differently — mid-flight, in a reply to an escalation, anywhere — it drafts the
+  matching edit to its own brief instead of just complying once.
+- **Approval is a Telegram yes/no.** The proposal arrives as one question carrying
+  the exact diff: the current lines, then the replacement. Yes applies it. No, or
+  no answer at all, drops it, and it does not raise that amendment again.
+- **Two things it will never do:** propose relaxing **Hard boundaries** (that
+  section changes only when they hand-edit it), or interrupt a tick's duties to
+  ask.
+- **Every applied amendment is logged** as one line under **Amendments** at the
+  bottom of the brief — date, trigger, summary. That list is the honest record of
+  where this interview was wrong, and it accumulates without anyone scheduling it.
+
+That is the whole handover. Convergence is now the loop's job rather than a habit
+the operator has to keep.

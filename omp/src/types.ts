@@ -16,9 +16,6 @@ export interface Caps {
   /** Parallel omp sessions. Two, because the homelab only has 3 CI runners and
    *  a third worker would starve its own PR checks. */
   maxConcurrentWorkers: number;
-  /** Blast radius per rolling day: caps how much unattended churn a bad label
-   *  sweep can push into the tracker before a human sees it. */
-  maxIssuesPerDay: number;
   /** Rolling-day spend ceiling; the loop stops claiming work once it is hit. */
   dailySpendUsd: number;
   /** Turn ceiling for one worker — catches loops that are burning tokens
@@ -88,6 +85,12 @@ export interface ProjectConfig {
   routing: { labelPrefix: string; repos: Record<string, RepoTarget> };
   /** Per-project overrides layered on the global defaults. */
   caps: Partial<Caps>;
+  /**
+   * Model pattern for worker sessions, in omp's model/role syntax. Omitted
+   * leaves the harness default in place, which is what a project that never
+   * answered the question wants.
+   */
+  workerModel?: string;
   /** How a stuck run reaches a human, and what to do when it cannot. */
   escalation: { telegramChatId?: string; fallbackToIssueComment: boolean };
   /**
@@ -103,11 +106,25 @@ export interface ProjectConfig {
 }
 
 /**
+ * The config format this conductor writes. Bumped from 1 when a daily-volume cap
+ * was retired: a v1 file may still carry cap keys this version no longer
+ * enforces, so it is read leniently and normalised up, while a v2 file is held
+ * to the current key set exactly.
+ */
+export const CONFIG_VERSION = 2;
+
+/**
+ * Versions this conductor can read. A v1 file loads, drops the caps that no
+ * longer exist, and is rewritten as v2 the next time anything saves.
+ */
+export const READABLE_CONFIG_VERSIONS = [1, CONFIG_VERSION] as const;
+
+/**
  * On-disk root config. `version` is present from day one so a format change
  * can be migrated instead of silently misread by an older daemon.
  */
 export interface ConductorConfig {
-  version: 1;
+  version: typeof CONFIG_VERSION;
   defaults: Caps;
   projects: ProjectConfig[];
 }
@@ -226,7 +243,6 @@ export interface Escalation {
  */
 export const DEFAULT_CAPS: Caps = {
   maxConcurrentWorkers: 2,
-  maxIssuesPerDay: 6,
   dailySpendUsd: 25,
   workerMaxTurns: 120,
   workerWallClockMs: 90 * 60 * 1000,

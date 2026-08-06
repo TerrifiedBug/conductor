@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { configPath, findProject, loadConfig, resolveCaps, saveConfig, stateDir } from "./config.ts";
 import {
+  CONFIG_VERSION,
   DEFAULT_CAPS,
   DEFAULT_REPORT_SCOPE,
   type Caps,
@@ -61,7 +62,7 @@ function project(name: string): ProjectConfig {
 }
 
 function config(...projects: ProjectConfig[]): ConductorConfig {
-  return { version: 1, defaults: { ...DEFAULT_CAPS }, projects };
+  return { version: CONFIG_VERSION, defaults: { ...DEFAULT_CAPS }, projects };
 }
 
 /** Writes a config the loader must reject, bypassing `saveConfig`'s typing. */
@@ -88,10 +89,10 @@ test("loadConfig on a missing file names the path and the fix", () => {
   expect(() => loadConfig()).toThrow("/conductor setup");
 });
 
-test("loadConfig rejects a config written by a different version", () => {
-  writeRawConfig({ ...config(project("demo")), version: 2 });
+test("loadConfig rejects a config written by a version it cannot read", () => {
+  writeRawConfig({ ...config(project("demo")), version: 3 });
 
-  expect(() => loadConfig()).toThrow(/"version" must be 1/);
+  expect(() => loadConfig()).toThrow(/"version" must be 1 or 2, found 3/);
 });
 
 test("loadConfig rejects an empty projects list", () => {
@@ -179,6 +180,72 @@ test("loadConfig rejects a reporting block that is not an object", () => {
   expect(() => loadConfig()).toThrow(/reporting must be an object with a "scope"/);
 });
 
+test("a v1 config keeps loading after a cap is retired, and reports as v2", () => {
+  writeRawConfig({
+    version: 1,
+    defaults: { ...DEFAULT_CAPS, retiredCapFromAnOlderVersion: 6 },
+    projects: [{ ...project("demo"), caps: { retiredCapFromAnOlderVersion: 4 } }],
+  });
+
+  // Every config the wizard has ever written carries the caps current at the
+  // time. Refusing to load is how an upgrade strands a fleet whose config is
+  // otherwise fine — so a v1 file drops what no longer exists and migrates up.
+  const loaded = loadConfig();
+  expect(loaded.version).toBe(CONFIG_VERSION);
+  expect(loaded.defaults).toEqual(DEFAULT_CAPS);
+  expect(loaded.projects[0]?.caps).toEqual({});
+});
+
+test("a v2 config rejects an unknown cap key, because there is nothing left to retire", () => {
+  writeRawConfig({
+    version: CONFIG_VERSION,
+    defaults: { ...DEFAULT_CAPS },
+    projects: [{ ...project("demo"), caps: { dailySpendUSD: 5 } }],
+  });
+
+  // The typo that motivates this: a mistyped spend ceiling reads as configured
+  // while the real ceiling is the shipped default — five dollars intended,
+  // twenty-five enforced.
+  expect(() => loadConfig()).toThrow(/caps has unknown key\(s\): dailySpendUSD/);
+});
+
+test("a cap whose value cannot be read is rejected at either version", () => {
+  for (const version of [1, CONFIG_VERSION]) {
+    writeRawConfig({
+      version,
+      defaults: { ...DEFAULT_CAPS },
+      projects: [{ ...project("demo"), caps: { dailySpendUsd: "twenty" } }],
+    });
+
+    // Tolerating a retired *key* must never soften a cap the operator did set:
+    // a ceiling the daemon cannot read is worth stopping for.
+    expect(() => loadConfig()).toThrow(/caps\.dailySpendUsd must be a non-negative finite number/);
+  }
+});
+
+test("workerModel survives a save/load round-trip", () => {
+  saveConfig(config({ ...project("demo"), workerModel: "smol" }));
+
+  expect(loadConfig().projects[0]?.workerModel).toBe("smol");
+});
+
+test("an unusable workerModel is dropped rather than failing the load", () => {
+  writeRawConfig({
+    version: 1,
+    defaults: { ...DEFAULT_CAPS },
+    projects: [
+      { ...project("blank"), workerModel: "   " },
+      { ...project("wrongType"), workerModel: 7 },
+    ],
+  });
+
+  // A model is a hint to the harness, not a ceiling: the worst case is a run on
+  // the default model, and the session's own fallback notice is what says so.
+  const loaded = loadConfig();
+  expect(loaded.projects[0]?.workerModel).toBeUndefined();
+  expect(loaded.projects[1]?.workerModel).toBeUndefined();
+});
+
 test("saveConfig writes the config readable only by its owner", () => {
   saveConfig(config(project("demo")));
 
@@ -207,7 +274,6 @@ test("saveConfig replaces an existing config atomically rather than truncating i
 test("resolveCaps overrides only the fields a project sets and inherits the rest", () => {
   const defaults: Caps = {
     maxConcurrentWorkers: 3,
-    maxIssuesPerDay: 9,
     dailySpendUsd: 40,
     workerMaxTurns: 200,
     workerWallClockMs: 60_000,
@@ -218,7 +284,6 @@ test("resolveCaps overrides only the fields a project sets and inherits the rest
 
   expect(resolveCaps(p, defaults)).toEqual({
     maxConcurrentWorkers: 3,
-    maxIssuesPerDay: 9,
     // An explicit 0 is a hard stop, so it must survive the merge.
     dailySpendUsd: 0,
     workerMaxTurns: 7,

@@ -2,7 +2,7 @@
 
 Keeps the 24/7 omp fleet session **running** inside its Herdr pane. When the
 Herdr server restarts, when omp exits, or when the pane dies, this plugin resumes
-that exact omp session — or pages you and says the fleet is down. It never
+that exact omp session, or pages you and says the fleet is down. It never
 guesses which session to resume.
 
 ## What it is
@@ -32,7 +32,7 @@ that nobody attaches to, the topology comes back and the agent never does.
 
 **omp exiting does not kill anything Herdr watches.** `herdr agent start` submits
 omp *into* the pane's existing shell (`src/app/agents.rs:193-218`), so when omp
-exits — crash, OOM, `/exit` — the shell is still there. No `pane.exited` fires,
+exits (crash, OOM, `/exit`), the shell is still there. No `pane.exited` fires,
 the pane keeps its `shell_pid`, and for a moment it even keeps its agent name
 (`src/terminal/state.rs:1950-1952`). A liveness check that trusts either of those
 would call a dead fleet healthy forever. That is why the hook watches
@@ -62,10 +62,10 @@ fleet against the wrong server. `TARGET_SESSION` (default `fleet`) is that guard
 a run whose session name does not match skips before touching anything.
 
 The session name comes from `HERDR_SESSION`, which Herdr sets in its own process
-for every way of selecting a named session — `--session <name>`, `--session=<name>`
-and `session attach <name>` all end in `set_var` (`src/session.rs:29-94,448-457`)
-— and plugin commands inherit it, because Herdr adds its own variables on top of
-the inherited environment rather than replacing it
+for every way of selecting a named session: `--session <name>`, `--session=<name>`
+and `session attach <name>` all end in `set_var` (`src/session.rs:29-94,448-457`).
+Plugin commands inherit it, because Herdr adds its own variables on top of the
+inherited environment instead of replacing it
 (`src/app/api/plugins/runtime.rs:39-63`). When it is absent the name is derived
 from the injected socket path, which lives in `<config>/sessions/<name>/` for a
 named session and in the config dir itself for the default one
@@ -79,7 +79,7 @@ ExecStart=/usr/local/bin/herdr --session fleet server
 
 `herdr server` runs the headless server explicitly, and the global `--session`
 flag is consumed before the subcommand dispatch (`src/main.rs:456`), so it also
-exports `HERDR_SESSION=fleet` to everything the server spawns — including this
+exports `HERDR_SESSION=fleet` to everything the server spawns, including this
 plugin's hooks. `Environment=HERDR_SESSION=fleet` with a plain `herdr server` is
 equivalent (`src/session.rs:84-88`).
 
@@ -97,20 +97,32 @@ herdr plugin config-dir herdr-conductor   # prints the config directory
 Herdr plugins v1 has no npm install path and no `plugin update`: to update, run
 the same `plugin install` again and it replaces the managed checkout.
 
-Startup hooks run when a server starts or takes over during live handoff — **not**
-when a client attaches, config reloads, or a plugin is installed or enabled. After
-installing on a running server, either restart the server or run the script once
-by hand (see [Dry run](#dry-run)) to cover the current session.
+Startup hooks run when a server starts or takes over during live handoff. They do
+**not** run when a client attaches, when config reloads, or when a plugin is
+installed or enabled. After installing on a running server, either restart the
+server or run the script once by hand (see [Dry run](#dry-run)) to cover the
+current session.
 
-Required on the host:
+### Prerequisites
 
 - **Herdr ≥ 0.7.5.** `[[startup]]` hooks and `herdr agent start` both landed in
   0.7.5; `[[events]]` in 0.7.0. `min_herdr_version` is set to 0.7.5 and Herdr
   refuses to install a plugin that wants a newer binary than yours.
-- **`bash`** ≥ 3.2 (macOS system Bash is fine), **`jq`** — Herdr's session state
-  and CLI responses are JSON, **`curl`** — only for Telegram pages.
+- **`bash`** ≥ 3.2 (macOS system Bash is fine), **`jq`** (Herdr's session state and
+  CLI responses are JSON) and **`curl`** (only for Telegram pages).
 - Linux or macOS. Windows is not declared: the recovery path assumes a Unix
   socket path next to `session.json`.
+- **[omp-telegram](https://www.npmjs.com/package/omp-telegram)**, installed and
+  paired, if you want to hear about a fleet that is down. This plugin holds no
+  credentials of its own; it borrows omp-telegram's files: the bot token from
+  `TELEGRAM_ENV` (default `/root/.omp/agent/telegram/.env`) and the chat id from
+  the first `allowFrom` entry in `ACCESS_JSON` (default
+  `/root/.omp/agent/telegram/access.json`). Both paths are overridable in
+  `config.env`.
+
+  Without them, recovery still runs and still logs; only the page is skipped, and
+  the log line says which file was missing. A Herdr notification is always raised
+  regardless, so a page is the remote copy of a signal you already have locally.
 
 For local development, link the working tree instead:
 
@@ -122,7 +134,7 @@ herdr plugin log list --plugin herdr-conductor
 ## Configuration
 
 Optional. Write `config.env` into the directory printed by
-`herdr plugin config-dir herdr-conductor`. It is plain shell, sourced — comments
+`herdr plugin config-dir herdr-conductor`. It is plain shell, sourced, so comments
 and quoting work. A missing file means "all defaults".
 
 | Key | Default | Notes |
@@ -137,7 +149,7 @@ and quoting work. A missing file means "all defaults".
 | `BOOTSTRAP_RESUME` | unset | First provisioning only: an exact omp session ref (absolute `.jsonl` path or session id) to resume when **no** fleet pane has ever been saved. Used at most once — a marker retires it — so a later loss of identity pages instead of quietly provisioning a second fleet. |
 
 Three files live under `HERDR_PLUGIN_STATE_DIR`, each suffixed with the session
-name because that directory is global to the user, not per session
+name because that directory is global to the user and shared by every session
 (`src/plugin_paths.rs:21-25`): `recover.lock*` (the singleton), `identity` (the
 last pane and session ref this plugin saw the fleet in) and `bootstrapped` (the
 one-shot provisioning marker). The session guard should make cross-session
@@ -283,7 +295,7 @@ Known and deliberate in this version:
   and it means a fleet whose snapshot was never written (a session that died
   within the save debounce of starting) pages rather than recovers.
 - **A pane with a deferred resume plan cannot be recovered, only reported.** See
-  above; the fix is a config setting on the host, not something a plugin can do
+  above; the fix is a config setting on the host, which no plugin can apply
   through the CLI.
 - **Liveness leans on Herdr's own detection.** The foreground job and the agent
   label both come from Herdr. If its detector cannot read a pane's foreground
@@ -299,9 +311,9 @@ Known and deliberate in this version:
   keep a stale one and a disagreement pages rather than resolving itself.
 - **One fleet per Herdr session.** `TARGET_SESSION`/`AGENT_NAME` name exactly one,
   and state files are per session, so two fleets need two sessions.
-- **No back-off or retry.** Each hook invocation decides once. Recovery is retried
-  by the next server start, pane exit, or agent release — not by this script.
+- **No back-off or retry.** Each hook invocation decides once. The next server
+  start, pane exit, or agent release retries recovery; this script never does.
 - **Pages are not deduplicated.** Ten failing pane exits are ten pages. The
-  singleton lock only collapses concurrent runs, not repeated ones.
+  singleton lock only collapses runs that overlap in time.
 - **`jq` and `curl` are assumed, not installed.** Herdr reports plugin build and
   runtime failures; it does not provision toolchains.

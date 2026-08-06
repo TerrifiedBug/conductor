@@ -20,9 +20,9 @@ jobs:
       - run: bun test
 
   herdr:
-    name: herdr plugin (recover.sh suite)
+    name: herdr plugin (recover.sh suite) + setup.sh syntax
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: bash -n herdr/bin/recover.sh herdr/test/recover-test.sh
+      - run: bash -n herdr/bin/recover.sh herdr/test/recover-test.sh setup.sh
       - run: bash herdr/test/recover-test.sh
