@@ -5,8 +5,13 @@
  * process lifecycle in ./lifecycle.ts, so the CLI and the `/conductor` plugin
  * cannot drift apart.
  */
+import { readFileSync } from "node:fs";
+import { checkBrief, formatBriefStatus, writeMergedBrief } from "./brief-upgrade.ts";
+import { findProject, loadConfig } from "./config.ts";
 import { formatStatus, runDaemon, setPaused, statusSnapshot } from "./daemon.ts";
 import { healthCheck, livingDaemon, startDaemon, stopDaemon } from "./lifecycle.ts";
+import { briefPathForProject, renderBriefForProject, shippedBriefTemplate } from "./setup.ts";
+import type { ProjectConfig } from "./types.ts";
 
 const USAGE = `omp-conductor — dispatch ready issues to omp coding sessions
 
@@ -18,6 +23,7 @@ usage:
   omp-conductor daemon [--once] [--port N] [--project NAME]
   omp-conductor pause
   omp-conductor resume
+  omp-conductor brief-upgrade [--apply] [--file PATH] [--project NAME]
   omp-conductor help
 
   start    run the dispatch loop in the background and wait until it answers
@@ -32,6 +38,14 @@ usage:
            and exits. This is what \`start\` launches.
   pause    stop claiming new work. The running daemon notices on its next tick.
   resume   allow claiming again.
+  brief-upgrade
+           compare a project's ORCHESTRATOR.md against the brief this version of
+           the package ships. Reports by default; --apply replaces the half above
+           the YOURS TO EDIT banner and keeps everything below it, backing the old
+           file up first. --file checks a brief that is not where the wizard would
+           have put it, on a host that may have no config at all. Nothing is
+           written for a brief with no banner, or when no config resolved and the
+           template still carries its {{PLACEHOLDER}} coordinates.
   help     print this text (also --help, -h).
 
 Pause is a flag file under the state directory, so it applies to every project
@@ -158,6 +172,60 @@ try {
       setPaused(false);
       process.stdout.write("resumed — work will be claimed on the next tick\n");
       break;
+
+    case "brief-upgrade": {
+      // `--file` exists because a real fleet's brief is often not where the wizard
+      // would have put it: the supervising session runs from its own directory, and
+      // that host may never have configured a dispatch daemon at all. Without this
+      // the command cannot check the one file it was written for.
+      const override = flag(argv, "file");
+      let project: ProjectConfig | undefined;
+      let path: string;
+      if (override === undefined) {
+        project = findProject(loadConfig(), flag(argv, "project"));
+        path = briefPathForProject(project);
+      } else {
+        path = override;
+        try {
+          project = findProject(loadConfig(), flag(argv, "project"));
+        } catch {
+          // No config here, or several projects and no name given. With an explicit
+          // file we need neither, and refusing would make the command unusable on a
+          // fleet host that runs only the supervising session.
+          project = undefined;
+        }
+      }
+
+      let live: string;
+      try {
+        live = readFileSync(path, "utf8");
+      } catch {
+        process.stderr.write(
+          `omp-conductor: no brief at ${path}` +
+            `${override === undefined ? " — run /conductor setup and say yes to writing ORCHESTRATOR.md." : "."}\n`,
+        );
+        process.exit(1);
+      }
+
+      // With no config there are no coordinates to substitute, so the template is
+      // compared raw. Headings carry no placeholders, so the section-level report is
+      // unaffected; the note below keeps the printed text honest.
+      const status = checkBrief(live, project === undefined ? shippedBriefTemplate() : renderBriefForProject(project));
+      // Report first, always: --apply on a brief with no banner must not be the
+      // command that silently discards an operator's hand-written policy.
+      process.stdout.write(`${formatBriefStatus(path, status)}\n`);
+      if (project === undefined) {
+        process.stdout.write(
+          "\nnote: no conductor config resolved on this host, so the template's\n" +
+            "{{PLACEHOLDER}} coordinates are unsubstituted. Section names are unaffected.\n",
+        );
+      }
+      if (argv.includes("--apply") && status.kind === "mergeable") {
+        const backup = writeMergedBrief(path, status.merged);
+        process.stdout.write(`\napplied — previous brief kept at ${backup}\n`);
+      }
+      break;
+    }
 
     case "help":
     case "--help":

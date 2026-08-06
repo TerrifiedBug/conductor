@@ -27,6 +27,7 @@ import { configPath, resolveCaps, stateDir } from "./config.ts";
 import {
   CONFIG_VERSION,
   DEFAULT_CAPS,
+  DEFAULT_REPORT_SCOPE,
   type Caps,
   type ConductorConfig,
   type ProjectConfig,
@@ -392,29 +393,53 @@ export function buildConfig(a: SetupAnswers, existing?: ConductorConfig): Conduc
 }
 
 /**
- * Where the operator's own brief lands: beside the worktrees, under the state
+ * Where a configured project's brief lives: beside its worktrees, under the state
  * directory, so it is on the same disk the fleet already owns and survives a
- * reinstall of the package. Derived from the answers rather than fixed, so a
+ * reinstall of the package. Derived from the project rather than fixed, so a
  * project that ever gains a chosen workspace root keeps its brief with it.
  */
-export function orchestratorBriefPath(a: SetupAnswers): string {
-  return join(buildProject(a).workspaceRoot, ORCHESTRATOR_BRIEF_NAME);
+export function briefPathForProject(p: ProjectConfig): string {
+  return join(p.workspaceRoot, ORCHESTRATOR_BRIEF_NAME);
 }
 
 /**
- * The shipped template with this project's real values in it.
+ * The brief template exactly as shipped, placeholders and all.
+ *
+ * Exported for the upgrade check, which has to be able to read the shipped text
+ * on a host that has no config to render it against.
+ */
+export function shippedBriefTemplate(): string {
+  return readFileSync(ORCHESTRATOR_TEMPLATE_PATH, "utf8");
+}
+
+/**
+ * The shipped template with a configured project's real values in it.
  *
  * Only the coordinates and the chosen scope are substituted: the policy text is
  * left exactly as shipped, because from here on the file is the operator's to
  * edit and nothing in this package reads it back.
+ *
+ * Takes a `ProjectConfig` rather than answers so that a *later* upgrade check can
+ * reproduce the same render from what is on disk, months after the wizard's
+ * answers are gone.
  */
-export function renderOrchestratorBrief(a: SetupAnswers): string {
+export function renderBriefForProject(p: ProjectConfig): string {
   return renderBrief(readFileSync(ORCHESTRATOR_TEMPLATE_PATH, "utf8"), {
-    PROJECT: a.projectName,
-    TRACKER_REPO: a.trackerRepo,
-    QUEUE_LABEL: a.queueLabel,
-    REPORT_SCOPE: a.reportScope,
+    PROJECT: p.name,
+    TRACKER_REPO: p.tracker.repo,
+    QUEUE_LABEL: p.queueLabel,
+    REPORT_SCOPE: p.reporting?.scope ?? DEFAULT_REPORT_SCOPE,
   });
+}
+
+/** Wizard-time path, via the project the answers describe. */
+export function orchestratorBriefPath(a: SetupAnswers): string {
+  return briefPathForProject(buildProject(a));
+}
+
+/** Wizard-time render, via the project the answers describe. */
+export function renderOrchestratorBrief(a: SetupAnswers): string {
+  return renderBriefForProject(buildProject(a));
 }
 
 /**
