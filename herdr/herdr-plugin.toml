@@ -1,0 +1,17 @@
+id = "herdr-conductor"
+name = "Conductor"
+version = "0.1.0"
+min_herdr_version = "0.7.5"
+description = "Keeps the 24/7 omp fleet session running: resumes it by exact session identity after a Herdr restart or pane exit, and pages when it cannot."
+platforms = ["linux", "macos"]
+
+[[startup]]
+command = ["bash", "bin/recover.sh"]
+
+[[events]]
+on = "pane.exited"
+command = ["bash", "bin/recover.sh"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["bash", "bin/recover.sh"]

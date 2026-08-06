@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  omp:
+    name: omp plugin (tsc + bun test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: omp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: bun test
+
+  herdr:
+    name: herdr plugin (recover.sh suite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash -n herdr/bin/recover.sh herdr/test/recover-test.sh
+      - run: bash herdr/test/recover-test.sh
