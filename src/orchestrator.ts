@@ -14,7 +14,10 @@
  *     already escalated, re-briefed and given up on.
  *  2. **Non-blocking.** `deliver()` resolves when the harness has *accepted* the
  *     prompt, never when the model has answered it. The dispatcher tick that
- *     produced the escalation must not sit behind a model for ten minutes.
+ *     produced the escalation must not sit behind a model for ten minutes. The
+ *     answer is not thrown away, though: the returned {@link DeliveryReceipt}
+ *     carries it, so a turn that fails ten minutes later is still attributable
+ *     to the one escalation that caused it — never to the next one.
  *  3. **Serialised.** Two escalations noticed in the same tick become two
  *     prompts, in order — never two concurrent `prompt()` calls racing over
  *     which of them is the follow-up to a busy session.
@@ -43,9 +46,27 @@ export type CreateSessionFn = (opts: {
   resume?: boolean;
 }) => Promise<AgentSessionLike>;
 
+/**
+ * What a caller gets once an injection has been *accepted*.
+ *
+ * The split exists because acceptance and delivery are minutes apart. Marking
+ * an escalation handled on acceptance is what silently drops it when the turn
+ * then fails: the dedup key says "notified", no human was told, and nothing
+ * ever retries. `settled` is the other half of that promise, kept per
+ * injection so a failure is attributed to the escalation it belongs to.
+ */
+export interface DeliveryReceipt {
+  /** Rejects if the orchestrator's turn for THIS injection failed. */
+  settled: Promise<void>;
+}
+
 export interface OrchestratorHandle {
-  /** Inject an escalation as a prompt. Resolves once accepted, not once answered. */
-  deliver(e: Escalation, project: string): Promise<void>;
+  /**
+   * Inject an escalation as a prompt. Resolves once accepted, not once
+   * answered; rejects only when the injection was never taken at all. Watch
+   * the receipt's `settled` for the turn's own outcome.
+   */
+  deliver(e: Escalation, project: string): Promise<DeliveryReceipt>;
   busy(): boolean;
   sessionFile(): string | undefined;
   dispose(): Promise<void>;
@@ -170,32 +191,20 @@ export async function startOrchestrator(o: OrchestratorOpts): Promise<Orchestrat
   let queue: Promise<void> = Promise.resolve();
   /** Consumed by the first injection; see {@link OrchestratorOpts.brief}. */
   let standingOrders = o.brief;
-  /**
-   * A prompt that failed *after* acceptance. Reported to the next `deliver()`
-   * and then cleared, so a session that has started rejecting routes the
-   * following escalation to the caller's fallback instead of swallowing it. The
-   * previous escalation is already lost by then — that is the price of not
-   * blocking the tick — and this is what stops it becoming every escalation.
-   */
-  let carriedFailure: Error | undefined;
 
   /**
    * Issue one prompt. Runs inside the queue, so the streaming flag is read at
    * the moment the prompt is actually handed over rather than when it was
    * queued — the escalation ahead of it in the queue may have started a turn.
+   *
+   * Throws only when the prompt cannot be *accepted*. Everything after that
+   * travels back on the receipt, attached to this escalation and no other.
    */
-  const issue = (e: Escalation, project: string): void => {
+  const issue = (e: Escalation, project: string): DeliveryReceipt => {
     if (disposed) {
       throw new Error(
         `orchestrator session is disposed; tier ${e.tier} escalation on issue #${e.issue} was not injected`,
       );
-    }
-    const failure = carriedFailure;
-    if (failure !== undefined) {
-      carriedFailure = undefined;
-      throw new Error(`orchestrator session rejected its previous injection: ${failure.message}`, {
-        cause: failure,
-      });
     }
 
     const injection = formatInjection(e, project);
@@ -205,27 +214,29 @@ export async function startOrchestrator(o: OrchestratorOpts): Promise<Orchestrat
 
     // Accepted, not answered. `prompt()` resolves when the turn ends, which for
     // a re-brief is minutes; the tick that found this escalation has other
-    // issues to service. A synchronous throw is therefore the only failure the
-    // caller can see in time to fall back — later ones are carried above.
-    const pending = session.prompt(text, opts);
+    // issues to service. A synchronous throw is the only failure the caller can
+    // see before `deliver()` returns — the later one is the receipt's job.
+    const settled = session.prompt(text, opts).then(() => {});
     // Only reached once the harness took the prompt, so the brief has landed.
     standingOrders = undefined;
-    void Promise.resolve(pending).catch((cause: unknown) => {
-      carriedFailure = cause instanceof Error ? cause : new Error(String(cause));
-    });
+    // A caller that never reads `settled` must not take the daemon down with an
+    // unhandled rejection. This handler does not consume the rejection: the
+    // caller still sees the real one through the receipt.
+    settled.catch(() => {});
+    return { settled };
   };
 
   return {
-    deliver(e: Escalation, project: string): Promise<void> {
+    deliver(e: Escalation, project: string): Promise<DeliveryReceipt> {
       // Never throws synchronously, by construction: `issue()` runs inside the
       // chain below, so a transport problem always arrives as a rejected
       // promise the caller can catch and route to its own fallback. The caller
       // decides what an unreachable orchestrator means; this module does not.
-      const accepted = queue.then(() => {
-        issue(e, project);
-      });
-      // The queue outlives a rejected delivery: one unreachable injection must
-      // not poison every escalation queued behind it.
+      const accepted = queue.then(() => issue(e, project));
+      // The queue advances on *acceptance*, never on `settled`: parking the
+      // next injection behind a whole model turn is the blocking dispatcher
+      // this module exists to avoid. It also outlives a rejected delivery —
+      // one unreachable injection must not poison the escalations behind it.
       queue = accepted.then(
         () => {},
         () => {},

@@ -5,9 +5,12 @@
  *
  * Two rules shape everything here:
  *
- *  1. An escalation is never silently dropped. Either a transport accepted it,
+ *  1. An escalation is never silently dropped. Either a transport delivered it,
  *     or `escalate()` throws so the dispatcher learns nobody is reachable. A
- *     swallowed escalation looks exactly like a healthy fleet.
+ *     swallowed escalation looks exactly like a healthy fleet. Tier 1 is where
+ *     that is hardest: the orchestrator *accepts* an injection minutes before
+ *     its turn settles, so the dedup marker waits for the settlement and a
+ *     late failure falls back to an issue comment for that same escalation.
  *  2. An escalation is never repeated. The dispatcher re-notices the same
  *     unroutable issue on every poll, so the store's notification ledger — not
  *     the loop — is what stops a human being paged every five minutes.
@@ -78,19 +81,57 @@ export function createEscalator(
       const chatId = p.escalation.telegramChatId;
 
       if (e.tier === 1 && orchestrator) {
-        try {
-          // Resolves on acceptance, not on an answer, so this does not park the
-          // tick behind a model. Acceptance *is* the escalation: the run is
-          // parked and safe, and the orchestrator now owns deciding what
-          // happens to it.
-          await orchestrator.deliver(e, p.name);
-          store.markNotified(key);
+        // Resolves on acceptance, not on an answer, so this does not park the
+        // tick behind a model. A rejection means the injection was never taken
+        // at all: `undefined` falls through to the human-facing path below
+        // rather than losing the escalation — a tier-1 event that reached
+        // nobody is indistinguishable from a healthy fleet.
+        const receipt = await orchestrator.deliver(e, p.name).catch(() => undefined);
+        if (receipt) {
+          /**
+           * This escalation's own late failure, routed to this escalation's own
+           * fallback. The key stays unmarked unless something actually lands:
+           * an unmarked key means the next tick re-escalates, which is the
+           * whole difference between a late escalation and a lost one. Marking
+           * on acceptance is what used to drop it — "notified" written over an
+           * event no human ever read, and nothing left to retry it.
+           */
+          const onTurnFailed = async (cause: unknown): Promise<void> => {
+            if (!p.escalation.fallbackToIssueComment) {
+              warn(
+                `tier 1 escalation on issue #${e.issue} was accepted by the orchestrator but its ` +
+                  `turn failed (${errText(cause)}), and no fallback is configured — left unmarked ` +
+                  `so the next tick retries`,
+              );
+              return;
+            }
+            try {
+              await tracker.comment(e.issue, text);
+              store.markNotified(key);
+            } catch (err) {
+              warn(
+                `tier 1 escalation on issue #${e.issue} failed after acceptance ` +
+                  `(${errText(cause)}) and its issue-comment fallback failed too ` +
+                  `(${errText(err)}) — left unmarked so the next tick retries`,
+              );
+            }
+          };
+
+          // Acceptance is not delivery: the orchestrator's turn for *this*
+          // injection can still fail minutes from now, so the marker waits for
+          // `settled`. Deliberately not awaited — `settled` resolves only when
+          // the model has finished answering, which is exactly the wait the
+          // dispatcher tick must not take.
+          void receipt.settled
+            .then(() => {
+              store.markNotified(key);
+            }, onTurnFailed)
+            .catch(() => {
+              // `markNotified` is the only thing above that can still throw,
+              // and a failing store write must not become an unhandled
+              // rejection in a daemon that has nobody left to throw at.
+            });
           return;
-        } catch {
-          // The re-briefing channel is down. Fall through to the human-facing
-          // path below rather than lose the escalation — a tier-1 event that
-          // reached nobody is indistinguishable from a healthy fleet, and the
-          // marker deliberately stays unwritten until something accepts it.
         }
       }
 
@@ -121,6 +162,23 @@ export function createEscalator(
       store.markNotified(key);
     },
   };
+}
+
+/**
+ * The tier-1 settlement tail runs after `escalate()` has already returned, so a
+ * failure there has no caller left to throw at. stderr is where it can still be
+ * seen: the daemon's log *is* its stderr, so these land in `daemon.log` beside
+ * every other conductor line.
+ *
+ * ponytail: duplicates daemon.ts's one-line format rather than sharing a
+ * logger. Upgrade path is a `log.ts` both modules import.
+ */
+function warn(msg: string): void {
+  process.stderr.write(`[conductor ${new Date().toISOString()}] ${msg}\n`);
+}
+
+function errText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }
 
 /**

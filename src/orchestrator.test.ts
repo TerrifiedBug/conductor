@@ -32,14 +32,16 @@ type PromptCall = { text: string; opts: Record<string, unknown> };
 /**
  * A session the test drives directly: every `prompt()` is recorded, every
  * `on()` handler is kept so `emit()` can fire the harness events the
- * orchestrator reads, and `failNextPrompt()` reproduces a session that has
- * stopped accepting work.
+ * orchestrator reads, `failNextPrompt()` reproduces a session that has stopped
+ * accepting work, and `failNextPromptLater()` reproduces the nastier one — a
+ * session that accepts the injection and only then dies mid-turn.
  */
 function makeFake() {
   const prompts: PromptCall[] = [];
   const created: Parameters<CreateSessionFn>[0][] = [];
   const handlers = new Map<string, ((e: unknown) => void)[]>();
   let promptFailure: Error | undefined;
+  let pendingSettlement: Promise<void> | undefined;
 
   const session: AgentSessionLike = {
     // Deliberately not `async`: a dead harness session rejects the call itself,
@@ -50,6 +52,11 @@ function makeFake() {
       if (failure !== undefined) {
         promptFailure = undefined;
         throw failure;
+      }
+      const deferred = pendingSettlement;
+      if (deferred !== undefined) {
+        pendingSettlement = undefined;
+        return deferred;
       }
       return Promise.resolve(undefined);
     },
@@ -76,6 +83,20 @@ function makeFake() {
     },
     failNextPrompt(error: Error): void {
       promptFailure = error;
+    },
+    /**
+     * The next prompt is *accepted*; its turn fails only when the returned
+     * handle is called. This is the failure that used to be carried forward
+     * and blamed on whichever escalation happened to arrive next.
+     */
+    failNextPromptLater(): (cause: Error) => void {
+      let fail!: (cause: Error) => void;
+      pendingSettlement = new Promise<void>((_resolve, reject) => {
+        fail = (cause: Error): void => {
+          reject(cause);
+        };
+      });
+      return fail;
     },
   };
 }
@@ -250,6 +271,56 @@ describe("startOrchestrator", () => {
 
     await expect(orchestrator.deliver(blocked, "veltro")).rejects.toThrow(/disposed/);
     expect(fake.prompts.length).toBe(0);
+  });
+
+  test("a prompt that fails after acceptance rejects only its own receipt", async () => {
+    const fake = makeFake();
+    const dir = scratchDir();
+
+    const orchestrator = await startOrchestrator({
+      cwd: dir,
+      sessionDir: dir,
+      createSessionImpl: fake.create,
+    });
+    const failTurn = fake.failNextPromptLater();
+
+    // Accepted: the harness took the prompt, so the tick is free to move on
+    // even though this turn will run for minutes.
+    const receipt = await orchestrator.deliver(blocked, "veltro");
+    expect(fake.prompts.length).toBe(1);
+
+    // ...and then the turn dies. The failure belongs to #4211 and comes back on
+    // #4211's own receipt, which is what lets the escalator fall *this* item
+    // back rather than dropping it and blaming the next escalation for it.
+    failTurn(new Error("session died mid-turn"));
+    await expect(receipt.settled).rejects.toThrow(/died mid-turn/);
+
+    // The next escalation carries none of that: accepted, and clean.
+    const next = await orchestrator.deliver(conflict, "veltro");
+    await next.settled;
+    expect(fake.prompts.length).toBe(2);
+    expect(fake.prompts[1]?.text).toContain("#4300");
+  });
+
+  test("a prompt that throws synchronously rejects deliver itself, with no receipt", async () => {
+    const fake = makeFake();
+    const dir = scratchDir();
+
+    const orchestrator = await startOrchestrator({
+      cwd: dir,
+      sessionDir: dir,
+      createSessionImpl: fake.create,
+    });
+    fake.failNextPrompt(new Error("session is not accepting prompts"));
+
+    // Never accepted, so there is no receipt to watch: the caller's catch is
+    // the whole signal, and it fires before the escalator has marked anything.
+    await expect(orchestrator.deliver(blocked, "veltro")).rejects.toThrow(/not accepting/);
+
+    // The session is usable again, and the next delivery gets a real receipt.
+    const receipt = await orchestrator.deliver(conflict, "veltro");
+    await receipt.settled;
+    expect(fake.prompts.length).toBe(2);
   });
 });
 

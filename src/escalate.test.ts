@@ -252,20 +252,49 @@ test("a 200 response with ok:false is treated as a failure", async () => {
 
 /**
  * A handle whose `deliver` either accepts or refuses, and counts either way.
- * Nothing else on the interface is on the escalation path.
+ * When it accepts, `settlesLater` hands the test control of the orchestrator's
+ * turn for that injection — accepted now, failed whenever `failTurn` says.
  */
-function makeOrchestrator(opts: { deliverRejects?: boolean } = {}) {
+function makeOrchestrator(opts: { deliverRejects?: boolean; settlesLater?: boolean } = {}) {
   const delivered: { issue: number; project: string }[] = [];
+  let failTurn: (cause: Error) => void = () => {
+    throw new Error("this orchestrator settles immediately; pass settlesLater");
+  };
+  // The executor runs synchronously, so `failTurn` is live by the time this
+  // returns — no timer anywhere in the settlement path.
+  const settled = new Promise<void>((resolve, reject) => {
+    if (!opts.settlesLater) {
+      resolve();
+      return;
+    }
+    failTurn = (cause: Error): void => {
+      reject(cause);
+    };
+  });
+  // The escalator attaches its handler a microtask later; nothing may crash the
+  // runner in between.
+  settled.catch(() => {});
+
   const orchestrator: OrchestratorHandle = {
     deliver: async (e, project) => {
       delivered.push({ issue: e.issue, project });
       if (opts.deliverRejects) throw new Error("orchestrator session is disposed");
+      return { settled };
     },
     busy: () => false,
     sessionFile: () => undefined,
     dispose: async () => {},
   };
-  return { orchestrator, delivered };
+  return { orchestrator, delivered, failTurn };
+}
+
+/**
+ * Runs the settlement tail to completion. It is a short chain of already-
+ * settled promises, so draining the microtask queue is enough — a timer would
+ * only add flakiness on a loaded machine.
+ */
+async function flushMicrotasks(): Promise<void> {
+  for (let i = 0; i < 10; i += 1) await Promise.resolve();
 }
 
 test("tier 1 goes to the orchestrator, not to a human-facing issue comment", async () => {
@@ -297,4 +326,60 @@ test("an orchestrator that refuses the injection falls back to an issue comment"
   expect(comments.length).toBe(1);
   expect(comments[0]?.body).toContain(tier1.summary);
   expect(marked.length).toBe(1);
+});
+
+test("a lone tier-1 injection that fails after acceptance falls back for itself", async () => {
+  const { tracker, comments } = makeTracker();
+  const { store, marked } = makeStore();
+  const { orchestrator, delivered, failTurn } = makeOrchestrator({ settlesLater: true });
+  const p = makeProject({ fallbackToIssueComment: true });
+
+  // One escalation and nothing behind it. The bug this defends against lost
+  // exactly this item — marked notified on acceptance — and then pushed the
+  // *next*, unrelated escalation to the fallback in its place.
+  await createEscalator(p, tracker, store, orchestrator).escalate(tier1);
+
+  // Accepted, so the tick moved on. Nothing is owed to a human yet, and
+  // nothing may be marked: acceptance is not delivery.
+  expect(delivered).toEqual([{ issue: 4211, project: "veltro" }]);
+  expect(comments.length).toBe(0);
+  expect(marked.length).toBe(0);
+
+  // The orchestrator's turn for this injection dies minutes later.
+  failTurn(new Error("orchestrator session died mid-turn"));
+  await flushMicrotasks();
+
+  expect(comments.length).toBe(1);
+  expect(comments[0]?.issue).toBe(4211);
+  expect(comments[0]?.body).toContain(tier1.summary);
+  // Marked only once the fallback actually landed, never before.
+  expect(marked).toEqual(["veltro:4211:1:gate `bun test` failed twice on the same assertion"]);
+});
+
+test("a settlement failure with no fallback stays unmarked and stays visible", async () => {
+  const { tracker, comments } = makeTracker();
+  const { store, marked } = makeStore();
+  const { orchestrator, failTurn } = makeOrchestrator({ settlesLater: true });
+  const p = makeProject({ fallbackToIssueComment: false });
+
+  const written: string[] = [];
+  const realWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: unknown) => {
+    written.push(String(chunk));
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    await createEscalator(p, tracker, store, orchestrator).escalate(tier1);
+    failTurn(new Error("orchestrator session died mid-turn"));
+    await flushMicrotasks();
+  } finally {
+    process.stderr.write = realWrite;
+  }
+
+  expect(comments.length).toBe(0);
+  // Deliberately unmarked: the next tick re-escalates. Writing the marker here
+  // would be the daemon telling itself a human was paged when none was.
+  expect(marked.length).toBe(0);
+  // And it is not silent either — the daemon's log is its stderr.
+  expect(written.join("")).toContain("#4211");
 });
