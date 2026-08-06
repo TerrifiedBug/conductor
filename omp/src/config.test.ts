@@ -32,15 +32,15 @@ afterEach(() => {
 function project(name: string): ProjectConfig {
   return {
     name,
-    tracker: { kind: "github", repo: `TerrifiedBug/${name}` },
+    tracker: { kind: "github", repo: `acme/${name}` },
     queueLabel: "agent:ready",
     stateLabels: { inProgress: "agent:in-progress", blocked: "agent:blocked", failed: "agent:failed" },
     routing: {
       labelPrefix: "repo:",
       repos: {
-        chad: {
-          name: "chad",
-          cloneUrl: "git@github.com:TerrifiedBug/chad.git",
+        api: {
+          name: "api",
+          cloneUrl: "git@github.com:acme/api.git",
           defaultBranch: "main",
           gates: [{ cmd: "bun run check", cwd: "." }],
         },
@@ -69,7 +69,7 @@ test("configPath and stateDir follow $OMP_CONDUCTOR_HOME", () => {
 });
 
 test("save then load round-trips a fully specified config unchanged", () => {
-  const original = config(project("veltro"));
+  const original = config(project("demo"));
 
   saveConfig(original);
 
@@ -82,7 +82,7 @@ test("loadConfig on a missing file names the path and the fix", () => {
 });
 
 test("loadConfig rejects a config written by a different version", () => {
-  writeRawConfig({ ...config(project("veltro")), version: 2 });
+  writeRawConfig({ ...config(project("demo")), version: 2 });
 
   expect(() => loadConfig()).toThrow(/"version" must be 1/);
 });
@@ -94,7 +94,7 @@ test("loadConfig rejects an empty projects list", () => {
 });
 
 test("loadConfig reports every problem it found, not just the first", () => {
-  const broken = project("veltro");
+  const broken = project("demo");
   writeRawConfig({
     version: 1,
     defaults: { ...DEFAULT_CAPS },
@@ -123,7 +123,7 @@ test("loadConfig reports every problem it found, not just the first", () => {
 });
 
 test("saveConfig writes the config readable only by its owner", () => {
-  saveConfig(config(project("veltro")));
+  saveConfig(config(project("demo")));
 
   expect(statSync(configPath()).mode & 0o777).toBe(0o600);
 });
@@ -132,14 +132,14 @@ test("saveConfig creates a missing state directory as 0700 and leaves no temp fi
   const nested = join(home, "nested", "conductor");
   process.env[ENV_KEY] = nested;
 
-  saveConfig(config(project("veltro")));
+  saveConfig(config(project("demo")));
 
   expect(statSync(nested).mode & 0o777).toBe(0o700);
   expect([...new Bun.Glob("*").scanSync({ cwd: nested, dot: true })]).toEqual(["config.json"]);
 });
 
 test("saveConfig replaces an existing config atomically rather than truncating it", () => {
-  saveConfig(config(project("veltro")));
+  saveConfig(config(project("demo")));
   saveConfig(config(project("homelab")));
 
   const onDisk = JSON.parse(readFileSync(configPath(), "utf8")) as ConductorConfig;
@@ -156,7 +156,7 @@ test("resolveCaps overrides only the fields a project sets and inherits the rest
     workerWallClockMs: 60_000,
     maxAttemptsPerIssue: 4,
   };
-  const p = project("veltro");
+  const p = project("demo");
   p.caps = { workerMaxTurns: 7, dailySpendUsd: 0 };
 
   expect(resolveCaps(p, defaults)).toEqual({
@@ -171,28 +171,28 @@ test("resolveCaps overrides only the fields a project sets and inherits the rest
 });
 
 test("resolveCaps returns the defaults when a project overrides nothing", () => {
-  const p = project("veltro");
+  const p = project("demo");
   p.caps = {};
 
   expect(resolveCaps(p, DEFAULT_CAPS)).toEqual(DEFAULT_CAPS);
 });
 
 test("findProject returns the sole project when no name is given", () => {
-  const c = config(project("veltro"));
+  const c = config(project("demo"));
 
-  expect(findProject(c).name).toBe("veltro");
+  expect(findProject(c).name).toBe("demo");
 });
 
 test("findProject refuses to guess between two projects", () => {
-  const c = config(project("veltro"), project("homelab"));
+  const c = config(project("demo"), project("homelab"));
 
   expect(() => findProject(c)).toThrow(/2 projects/);
 });
 
 test("findProject rejects an unknown name and lists what exists", () => {
-  const c = config(project("veltro"), project("homelab"));
+  const c = config(project("demo"), project("homelab"));
 
   expect(() => findProject(c, "nope")).toThrow(/Unknown project "nope"/);
-  expect(() => findProject(c, "nope")).toThrow(/veltro, homelab/);
+  expect(() => findProject(c, "nope")).toThrow(/demo, homelab/);
   expect(findProject(c, "homelab").name).toBe("homelab");
 });

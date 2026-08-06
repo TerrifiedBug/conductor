@@ -214,7 +214,7 @@ async function collectAnswers(
     ctx,
     "Tracker repo (owner/repo) — where ready issues live",
     prior?.tracker.repo ?? "",
-    (v) => (REPO_RE.test(v) ? undefined : `"${v}" is not owner/repo — e.g. TerrifiedBug/veltro.`),
+    (v) => (REPO_RE.test(v) ? undefined : `"${v}" is not owner/repo — e.g. acme/planning.`),
   );
 
   const queueLabel = await ask(

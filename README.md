@@ -37,7 +37,7 @@ README: [`omp/README.md`](omp/README.md), [`herdr/README.md`](herdr/README.md).
 
 ## The fleet host
 
-Both halves are pointed at the same 24/7 session — on the Hermes VPS, an omp
+Both halves are pointed at the same 24/7 session — on your always-on host, an omp
 session with `/root/fleet` as its cwd, `ORCHESTRATOR.md` as its standing brief
 (symlinked as `AGENTS.md`), and `state/armed` as the marker that decides whether a
 heartbeat does anything. `omp-conductor`'s pause flag is the same flag both the

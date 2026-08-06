@@ -38,7 +38,7 @@ export interface Caps {
  * clone and validate each one without asking the model.
  */
 export interface RepoTarget {
-  /** Short routing key that appears in the issue label, e.g. "chad". */
+  /** Short routing key that appears in the issue label, e.g. "api". */
   name: string;
   cloneUrl: string;
   /** Branch worktrees are cut from and PRs target. */

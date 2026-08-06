@@ -3,16 +3,16 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { openStore } from "./store.ts";
 import type { RunRecord, Store } from "./types.ts";
 
-const PROJECT = "veltro";
+const PROJECT = "demo";
 
 /** A complete, boring run; each test overrides only what it is asserting on. */
 function draft(over: Partial<Omit<RunRecord, "id">> = {}): Omit<RunRecord, "id"> {
   return {
     project: PROJECT,
     issue: 42,
-    repo: "chad",
+    repo: "api",
     branch: "feat/add-widget",
-    worktree: "/tmp/conductor/veltro-42",
+    worktree: "/tmp/conductor/demo-42",
     state: "running",
     attempt: 1,
     turns: 0,
@@ -102,15 +102,15 @@ describe("openStore", () => {
   });
 
   it("reports a notification key only after it is marked", () => {
-    expect(store.wasNotified("veltro/42/tier2")).toBe(false);
+    expect(store.wasNotified("demo/42/tier2")).toBe(false);
 
-    store.markNotified("veltro/42/tier2");
+    store.markNotified("demo/42/tier2");
 
-    expect(store.wasNotified("veltro/42/tier2")).toBe(true);
-    expect(store.wasNotified("veltro/43/tier2")).toBe(false);
+    expect(store.wasNotified("demo/42/tier2")).toBe(true);
+    expect(store.wasNotified("demo/43/tier2")).toBe(false);
     // Re-marking is the whole point of the guard: it must stay idempotent.
-    expect(() => store.markNotified("veltro/42/tier2")).not.toThrow();
-    expect(store.wasNotified("veltro/42/tier2")).toBe(true);
+    expect(() => store.markNotified("demo/42/tier2")).not.toThrow();
+    expect(store.wasNotified("demo/42/tier2")).toBe(true);
   });
 
   it("ignores an update for an unknown id instead of throwing", () => {

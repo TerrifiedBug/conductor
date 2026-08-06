@@ -54,8 +54,8 @@ function stubFetch(reply: () => Response): FetchCall[] {
 
 function makeProject(escalation: ProjectConfig["escalation"]): ProjectConfig {
   return {
-    name: "veltro",
-    tracker: { kind: "github", repo: "TerrifiedBug/veltro" },
+    name: "demo",
+    tracker: { kind: "github", repo: "acme/demo" },
     queueLabel: "agent-ready",
     stateLabels: { inProgress: "agent:running", blocked: "agent:blocked", failed: "agent:failed" },
     routing: { labelPrefix: "repo:", repos: {} },
@@ -109,16 +109,16 @@ function makeStore() {
 
 const tier1: Escalation = {
   tier: 1,
-  project: "veltro",
+  project: "demo",
   issue: 4211,
   summary: "gate `bun test` failed twice on the same assertion",
-  detail: "https://github.com/TerrifiedBug/veltro/pull/99",
+  detail: "https://github.com/acme/demo/pull/99",
   runId: "run_abc",
 };
 
 const tier2: Escalation = {
   tier: 2,
-  project: "veltro",
+  project: "demo",
   issue: 4212,
   summary: "worker killed by wallclock cap with a dirty worktree",
   runId: "run_def",
@@ -163,7 +163,7 @@ test("a failed transport is not marked notified, so the next tick retries", asyn
   const working = makeTracker();
   await createEscalator(p, working.tracker, store).escalate(tier1);
   expect(working.comments.length).toBe(1);
-  expect(marked).toEqual(["veltro:4211:1:gate `bun test` failed twice on the same assertion"]);
+  expect(marked).toEqual(["demo:4211:1:gate `bun test` failed twice on the same assertion"]);
 });
 
 test("tier 2 with a chat id sends one Telegram request and no issue comment", async () => {
@@ -181,7 +181,7 @@ test("tier 2 with a chat id sends one Telegram request and no issue comment", as
   expect(marked.length).toBe(1);
 
   const sent: unknown = JSON.parse(calls[0]?.body ?? "{}");
-  expect(sent).toMatchObject({ chat_id: "123456789", text: formatEscalation(tier2, "veltro") });
+  expect(sent).toMatchObject({ chat_id: "123456789", text: formatEscalation(tier2, "demo") });
 });
 
 test("tier 2 with no chat id and no fallback throws instead of dropping the page", async () => {
@@ -197,12 +197,12 @@ test("tier 2 with no chat id and no fallback throws instead of dropping the page
 });
 
 test("formatEscalation names the tier, issue number and summary", () => {
-  const text = formatEscalation(tier2, "veltro");
+  const text = formatEscalation(tier2, "demo");
 
   expect(text).toContain("tier 2");
   expect(text).toContain("#4212");
   expect(text).toContain(tier2.summary);
-  expect(text).toContain("veltro");
+  expect(text).toContain("demo");
   expect(text).toContain("run_def");
 });
 
@@ -307,7 +307,7 @@ test("tier 1 goes to the orchestrator, not to a human-facing issue comment", asy
 
   // Acceptance is the escalation: the run is parked and the orchestrator owns
   // it now, so nobody needs a comment about it.
-  expect(delivered).toEqual([{ issue: 4211, project: "veltro" }]);
+  expect(delivered).toEqual([{ issue: 4211, project: "demo" }]);
   expect(comments.length).toBe(0);
   expect(marked.length).toBe(1);
 });
@@ -341,7 +341,7 @@ test("a lone tier-1 injection that fails after acceptance falls back for itself"
 
   // Accepted, so the tick moved on. Nothing is owed to a human yet, and
   // nothing may be marked: acceptance is not delivery.
-  expect(delivered).toEqual([{ issue: 4211, project: "veltro" }]);
+  expect(delivered).toEqual([{ issue: 4211, project: "demo" }]);
   expect(comments.length).toBe(0);
   expect(marked.length).toBe(0);
 
@@ -353,7 +353,7 @@ test("a lone tier-1 injection that fails after acceptance falls back for itself"
   expect(comments[0]?.issue).toBe(4211);
   expect(comments[0]?.body).toContain(tier1.summary);
   // Marked only once the fallback actually landed, never before.
-  expect(marked).toEqual(["veltro:4211:1:gate `bun test` failed twice on the same assertion"]);
+  expect(marked).toEqual(["demo:4211:1:gate `bun test` failed twice on the same assertion"]);
 });
 
 test("a settlement failure with no fallback stays unmarked and stays visible", async () => {
