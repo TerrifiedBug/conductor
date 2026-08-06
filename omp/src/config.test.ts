@@ -9,7 +9,13 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync }
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { configPath, findProject, loadConfig, resolveCaps, saveConfig, stateDir } from "./config.ts";
-import { DEFAULT_CAPS, type Caps, type ConductorConfig, type ProjectConfig } from "./types.ts";
+import {
+  DEFAULT_CAPS,
+  DEFAULT_REPORT_SCOPE,
+  type Caps,
+  type ConductorConfig,
+  type ProjectConfig,
+} from "./types.ts";
 
 const ENV_KEY = "OMP_CONDUCTOR_HOME";
 
@@ -48,6 +54,7 @@ function project(name: string): ProjectConfig {
     },
     caps: { workerMaxTurns: 7 },
     escalation: { telegramChatId: "123456", fallbackToIssueComment: true },
+    reporting: { scope: "escalations" },
     workspaceRoot: join(home, "worktrees"),
     mirrorRoot: join(home, "mirrors"),
   };
@@ -120,6 +127,56 @@ test("loadConfig reports every problem it found, not just the first", () => {
   expect(message).toContain(`tracker.repo must look like "owner/repo"`);
   expect(message).toContain("queueLabel must be a non-empty string");
   expect(message).toContain("routing.repos needs at least one repo entry");
+});
+
+test("a project with no reporting block loads as the documented default", () => {
+  const { reporting, ...withoutReporting } = project("demo");
+  writeRawConfig({ version: 1, defaults: { ...DEFAULT_CAPS }, projects: [withoutReporting] });
+
+  // The compatibility promise: a config written before this key existed keeps
+  // the reporting volume it already had, rather than going quiet.
+  expect(loadConfig().projects[0]?.reporting).toEqual({ scope: DEFAULT_REPORT_SCOPE });
+  expect(reporting).toEqual({ scope: "escalations" });
+});
+
+test("loadConfig rejects an unknown reporting scope by name instead of defaulting it", () => {
+  writeRawConfig({
+    version: 1,
+    defaults: { ...DEFAULT_CAPS },
+    projects: [{ ...project("demo"), reporting: { scope: "materal" } }],
+  });
+
+  // Silently folding a typo to "material" would read as configured on the day
+  // the operator meant to turn the volume down.
+  expect(() => loadConfig()).toThrow(/reporting\.scope must be "escalations" or "material", found "materal"/);
+});
+
+test("loadConfig reports a misshapen reporting block alongside every other fault", () => {
+  writeRawConfig({
+    version: 1,
+    defaults: { ...DEFAULT_CAPS },
+    projects: [{ ...project("demo"), queueLabel: "", reporting: { scope: "material", digest: "daily" } }],
+  });
+
+  let message = "";
+  try {
+    loadConfig();
+  } catch (err) {
+    message = err instanceof Error ? err.message : String(err);
+  }
+
+  expect(message).toContain("reporting has unknown key(s): digest");
+  expect(message).toContain("queueLabel must be a non-empty string");
+});
+
+test("loadConfig rejects a reporting block that is not an object", () => {
+  writeRawConfig({
+    version: 1,
+    defaults: { ...DEFAULT_CAPS },
+    projects: [{ ...project("demo"), reporting: "material" }],
+  });
+
+  expect(() => loadConfig()).toThrow(/reporting must be an object with a "scope"/);
 });
 
 test("saveConfig writes the config readable only by its owner", () => {

@@ -53,8 +53,13 @@ interface SentMessage {
  * Stands in for the extension host. `fire()` is the captured managed-timer
  * callback; it is undefined exactly when no timer was registered, which is what
  * the activation-gate tests assert on.
+ *
+ * `hasUI`/`activeTools` describe the session shape the extension is loaded
+ * into. The defaults are an interactive root session with no `yield` — the
+ * operator sitting at the orchestrator terminal — so every pre-existing test
+ * keeps describing the case it was written for.
  */
-function fakeHost(options: { pending?: boolean } = {}) {
+function fakeHost(options: { pending?: boolean; hasUI?: boolean; activeTools?: string[] } = {}) {
   const logs: string[] = [];
   const notices: { message: string; type?: string }[] = [];
   const sent: SentMessage[] = [];
@@ -62,6 +67,7 @@ function fakeHost(options: { pending?: boolean } = {}) {
   const state = { pending: options.pending ?? false };
 
   const ctx = {
+    hasUI: options.hasUI ?? true,
     cwd,
     ui: {
       notify(message: string, type?: "info" | "warning" | "error") {
@@ -82,6 +88,7 @@ function fakeHost(options: { pending?: boolean } = {}) {
       info: (message: string) => logs.push(message),
       error: (message: string) => logs.push(message),
     },
+    getActiveTools: () => options.activeTools ?? [],
     on(_event: "session_start", h: (event: { type: "session_start" }, c: typeof ctx) => void) {
       handler = h as typeof handler;
     },
@@ -264,6 +271,44 @@ test("a second session_start does not install a second heartbeat", () => {
   pi.start();
 
   expect(pi.intervals).toHaveLength(1);
+});
+
+// ------------------------------------------------------------- session shape
+//
+// A worker subagent runs in the orchestrator's own cwd, so the activation file
+// is present and valid for it too. Only the session shape separates the two,
+// and it takes both halves: headless *and* holding `yield`.
+
+test("a subagent never arms, even with a valid activation file in its cwd", () => {
+  writeTickConfig({ intervalSeconds: 600 });
+  const pi = fakeHost({ hasUI: false, activeTools: ["read", "edit", "yield"] });
+  orchestratorTickExtension(pi);
+  pi.start();
+
+  expect(pi.intervals).toHaveLength(0);
+  expect(pi.notices).toHaveLength(0);
+  expect(pi.sent).toHaveLength(0);
+  expect(pi.logs).toEqual(["[omp-conductor] tick inert: subagent session"]);
+});
+
+test("a headless root session arms: no UI alone is print/RPC mode, not a subagent", () => {
+  writeTickConfig({ intervalSeconds: 600 });
+  const pi = fakeHost({ hasUI: false, activeTools: ["read", "edit"] });
+  orchestratorTickExtension(pi);
+  pi.start();
+
+  expect(pi.intervals).toHaveLength(1);
+  expect(pi.intervals[0]?.ms).toBe(600_000);
+});
+
+test("an interactive session arms even while `yield` is active: tools alone disqualify nothing", () => {
+  writeTickConfig({ intervalSeconds: 600 });
+  const pi = fakeHost({ hasUI: true, activeTools: ["read", "edit", "yield"] });
+  orchestratorTickExtension(pi);
+  pi.start();
+
+  expect(pi.intervals).toHaveLength(1);
+  expect(pi.intervals[0]?.ms).toBe(600_000);
 });
 
 // -------------------------------------------------------------- timer wiring

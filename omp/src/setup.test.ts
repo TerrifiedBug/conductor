@@ -12,20 +12,25 @@
  */
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, saveConfig, stateDir } from "./config.ts";
 import {
+  ORCHESTRATOR_BRIEF_NAME,
+  REPORT_SCOPE_CHOICES,
   buildConfig,
   detectTelegram,
+  orchestratorBriefPath,
+  renderOrchestratorBrief,
   summarisePlan,
+  writeOrchestratorBrief,
   type LabelPlan,
   type ScopeCheck,
   type SetupAnswers,
   type TelegramPresence,
 } from "./setup.ts";
-import { DEFAULT_CAPS } from "./types.ts";
+import { DEFAULT_CAPS, DEFAULT_REPORT_SCOPE } from "./types.ts";
 
 const CONDUCTOR_HOME = "OMP_CONDUCTOR_HOME";
 const TELEGRAM_HOME = "OMP_TELEGRAM_STATE_DIR";
@@ -71,6 +76,8 @@ function answers(overrides: Partial<SetupAnswers> = {}): SetupAnswers {
     ],
     caps: {},
     fallbackToIssueComment: true,
+    reportScope: DEFAULT_REPORT_SCOPE,
+    writeOrchestratorBrief: false,
     ...overrides,
   };
 }
@@ -97,6 +104,7 @@ test("a config built from answers survives its own validator", () => {
   expect(project?.caps).toEqual({ maxConcurrentWorkers: 3, dailySpendUsd: 40 });
   expect(project?.escalation).toEqual({ fallbackToIssueComment: false, telegramChatId: "424242" });
   expect(project?.routing.repos["api"]?.gates).toEqual([{ cmd: "bun run check", cwd: "." }]);
+  expect(project?.reporting).toEqual({ scope: "material" });
   expect(loaded.defaults).toEqual(DEFAULT_CAPS);
 });
 
@@ -128,6 +136,77 @@ test("worktrees and mirrors are derived from the state directory, not the repo",
   expect(stateDir()).toBe(home);
   expect(project?.workspaceRoot).toBe(join(home, "worktrees"));
   expect(project?.mirrorRoot).toBe(join(home, "mirrors"));
+});
+
+test("the chosen report scope reaches the config the daemon will load", () => {
+  saveConfig(buildConfig(answers({ reportScope: "escalations" })));
+
+  expect(loadConfig().projects[0]?.reporting).toEqual({ scope: "escalations" });
+});
+
+// --------------------------------------------------------- orchestrator brief
+
+test("the rendered brief carries this project's coordinates and nothing unfilled", () => {
+  const text = renderOrchestratorBrief(
+    answers({ projectName: "homelab", trackerRepo: "acme/planning", queueLabel: "queued" }),
+  );
+
+  expect(text).toContain("homelab");
+  expect(text).toContain("acme/planning");
+  expect(text).toContain("`queued`");
+  // An unfilled placeholder means the template and the renderer disagree about a
+  // key, and the operator's brief would ship that literally to their session.
+  expect(text).not.toMatch(/\{\{[A-Za-z0-9_]+\}\}/);
+});
+
+test("the brief defaults to never releasing, and says the section is the operator's", () => {
+  const text = renderOrchestratorBrief(answers());
+
+  // The package's own boundary: whatever an operator writes later, the shipped
+  // default must never read as permission to release.
+  expect(text).toContain("## Releases (yours to define)");
+  expect(text).toContain("never tag, pin, deploy,");
+  expect(text).toContain("YOURS TO EDIT");
+  // And the fixed half stays fixed: duties, tiers, evidence.
+  expect(text).toContain("## Duty 1 — drain");
+  expect(text).toContain("## Duty 2 — groom");
+  expect(text).toContain("## Duty 3 — report");
+  expect(text).toContain("Every claim cites evidence");
+});
+
+test("the brief names the chosen scope while still spelling both out", () => {
+  const material = renderOrchestratorBrief(answers({ reportScope: "material" }));
+  const escalations = renderOrchestratorBrief(answers({ reportScope: "escalations" }));
+
+  expect(material).toContain("Your report scope is **`material`**");
+  expect(escalations).toContain("Your report scope is **`escalations`**");
+  // Both are described either way: the operator can switch by editing the key
+  // without having to re-run setup to find out what the other one meant.
+  for (const text of [material, escalations]) {
+    for (const choice of REPORT_SCOPE_CHOICES) expect(text).toContain(`- **\`${choice.scope}\`**`);
+  }
+});
+
+test("writing the brief creates the workspace root it lands in", () => {
+  const a = answers();
+  const expected = join(home, "worktrees", ORCHESTRATOR_BRIEF_NAME);
+  expect(orchestratorBriefPath(a)).toBe(expected);
+  expect(existsSync(expected)).toBe(false);
+
+  const written = writeOrchestratorBrief(a);
+
+  expect(written).toBe(expected);
+  expect(readFileSync(expected, "utf8")).toBe(renderOrchestratorBrief(a));
+});
+
+test("writing the brief again replaces it — the overwrite question is the wizard's", () => {
+  writeOrchestratorBrief(answers({ projectName: "outgoing-project" }));
+
+  writeOrchestratorBrief(answers({ projectName: "incoming-project" }));
+
+  const text = readFileSync(join(home, "worktrees", ORCHESTRATOR_BRIEF_NAME), "utf8");
+  expect(text).toContain("incoming-project");
+  expect(text).not.toContain("outgoing-project");
 });
 
 // --------------------------------------------------------------- summarisePlan
@@ -179,6 +258,41 @@ test("the plan shows effective caps, marking the ones that were answered", () =>
   expect(text).toMatch(/maxConcurrentWorkers\s+5\s+\(answered\)/);
   // Unanswered caps still show, at the shipped default, so nothing is implicit.
   expect(text).toMatch(new RegExp(`maxIssuesPerDay\\s+${DEFAULT_CAPS.maxIssuesPerDay}$`, "m"));
+});
+
+test("the plan names both reporting answers, so neither is applied unseen", () => {
+  const scopes: ScopeCheck = { ok: true, login: "acme", scopes: ["repo", "project"], missing: [] };
+
+  const declined = summarisePlan(answers({ reportScope: "escalations" }), scopes, labelPlan(), NO_TELEGRAM);
+
+  expect(declined).toContain("scope          escalations");
+  expect(declined).toContain("brief          not written");
+
+  const accepted = summarisePlan(
+    answers({ reportScope: "material", writeOrchestratorBrief: true }),
+    scopes,
+    labelPlan(),
+    NO_TELEGRAM,
+  );
+
+  expect(accepted).toContain("scope          material");
+  expect(accepted).toContain(`would write ${join(home, "worktrees", ORCHESTRATOR_BRIEF_NAME)}`);
+});
+
+test("the plan says OVERWRITE when a brief is already there", () => {
+  const scopes: ScopeCheck = { ok: true, login: "acme", scopes: ["repo", "project"], missing: [] };
+  writeOrchestratorBrief(answers());
+
+  const text = summarisePlan(answers({ writeOrchestratorBrief: true }), scopes, labelPlan(), NO_TELEGRAM);
+
+  // Destroying an operator's own policy file is exactly the change the consent
+  // screen exists to name before it happens.
+  expect(text).toContain(`would OVERWRITE ${join(home, "worktrees", ORCHESTRATOR_BRIEF_NAME)}`);
+
+  // And declining says the existing file survives, rather than claiming there
+  // is none — the operator is being told what happens to the file they wrote.
+  const declined = summarisePlan(answers(), scopes, labelPlan(), NO_TELEGRAM);
+  expect(declined).toContain(`${join(home, "worktrees", ORCHESTRATOR_BRIEF_NAME)} is left exactly as it is`);
 });
 
 // -------------------------------------------------------------- detectTelegram
