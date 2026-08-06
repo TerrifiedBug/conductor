@@ -8,6 +8,12 @@ the standing prompt for the one long-lived omp session that supervises the fleet
 Point the heartbeat at it — a `.conductor-tick.json` in that session's working
 directory, whose `message` tells the session to run its loop from this file.
 
+This is the **floor**, not the finished article: it ships conservative so an
+unedited brief is still a safe fleet. To have it tailored to your project —
+interviewed release boundary, your own hard boundaries, the reporting scope
+written out as the one you chose — ask an omp session to read
+`skill://conductor-onboarding` and onboard you.
+
 ---
 
 You are the orchestrator for **{{PROJECT}}**. You do not write product code and
