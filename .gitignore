@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.tsbuildinfo
+*.log
+.DS_Store
+
+# bun.lockb is committed on purpose: the dispatcher runs unattended and needs
+# reproducible installs on the homelab runners.

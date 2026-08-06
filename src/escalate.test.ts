@@ -1,0 +1,250 @@
+import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { createEscalator, formatEscalation } from "./escalate.ts";
+import type { Escalation, ProjectConfig, Store, Tracker } from "./types.ts";
+
+/** Obvious junk: this must never reach the network, a log or an assertion. */
+const FAKE_TOKEN = "1234567:AA-fake-test-token-not-a-secret";
+
+const realFetch = globalThis.fetch;
+const realStateDir = process.env.OMP_TELEGRAM_STATE_DIR;
+let tokenDir: string;
+
+beforeAll(() => {
+  // Point the token reader at a throwaway dir so no test can read — let alone
+  // send with — the developer's real omp-telegram credentials.
+  tokenDir = mkdtempSync(join(tmpdir(), "conductor-escalate-"));
+  writeFileSync(join(tokenDir, ".env"), `TELEGRAM_BOT_TOKEN=${FAKE_TOKEN}\n`, { mode: 0o600 });
+});
+
+afterAll(() => {
+  rmSync(tokenDir, { recursive: true, force: true });
+  if (realStateDir === undefined) delete process.env.OMP_TELEGRAM_STATE_DIR;
+  else process.env.OMP_TELEGRAM_STATE_DIR = realStateDir;
+  globalThis.fetch = realFetch;
+});
+
+beforeEach(() => {
+  process.env.OMP_TELEGRAM_STATE_DIR = tokenDir;
+  // Default deny: any unexpected network call fails the test that made it.
+  globalThis.fetch = (async () => {
+    throw new Error("unexpected network call");
+  }) as unknown as typeof fetch;
+});
+
+afterEach(() => {
+  globalThis.fetch = realFetch;
+});
+
+type FetchCall = { url: string; body: string };
+
+/** Stubs fetch with one canned reply and records what was sent. */
+function stubFetch(reply: () => Response): FetchCall[] {
+  const calls: FetchCall[] = [];
+  globalThis.fetch = (async (...args: Parameters<typeof fetch>) => {
+    calls.push({ url: String(args[0]), body: String(args[1]?.body ?? "") });
+    return reply();
+  }) as typeof fetch;
+  return calls;
+}
+
+function makeProject(escalation: ProjectConfig["escalation"]): ProjectConfig {
+  return {
+    name: "veltro",
+    tracker: { kind: "github", repo: "TerrifiedBug/veltro" },
+    queueLabel: "agent-ready",
+    stateLabels: { inProgress: "agent:running", blocked: "agent:blocked", failed: "agent:failed" },
+    routing: { labelPrefix: "repo:", repos: {} },
+    caps: {},
+    escalation,
+    workspaceRoot: "/tmp/conductor/work",
+    mirrorRoot: "/tmp/conductor/mirrors",
+  };
+}
+
+function makeTracker(opts: { commentThrows?: boolean } = {}) {
+  const comments: { issue: number; body: string }[] = [];
+  const tracker: Tracker = {
+    listReady: async () => [],
+    addLabel: async () => {},
+    removeLabel: async () => {},
+    comment: async (issue: number, body: string) => {
+      comments.push({ issue, body });
+      if (opts.commentThrows) throw new Error("tracker unreachable");
+    },
+    close: async () => {},
+    linkParent: async () => {},
+  };
+  return { tracker, comments };
+}
+
+function makeStore() {
+  const notified = new Set<string>();
+  const marked: string[] = [];
+  const store: Store = {
+    createRun: () => {
+      throw new Error("createRun is not part of the escalation path");
+    },
+    updateRun: () => {
+      throw new Error("updateRun is not part of the escalation path");
+    },
+    getRun: () => undefined,
+    activeRuns: () => [],
+    attemptsFor: () => 0,
+    runsStartedSince: () => 0,
+    spendSince: () => 0,
+    wasNotified: (key: string) => notified.has(key),
+    markNotified: (key: string) => {
+      notified.add(key);
+      marked.push(key);
+    },
+    close: () => {},
+  };
+  return { store, marked };
+}
+
+const tier1: Escalation = {
+  tier: 1,
+  project: "veltro",
+  issue: 4211,
+  summary: "gate `bun test` failed twice on the same assertion",
+  detail: "https://github.com/TerrifiedBug/veltro/pull/99",
+  runId: "run_abc",
+};
+
+const tier2: Escalation = {
+  tier: 2,
+  project: "veltro",
+  issue: 4212,
+  summary: "worker killed by wallclock cap with a dirty worktree",
+  runId: "run_def",
+};
+
+test("tier 1 with the issue-comment fallback comments exactly once", async () => {
+  const { tracker, comments } = makeTracker();
+  const { store, marked } = makeStore();
+  const p = makeProject({ fallbackToIssueComment: true });
+
+  await createEscalator(p, tracker, store).escalate(tier1);
+
+  expect(comments.length).toBe(1);
+  expect(comments[0]?.issue).toBe(4211);
+  expect(comments[0]?.body).toContain("#4211");
+  expect(comments[0]?.body).toContain(tier1.summary);
+  expect(marked.length).toBe(1);
+});
+
+test("the same escalation twice notifies once", async () => {
+  const { tracker, comments } = makeTracker();
+  const { store } = makeStore();
+  const escalator = createEscalator(makeProject({ fallbackToIssueComment: true }), tracker, store);
+
+  await escalator.escalate(tier1);
+  await escalator.escalate({ ...tier1 });
+
+  expect(comments.length).toBe(1);
+});
+
+test("a failed transport is not marked notified, so the next tick retries", async () => {
+  const failing = makeTracker({ commentThrows: true });
+  const { store, marked } = makeStore();
+  const p = makeProject({ fallbackToIssueComment: true });
+
+  await expect(createEscalator(p, failing.tracker, store).escalate(tier1)).rejects.toThrow(
+    "tracker unreachable",
+  );
+  expect(marked.length).toBe(0);
+
+  // Same store, working tracker: the event is still owed to the human.
+  const working = makeTracker();
+  await createEscalator(p, working.tracker, store).escalate(tier1);
+  expect(working.comments.length).toBe(1);
+  expect(marked).toEqual(["veltro:4211:1:gate `bun test` failed twice on the same assertion"]);
+});
+
+test("tier 2 with a chat id sends one Telegram request and no issue comment", async () => {
+  const calls = stubFetch(() => new Response(JSON.stringify({ ok: true, result: {} }), { status: 200 }));
+  const { tracker, comments } = makeTracker();
+  const { store, marked } = makeStore();
+  const p = makeProject({ telegramChatId: "123456789", fallbackToIssueComment: true });
+
+  await createEscalator(p, tracker, store).escalate(tier2);
+
+  expect(calls.length).toBe(1);
+  expect(calls[0]?.url).toStartWith("https://api.telegram.org/bot");
+  expect(calls[0]?.url).toEndWith("/sendMessage");
+  expect(comments.length).toBe(0);
+  expect(marked.length).toBe(1);
+
+  const sent: unknown = JSON.parse(calls[0]?.body ?? "{}");
+  expect(sent).toMatchObject({ chat_id: "123456789", text: formatEscalation(tier2, "veltro") });
+});
+
+test("tier 2 with no chat id and no fallback throws instead of dropping the page", async () => {
+  const { tracker, comments } = makeTracker();
+  const { store, marked } = makeStore();
+  const p = makeProject({ fallbackToIssueComment: false });
+
+  await expect(createEscalator(p, tracker, store).escalate(tier2)).rejects.toThrow(
+    /no escalation transport configured/,
+  );
+  expect(comments.length).toBe(0);
+  expect(marked.length).toBe(0);
+});
+
+test("formatEscalation names the tier, issue number and summary", () => {
+  const text = formatEscalation(tier2, "veltro");
+
+  expect(text).toContain("tier 2");
+  expect(text).toContain("#4212");
+  expect(text).toContain(tier2.summary);
+  expect(text).toContain("veltro");
+  expect(text).toContain("run_def");
+});
+
+test("a Telegram failure never leaks the bot token", async () => {
+  // Worst case: the API echoes the full request URL — token and all — back at us.
+  stubFetch(
+    () =>
+      new Response(`{"ok":false,"description":"bad request at https://api.telegram.org/bot${FAKE_TOKEN}/sendMessage"}`, {
+        status: 400,
+      }),
+  );
+  const { tracker } = makeTracker();
+  const { store, marked } = makeStore();
+  const p = makeProject({ telegramChatId: "123456789", fallbackToIssueComment: false });
+
+  const err = await createEscalator(p, tracker, store).escalate(tier2).catch((e: unknown) => e);
+
+  expect(err).toBeInstanceOf(Error);
+  const message = err instanceof Error ? err.message : String(err);
+  expect(message).not.toContain(FAKE_TOKEN);
+  expect(message).not.toContain("AA-fake-test-token-not-a-secret");
+  expect(message).toContain("<redacted>");
+  expect(marked.length).toBe(0);
+});
+
+test("tier 2 falls back to an issue comment when the token file is missing", async () => {
+  process.env.OMP_TELEGRAM_STATE_DIR = join(tokenDir, "does-not-exist");
+  const { tracker, comments } = makeTracker();
+  const { store } = makeStore();
+  const p = makeProject({ telegramChatId: "123456789", fallbackToIssueComment: true });
+
+  await createEscalator(p, tracker, store).escalate(tier2);
+
+  expect(comments.length).toBe(1);
+  expect(comments[0]?.body).toContain("tier 2");
+});
+
+test("a 200 response with ok:false is treated as a failure", async () => {
+  stubFetch(() => new Response(JSON.stringify({ ok: false, description: "chat not found" }), { status: 200 }));
+  const { tracker } = makeTracker();
+  const { store, marked } = makeStore();
+  const p = makeProject({ telegramChatId: "123456789", fallbackToIssueComment: false });
+
+  await expect(createEscalator(p, tracker, store).escalate(tier2)).rejects.toThrow(/rejected/);
+  expect(marked.length).toBe(0);
+});

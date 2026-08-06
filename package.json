@@ -1,0 +1,30 @@
+{
+  "name": "omp-conductor",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "description": "A 24/7 dispatcher that turns ready GitHub issues into merged PRs using omp coding sessions, with tiered escalation to a human.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TerrifiedBug/omp-conductor.git"
+  },
+  "main": "./src/plugin.ts",
+  "bin": {
+    "omp-conductor": "./src/cli.ts"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "peerDependencies": {
+    "@oh-my-pi/pi-coding-agent": ">=17.1.4"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.7.0"
+  }
+}
