@@ -31,13 +31,14 @@ run's transcript and then either re-brief the worker or decide the problem genui
 needs a human. It never edits product code, pushes or merges. Only tier 2 pages you
 directly.
 
-The package ships three deployables:
+The package ships three deployables, plus one skill:
 
 | Deployable | Entry | What it is for |
 | --- | --- | --- |
 | omp plugin | `/conductor` slash command | Inspect and arm the conductor from inside an omp session: dry-run the queue, read status, pause, resume. |
 | Standalone daemon | `omp-conductor` binary | The dispatch loop, managed as a background process (`start` / `stop` / `restart`) with a `/healthz` endpoint for a supervisor. |
 | Orchestrator heartbeat | omp extension, activated by `.conductor-tick.json` | Prompts a 24/7 orchestrator session on a fixed interval so its standing loop actually runs. Inert in every other session. See [Orchestrator tick](#orchestrator-tick). |
+| Onboarding skill | `skill://conductor-onboarding` | Directs an omp session to interview you, read your repos for real CI gates, and tailor `ORCHESTRATOR.md` — then finish through the wizard. Discovered automatically once the plugin is installed. See [Onboarding](#onboarding). |
 
 The first two are thin wrappers over the same `daemon.ts`, so the plugin and the
 CLI cannot disagree about what a cap means or where the state lives. The heartbeat
@@ -140,6 +141,55 @@ Also required on the host:
   daemon never handles a GitHub token itself.
 - `git` — mirrors and worktrees.
 
+## Onboarding
+
+Onboarding this package has two layers, and installing it gives you both.
+
+| Layer | What it is | What it owns |
+| --- | --- | --- |
+| **`/conductor setup`** | The deterministic wizard. Closed questions, a label plan, a dry run, one confirm. | **Mechanical config.** It is the only thing that writes `config.json`, and it mutates nothing before you confirm. |
+| **`skill://conductor-onboarding`** | A skill bundled in this package (`skills/conductor-onboarding/SKILL.md`), discovered automatically by any omp session once the plugin is installed. | **Brief authoring.** The judgement the wizard cannot prompt for. |
+
+The split exists because the two halves fail differently. A wrong config value is
+a run that errors on the next tick; a wrong release boundary is a fleet that
+publishes something at 03:00. The first is worth a text prompt with validation.
+The second is worth an interview.
+
+So the skill does the part a dialog cannot:
+
+- **Interviews you** on release policy — humans release (the default), the agent
+  releases to a named boundary, or the agent releases fully — pressing on the one
+  question that makes a delegated release safe: *where does the agent's leg end?*
+  Plus escalation taste, and which of the two [`reporting.scope`](#your-workflow-vs-the-package)
+  values your answer actually maps to.
+- **Reads your repos instead of asking about them.** It opens each routing repo's
+  CI workflows, `package.json` scripts and `Makefile`/`justfile`, then *proposes*
+  the exact pre-push [gates](#configuration) with the `cwd` each runs from — so
+  the gates match what CI runs, rather than what you remembered it runs.
+- **Tailors `ORCHESTRATOR.md`** from the shipped template. The template is the
+  floor: it rewrites the Releases and Reporting sections from your answers, adds
+  the hard boundaries only you know about (infra directories, off-limits repos),
+  leaves the fixed sections alone, and shows you the diff before writing.
+- **Verifies the worker brief's assumptions** against reality: default branch per
+  repo, whether the branch names the conductor cuts survive your branch
+  protection, whether each proposed gate exists and exits 0 on a clean checkout,
+  and whether `pull_request` actually fires — a workflow that never triggers on a
+  PR gives a worker no checks to watch and no verdict to reach.
+- **Then finishes through the wizard**, so the dry run and the consent gate still
+  do the writing.
+
+From an omp session with the plugin installed, just say what you want — "help me
+set up conductor", "onboard me", "configure the fleet" all reach it, because that
+is what the skill's description matches on. With `skills.enableSkillCommands`
+turned on you can also invoke it directly:
+
+```text
+/skill:conductor-onboarding
+```
+
+Nothing about the wizard changes: `/conductor setup` on its own remains a
+complete, supported path, and the brief it renders is safe unedited.
+
 ## Quick start
 
 1. Write a config (see [Configuration](#configuration)) at
@@ -161,7 +211,10 @@ Also required on the host:
    Two of its questions are about you rather than the fleet: how loud the
    orchestrator should be (`reporting.scope`), and whether to write an
    `ORCHESTRATOR.md` you then own — see
-   [Your workflow vs. the package](#your-workflow-vs-the-package).
+   [Your workflow vs. the package](#your-workflow-vs-the-package). If you would
+   rather be interviewed through those two, and have the brief tailored and your
+   gates read out of your CI config, start from
+   [Onboarding](#onboarding) instead.
 
 3. Start the daemon in the background:
 
