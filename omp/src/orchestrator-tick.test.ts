@@ -395,12 +395,20 @@ test("a message re-read that fails keeps the startup prompt, and keeps ticking",
   expect(pi.notices).toHaveLength(0);
 });
 
-test("the default message carries the tick timestamp", () => {
+test("the default message orders a disk re-read of the resolved brief and carries the timestamp", () => {
   const at = new Date("2026-08-06T12:00:00.000Z");
-  // No reporting clause of its own: the scope line below owns that contract, and
-  // two spellings of it would contradict each other inside one prompt.
+  // "Re-read … from disk" is load-bearing, and it is an observed failure, not a
+  // hypothetical: a session's context copy of the brief dates from its start
+  // (resume included), so a tick that merely says "run your loop" can act on a
+  // brief the operator has since amended — and a standing task added between
+  // ticks never binds. The path is resolved from the config because the brief
+  // lives at <workspaceRoot>/ORCHESTRATOR.md, not in the session cwd; the bare
+  // name is only the no-config fallback.
   expect(defaultTickMessage(at)).toBe(
-    "Tick 2026-08-06T12:00:00.000Z: run your standing loop from ORCHESTRATOR.md now.",
+    "Tick 2026-08-06T12:00:00.000Z: re-read ORCHESTRATOR.md from disk, then run your standing loop from it.",
+  );
+  expect(defaultTickMessage(at, "/data/fleet/worktrees/ORCHESTRATOR.md")).toBe(
+    "Tick 2026-08-06T12:00:00.000Z: re-read /data/fleet/worktrees/ORCHESTRATOR.md from disk, then run your standing loop from it.",
   );
 });
 

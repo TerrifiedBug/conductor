@@ -145,13 +145,20 @@ export type TickConfigResult =
  * The prompt when the config names none. The timestamp is what makes two
  * consecutive ticks distinguishable in the session log.
  *
+ * "Re-read … from disk" is an order, not colour. A 24/7 session holds a copy of
+ * the brief from its own start (or its last compaction), and a tick that merely
+ * says "run your loop" was observed acting on that cached copy first — which
+ * means an operator's amendment, or a dated standing task added between ticks,
+ * may never bind. The whole point of a file the operator can edit is that the
+ * next tick obeys the file, not the memory of it.
+ *
  * Deliberately silent about reporting volume: that clause is
  * {@link TICK_SCOPE_CONSTRAINTS}, appended per tick from the configured scope.
  * A second spelling of it here would contradict the first inside one prompt the
  * moment a fleet chose `escalations`.
  */
-export function defaultTickMessage(now: Date): string {
-  return `Tick ${now.toISOString()}: run your standing loop from ORCHESTRATOR.md now.`;
+export function defaultTickMessage(now: Date, briefPath = "ORCHESTRATOR.md"): string {
+  return `Tick ${now.toISOString()}: re-read ${briefPath} from disk, then run your standing loop from it.`;
 }
 
 /**
@@ -188,21 +195,34 @@ export const TICK_DELIVERY_RULE =
   "This tick was injected locally, not sent from Telegram, so your end-of-turn text does NOT reach your operator. Deliver anything reportable this turn by calling the telegram_send tool and confirming success; never claim a report was sent otherwise.";
 
 /**
- * The scope this tick carries, and — when it had to fall back — why.
+ * The scope this tick carries, where the brief actually lives, and — when the
+ * config could not answer — why.
  *
  * Read on every tick rather than cached at session start, for the reason the
  * channel gate is: the operator re-runs `/conductor setup` while this session
  * lives, and a heartbeat holding a startup snapshot would keep injecting the
  * old contract until somebody restarted it.
  *
- * Every fault collapses to {@link DEFAULT_REPORT_SCOPE}: no config written yet,
- * an unreadable or invalid one, or several projects with none named — the same
- * ambiguity `findProject` refuses to guess through for `status`. Stopping the
- * heartbeat over a reporting preference would be the worse trade.
+ * `briefPath` exists because the prompt orders a re-read, and an order must
+ * name a file that is really there: the brief lives at
+ * `<workspaceRoot>/ORCHESTRATOR.md`, not in the session cwd — the cwd usually
+ * holds only an `AGENTS.md` symlink to it. The name is spelled here rather than
+ * imported from setup.ts, whose import graph drags the session SDK into an
+ * extension that must stay cheap to load.
+ *
+ * Every fault collapses to {@link DEFAULT_REPORT_SCOPE} and a pathless prompt:
+ * no config written yet, an unreadable or invalid one, or several projects with
+ * none named — the same ambiguity `findProject` refuses to guess through for
+ * `status`. Stopping the heartbeat over either preference would be the worse
+ * trade.
  */
-export function resolveTickScope(): { scope: ReportScope; fallback?: string } {
+export function resolveTickScope(): { scope: ReportScope; briefPath?: string; fallback?: string } {
   try {
-    return { scope: findProject(loadConfig()).reporting?.scope ?? DEFAULT_REPORT_SCOPE };
+    const project = findProject(loadConfig());
+    return {
+      scope: project.reporting?.scope ?? DEFAULT_REPORT_SCOPE,
+      briefPath: join(project.workspaceRoot, "ORCHESTRATOR.md"),
+    };
   } catch (err) {
     return { scope: DEFAULT_REPORT_SCOPE, fallback: err instanceof Error ? err.message : String(err) };
   }
@@ -405,7 +425,7 @@ function tick(pi: TickApi, ctx: TickContext, config: TickConfig, session: { scop
       session.scopeFallbackLogged = true;
       pi.logger.info(`[omp-conductor] tick reporting scope: using ${DEFAULT_REPORT_SCOPE} — ${scope.fallback}`);
     }
-    content = `${defaultTickMessage(new Date())}\n${TICK_SCOPE_CONSTRAINTS[scope.scope]}\n${TICK_DELIVERY_RULE}`;
+    content = `${defaultTickMessage(new Date(), scope.briefPath)}\n${TICK_SCOPE_CONSTRAINTS[scope.scope]}\n${TICK_DELIVERY_RULE}`;
   }
 
   pi.sendMessage(
