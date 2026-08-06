@@ -16,9 +16,12 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, wri
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
+  AUTHORITY_HOLDERS,
   CONFIG_VERSION,
+  DEFAULT_AUTHORITY,
   DEFAULT_CAPS,
   DEFAULT_REPORT_SCOPE,
+  ORCHESTRATOR_MODES,
   READABLE_CONFIG_VERSIONS,
   REPORT_SCOPES,
   type Caps,
@@ -43,8 +46,10 @@ type Raw = { readonly [key: string]: unknown };
 /** Derived from the data so a new `Caps` field cannot be silently ignored. */
 const CAP_KEYS = Object.keys(DEFAULT_CAPS) as (keyof Caps)[];
 
-/** Quoted for error messages, from the same data the guard below reads. */
-const REPORT_SCOPE_LIST = REPORT_SCOPES.map((s) => `"${s}"`).join(" or ");
+/** Quoted for error messages, from the same data the guards below read. */
+const REPORT_SCOPE_LIST = quoteList(REPORT_SCOPES);
+const AUTHORITY_HOLDER_LIST = quoteList(AUTHORITY_HOLDERS);
+const ORCHESTRATOR_MODE_LIST = quoteList(ORCHESTRATOR_MODES);
 
 /** `owner/repo`, the only tracker spelling `gh` accepts without a host. */
 const REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
@@ -267,13 +272,8 @@ function normalizeProject(
 
   const stateLabels = raw["stateLabels"] as Raw | undefined;
 
-  const escalationIn = raw["escalation"] as Raw | undefined;
-  const chatId = escalationIn?.["telegramChatId"];
-  const escalation: ProjectConfig["escalation"] = {
-    // Absent means "yes, still tell me": a silently stuck run is the worst case.
-    fallbackToIssueComment: escalationIn?.["fallbackToIssueComment"] !== false,
-  };
-  if (nonEmptyString(chatId)) escalation.telegramChatId = chatId;
+  const escalation = normalizeEscalation(raw["escalation"], label, problems);
+  const authority = normalizeAuthority(raw["authority"], label, problems);
 
   const caps = coerceCaps(raw["caps"], `${label}: caps`, problems, legacyCaps);
   const reporting = normalizeReporting(raw["reporting"], label, problems);
@@ -298,6 +298,7 @@ function normalizeProject(
     caps,
     ...(workerModel === undefined ? {} : { workerModel }),
     escalation,
+    authority,
     reporting,
     workspaceRoot: expandHome(pickString(raw["workspaceRoot"], join(stateDir(), "worktrees"))),
     mirrorRoot: expandHome(pickString(raw["mirrorRoot"], join(stateDir(), "mirrors"))),
@@ -326,14 +327,92 @@ function normalizeReporting(parsed: unknown, label: string, problems: string[]):
     problems.push(`${label}: reporting has unknown key(s): ${unknownKeys.join(", ")}`);
   }
 
-  const declared = raw["scope"];
-  if (declared === undefined) return { scope: DEFAULT_REPORT_SCOPE };
-  const scope = REPORT_SCOPES.find((s) => s === declared);
-  if (scope === undefined) {
-    problems.push(`${label}: reporting.scope must be ${REPORT_SCOPE_LIST}, found ${JSON.stringify(declared)}`);
-    return { scope: DEFAULT_REPORT_SCOPE };
+  return {
+    scope: pickLiteral(
+      raw["scope"],
+      REPORT_SCOPES,
+      DEFAULT_REPORT_SCOPE,
+      `${label}: reporting.scope`,
+      REPORT_SCOPE_LIST,
+      problems,
+    ),
+  };
+}
+
+/**
+ * Who triages escalations, and how they are delivered when nobody answers.
+ *
+ * `orchestrator` is validated rather than folded to the default for the reason
+ * `reporting.scope` is: a misspelt `"externl"` that quietly resolved to
+ * `"embedded"` would start a second brain beside the operator's own session,
+ * and both of them would triage the same issue from different transcripts.
+ */
+function normalizeEscalation(parsed: unknown, label: string, problems: string[]): ProjectConfig["escalation"] {
+  let raw: Raw = {};
+  if (parsed !== undefined) {
+    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) raw = parsed as Raw;
+    else problems.push(`${label}: escalation must be an object`);
   }
-  return { scope };
+
+  const escalation: ProjectConfig["escalation"] = {
+    // Absent means "yes, still tell me": a silently stuck run is the worst case.
+    fallbackToIssueComment: raw["fallbackToIssueComment"] !== false,
+    orchestrator: pickLiteral(
+      raw["orchestrator"],
+      ORCHESTRATOR_MODES,
+      "embedded",
+      `${label}: escalation.orchestrator`,
+      ORCHESTRATOR_MODE_LIST,
+      problems,
+    ),
+  };
+  const chatId = raw["telegramChatId"];
+  if (nonEmptyString(chatId)) escalation.telegramChatId = chatId;
+  return escalation;
+}
+
+/**
+ * Who lands PRs and who cuts releases. Both default to the human: this is the
+ * one config value that decides whether an unattended session may write to a
+ * main branch, so it is granted explicitly or not at all.
+ *
+ * Unknown keys are rejected outright, as in `reporting` and for the same
+ * reason: the object has exactly two members, so an unrecognised one is a typo
+ * every time — and a `authority: { merges: "orchestrator" }` that loaded
+ * cleanly would read as delegated while the orchestrator was still told to keep
+ * its hands off.
+ */
+function normalizeAuthority(parsed: unknown, label: string, problems: string[]): ProjectConfig["authority"] {
+  if (parsed === undefined) return { ...DEFAULT_AUTHORITY };
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    problems.push(`${label}: authority must be an object with "merge" and "release" of ${AUTHORITY_HOLDER_LIST}`);
+    return { ...DEFAULT_AUTHORITY };
+  }
+  const raw = parsed as Raw;
+
+  const unknownKeys = Object.keys(raw).filter((k) => k !== "merge" && k !== "release");
+  if (unknownKeys.length > 0) {
+    problems.push(`${label}: authority has unknown key(s): ${unknownKeys.join(", ")}`);
+  }
+
+  return {
+    merge: pickLiteral(
+      raw["merge"],
+      AUTHORITY_HOLDERS,
+      DEFAULT_AUTHORITY.merge,
+      `${label}: authority.merge`,
+      AUTHORITY_HOLDER_LIST,
+      problems,
+    ),
+    release: pickLiteral(
+      raw["release"],
+      AUTHORITY_HOLDERS,
+      DEFAULT_AUTHORITY.release,
+      `${label}: authority.release`,
+      AUTHORITY_HOLDER_LIST,
+      problems,
+    ),
+  };
 }
 
 function normalizeRepos(parsed: unknown, label: string, problems: string[]): Record<string, RepoTarget> {
@@ -437,6 +516,38 @@ function nonEmptyString(v: unknown): v is string {
 /** One rule for "a usable string, else the documented default", used throughout. */
 function pickString(v: unknown, fallback: string): string {
   return nonEmptyString(v) ? v : fallback;
+}
+
+/** Quoted alternatives for an error message, from the same data the guard reads. */
+function quoteList(values: readonly string[]): string {
+  return values.map((v) => `"${v}"`).join(" or ");
+}
+
+/**
+ * One rule for "a declared literal out of a closed set, else the documented
+ * default", used by every such field here.
+ *
+ * Absent takes the default silently; a value outside the set is always
+ * reported and never folded. Each of these sets decides something the operator
+ * would otherwise believe they had configured — who merges, who triages, how
+ * loud the fleet is — and a typo that resolves to the default reads exactly
+ * like a deliberate choice in the file afterwards.
+ */
+function pickLiteral<T extends string>(
+  v: unknown,
+  allowed: readonly T[],
+  fallback: T,
+  field: string,
+  quoted: string,
+  problems: string[],
+): T {
+  if (v === undefined) return fallback;
+  const hit = allowed.find((a) => a === v);
+  if (hit === undefined) {
+    problems.push(`${field} must be ${quoted}, found ${JSON.stringify(v)}`);
+    return fallback;
+  }
+  return hit;
 }
 
 /** `~/x` in a hand-written config must not create a literal `~` directory. */

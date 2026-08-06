@@ -258,6 +258,11 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
       sessionDir,
       ...(project.workerModel === undefined ? {} : { model: project.workerModel }),
       onTurn: (n) => store.updateRun(runId, { turns: n }),
+      // Recorded the moment the session opens its transcript, not when the run
+      // ends: `omp-conductor tail` resolves an issue to a file through this row,
+      // and a path written at completion is a path nobody can follow live. The
+      // completion-time update below writes the same value again, harmlessly.
+      onSessionFile: (f) => store.updateRun(runId, { sessionFile: f }),
     });
 
     // A configured model the harness could not honour means this run was done by
@@ -641,8 +646,16 @@ export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
     "fails twice, its gates stay red, its branch conflicts, or a tripwire fires.",
     "Your job when that happens: re-brief the issue (comment what the next worker must do",
     `differently, then put ${project.queueLabel} back on it), file follow-up issues, or promote to`,
-    "tier 2 and let the human decide. You never edit product code, push a branch, or merge a PR —",
-    "a worker session does all of that. Handle each escalation below before the next one.",
+    "tier 2 and let the human decide.",
+    // Worded from `authority.merge` rather than fixed, so the standing orders
+    // and the Releases section of the rendered brief cannot disagree about who
+    // is holding the merge button. The daemon still merges nothing itself.
+    project.authority.merge === "orchestrator"
+      ? "You never edit product code or push a branch — a worker session does that. Merging is yours: one PR at " +
+        "a time, freshness-checked against the base branch, per the Releases section of your ORCHESTRATOR.md."
+      : "You never edit product code, push a branch, or merge a PR — a worker session edits and pushes, and a " +
+        "human merges.",
+    "Handle each escalation below before the next one.",
   ].join("\n");
 
   // One orchestrator per daemon run, not per tick: it is a persistent session
@@ -651,17 +664,25 @@ export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
   // directory, deliberately not a checkout — the orchestrator re-briefs workers
   // and talks to the tracker, it does not edit product code.
   let orchestrator: OrchestratorHandle | undefined;
-  try {
-    orchestrator = await startOrchestrator({ cwd: stateDir(), brief });
-    const transcript = orchestrator.sessionFile();
-    log(`orchestrator session ready${transcript === undefined ? "" : ` · ${transcript}`}`);
-  } catch (err) {
-    // Loudly, but not fatally: tier-1 escalations degrade to issue comments,
-    // which a human still reads. A dispatcher that refuses to run because its
-    // re-briefing channel is down helps nobody.
-    log(
-      `WARNING: orchestrator session failed to start; tier-1 escalations will fall back to issue comments: ${errText(err)}`,
-    );
+  if (project.escalation.orchestrator === "external") {
+    // An operator already runs the brain — typically a visible TUI session that
+    // drains `blocked`/`failed` off the tracker as one of its standing duties.
+    // Starting a second one here would re-triage the same issues from a
+    // transcript nobody is watching, and the two would undo each other.
+    log("orchestrator: external — tier-1 escalations post as issue comments for the external session's drain duty");
+  } else {
+    try {
+      orchestrator = await startOrchestrator({ cwd: stateDir(), brief });
+      const transcript = orchestrator.sessionFile();
+      log(`orchestrator session ready${transcript === undefined ? "" : ` · ${transcript}`}`);
+    } catch (err) {
+      // Loudly, but not fatally: tier-1 escalations degrade to issue comments,
+      // which a human still reads. A dispatcher that refuses to run because its
+      // re-briefing channel is down helps nobody.
+      log(
+        `WARNING: orchestrator session failed to start; tier-1 escalations will fall back to issue comments: ${errText(err)}`,
+      );
+    }
   }
 
   const escalator = createEscalator(project, tracker, store, orchestrator);

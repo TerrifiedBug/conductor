@@ -26,10 +26,12 @@ import { dirname, join } from "node:path";
 import { configPath, resolveCaps, stateDir } from "./config.ts";
 import {
   CONFIG_VERSION,
+  DEFAULT_AUTHORITY,
   DEFAULT_CAPS,
   DEFAULT_REPORT_SCOPE,
   type Caps,
   type ConductorConfig,
+  type OrchestratorMode,
   type ProjectConfig,
   type ReportScope,
   type RepoTarget,
@@ -67,6 +69,20 @@ export interface SetupAnswers {
    * prompt that asked it to the step that acts on it.
    */
   writeOrchestratorBrief: boolean;
+  /**
+   * Who lands green PRs and who cuts releases. Both default to the human — see
+   * {@link DEFAULT_AUTHORITY} — and the answer is what the rendered brief's
+   * Releases paragraph states, so the session can never read a delegation the
+   * config does not grant.
+   */
+  authority: ProjectConfig["authority"];
+  /**
+   * Whether the daemon runs its own triage session, or an operator already runs
+   * one elsewhere. `external` on a host where the orchestrator is a visible TUI
+   * session: the daemon then posts tier-1 escalations as issue comments for
+   * that session to drain, rather than starting a second brain.
+   */
+  orchestratorMode: OrchestratorMode;
 }
 
 /** What `gh auth status` says the active token may do. */
@@ -93,6 +109,10 @@ export const SETUP_DEFAULTS = {
   stateLabels: { inProgress: "agent:in-progress", blocked: "agent:blocked", failed: "agent:failed" },
   routingLabelPrefix: "repo:",
   defaultBranch: "main",
+  /** Both authorities start with the human; the wizard asks to move each one. */
+  authority: DEFAULT_AUTHORITY,
+  /** The daemon runs its own triage session unless an operator already runs one. */
+  orchestratorMode: "embedded",
 } as const;
 
 /**
@@ -113,6 +133,57 @@ export const REPORT_SCOPE_CHOICES: readonly { scope: ReportScope; label: string;
     description: "escalations when they happen, plus one daily digest — silent otherwise",
   },
 ];
+
+/**
+ * The Releases paragraph the brief opens with, one per authority combination.
+ *
+ * Rendered rather than written by hand for the reason the standing orders are
+ * worded from the same config: an operator who delegated merging in setup and a
+ * brief that still says "you do not merge" is a session that has been given two
+ * answers and will act on whichever it read last.
+ *
+ * A mapped type over both holders, so adding a third holder fails to compile
+ * here instead of rendering `undefined` into somebody's standing prompt.
+ */
+export const RELEASES_DEFAULTS: {
+  readonly [K in `${ProjectConfig["authority"]["merge"]}/${ProjectConfig["authority"]["release"]}`]: string;
+} = {
+  "human/human":
+    '**Default: humans release, and you do not merge.** Work ends at a green PR;\n' +
+    "merging is a separate human action, and releasing is a separate human action after\n" +
+    'that. "This needs releasing" is something you report, never something you take on.',
+  "orchestrator/orchestrator":
+    "**Delegated in setup: you merge, and you release.** Merge green PRs one at a\n" +
+    "time, re-checked against the base branch first. Cut releases per the procedure\n" +
+    "your operator writes below — do not cut one before the seven specifics are\n" +
+    "filled in.",
+  "orchestrator/human":
+    "**Delegated in setup: you merge; humans release.** Merge green PRs one at a\n" +
+    'time, re-checked against the base branch first. "This needs releasing" is\n' +
+    "something you report, never something you take on.",
+  "human/orchestrator":
+    "**Delegated in setup: humans merge; you release.** You cut releases from work a\n" +
+    "human has already merged, per the procedure your operator writes below.",
+};
+
+/**
+ * Duty 1's "the PR is green" branch, worded from `authority.merge`.
+ *
+ * The duty has to name an action, and which action depends on the grant. A
+ * session told "merging is yours" in its standing orders and told "you do not
+ * merge it" three sections into its own brief will do whichever it read last,
+ * which is the failure this whole key exists to prevent. The bullet marker is
+ * part of the value so the template line is nothing but the placeholder.
+ */
+export const MERGE_DUTY: { readonly [K in ProjectConfig["authority"]["merge"]]: string } = {
+  human:
+    "- **It is already done.** The PR is green and waiting on a human merge. Note it,\n" +
+    "  with the link, and move on. You do not merge it.",
+  orchestrator:
+    "- **It is already done.** The PR is green, and merging is yours. Re-check it\n" +
+    "  against the base branch, merge it, and note the link. One PR at a time — that\n" +
+    "  one is a hard boundary, not a preference.",
+};
 
 /** The operator's own brief, rendered into the project's workspace root. */
 export const ORCHESTRATOR_BRIEF_NAME = "ORCHESTRATOR.md";
@@ -336,7 +407,10 @@ function buildProject(a: SetupAnswers): ProjectConfig {
     };
   }
 
-  const escalation: ProjectConfig["escalation"] = { fallbackToIssueComment: a.fallbackToIssueComment };
+  const escalation: ProjectConfig["escalation"] = {
+    fallbackToIssueComment: a.fallbackToIssueComment,
+    orchestrator: a.orchestratorMode,
+  };
   if (a.telegramChatId !== undefined && a.telegramChatId.trim().length > 0) {
     escalation.telegramChatId = a.telegramChatId.trim();
   }
@@ -359,6 +433,7 @@ function buildProject(a: SetupAnswers): ProjectConfig {
       ? { workerModel: a.workerModel.trim() }
       : {}),
     escalation,
+    authority: { ...a.authority },
     reporting: { scope: a.reportScope },
     // Both under the state dir so one `rm -rf ~/.omp/conductor` is a complete
     // uninstall, and neither can land in a repo the daemon then tries to commit.
@@ -415,9 +490,10 @@ export function shippedBriefTemplate(): string {
 /**
  * The shipped template with a configured project's real values in it.
  *
- * Only the coordinates and the chosen scope are substituted: the policy text is
- * left exactly as shipped, because from here on the file is the operator's to
- * edit and nothing in this package reads it back.
+ * Only the coordinates, the chosen scope and the authority paragraph are
+ * substituted: the rest of the policy text is left exactly as shipped, because
+ * from here on the file is the operator's to edit and nothing in this package
+ * reads it back.
  *
  * Takes a `ProjectConfig` rather than answers so that a *later* upgrade check can
  * reproduce the same render from what is on disk, months after the wizard's
@@ -428,6 +504,8 @@ export function renderBriefForProject(p: ProjectConfig): string {
     PROJECT: p.name,
     TRACKER_REPO: p.tracker.repo,
     QUEUE_LABEL: p.queueLabel,
+    RELEASES_DEFAULT: RELEASES_DEFAULTS[`${p.authority.merge}/${p.authority.release}`],
+    MERGE_DUTY: MERGE_DUTY[p.authority.merge],
     REPORT_SCOPE: p.reporting?.scope ?? DEFAULT_REPORT_SCOPE,
   });
 }
@@ -641,6 +719,22 @@ export function summarisePlan(
     );
   }
   lines.push(`  fallback       ${a.fallbackToIssueComment ? "comment on the issue as well" : "disabled"}`);
+  lines.push(
+    `  triage         ${
+      a.orchestratorMode === "external"
+        ? "external — the daemon starts no session; an operator's own drains tier 1 off the tracker"
+        : "embedded — the daemon runs its own orchestrator session"
+    }`,
+  );
+
+  const delegated = a.authority.merge === "orchestrator" || a.authority.release === "orchestrator";
+  lines.push(
+    "",
+    `authority      merge=${a.authority.merge}  release=${a.authority.release}`,
+    delegated
+      ? "               the brief tells that session so, and it must spell the procedure out before acting"
+      : "               humans do both; workers and the conductor stop at a green PR",
+  );
 
   const chosen = REPORT_SCOPE_CHOICES.find((c) => c.scope === a.reportScope);
   const briefPath = orchestratorBriefPath(a);

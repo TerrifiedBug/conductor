@@ -54,7 +54,8 @@ function project(name: string): ProjectConfig {
       },
     },
     caps: { workerMaxTurns: 7 },
-    escalation: { telegramChatId: "123456", fallbackToIssueComment: true },
+    escalation: { telegramChatId: "123456", fallbackToIssueComment: true, orchestrator: "embedded" },
+    authority: { merge: "human", release: "human" },
     reporting: { scope: "escalations" },
     workspaceRoot: join(home, "worktrees"),
     mirrorRoot: join(home, "mirrors"),
@@ -150,6 +151,70 @@ test("loadConfig rejects an unknown reporting scope by name instead of defaultin
   // Silently folding a typo to "material" would read as configured on the day
   // the operator meant to turn the volume down.
   expect(() => loadConfig()).toThrow(/reporting\.scope must be "escalations" or "material", found "materal"/);
+});
+
+test("a project that never answered the authority question keeps both with the human", () => {
+  const { authority, ...withoutAuthority } = project("demo");
+  writeRawConfig({ version: CONFIG_VERSION, defaults: { ...DEFAULT_CAPS }, projects: [withoutAuthority] });
+
+  // The one default that must never drift: an unattended session gets write
+  // access to a main branch only when somebody said so out loud.
+  expect(loadConfig().projects[0]?.authority).toEqual({ merge: "human", release: "human" });
+});
+
+test("a delegated authority survives its own validator", () => {
+  writeRawConfig({
+    version: CONFIG_VERSION,
+    defaults: { ...DEFAULT_CAPS },
+    projects: [{ ...project("demo"), authority: { merge: "orchestrator", release: "orchestrator" } }],
+  });
+
+  expect(loadConfig().projects[0]?.authority).toEqual({ merge: "orchestrator", release: "orchestrator" });
+});
+
+test("loadConfig rejects an authority holder it does not recognise, naming the field", () => {
+  writeRawConfig({
+    version: CONFIG_VERSION,
+    defaults: { ...DEFAULT_CAPS },
+    projects: [{ ...project("demo"), authority: { merge: "yes", release: "human" } }],
+  });
+
+  // Folding "yes" to the default would leave a config that reads as delegated
+  // beside standing orders that say the opposite — the exact disagreement this
+  // key exists to make impossible.
+  expect(() => loadConfig()).toThrow(/authority\.merge must be "human" or "orchestrator", found "yes"/);
+});
+
+test("loadConfig rejects a misspelt authority key rather than ignoring it", () => {
+  writeRawConfig({
+    version: CONFIG_VERSION,
+    defaults: { ...DEFAULT_CAPS },
+    projects: [{ ...project("demo"), authority: { merges: "orchestrator" } }],
+  });
+
+  expect(() => loadConfig()).toThrow(/authority has unknown key\(s\): merges/);
+});
+
+test("escalation.orchestrator defaults to embedded and rejects anything but the two modes", () => {
+  const { escalation, ...rest } = project("demo");
+  const { orchestrator, ...escalationWithoutMode } = escalation;
+  writeRawConfig({
+    version: CONFIG_VERSION,
+    defaults: { ...DEFAULT_CAPS },
+    projects: [{ ...rest, escalation: escalationWithoutMode }],
+  });
+  expect(loadConfig().projects[0]?.escalation.orchestrator).toBe("embedded");
+
+  writeRawConfig({
+    version: CONFIG_VERSION,
+    defaults: { ...DEFAULT_CAPS },
+    projects: [{ ...rest, escalation: { ...escalation, orchestrator: "externl" } }],
+  });
+  // A typo that resolved to "embedded" would start a second brain beside the
+  // operator's own session, and both would triage the same issue.
+  expect(() => loadConfig()).toThrow(
+    /escalation\.orchestrator must be "embedded" or "external", found "externl"/,
+  );
 });
 
 test("loadConfig reports a misshapen reporting block alongside every other fault", () => {

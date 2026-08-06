@@ -87,6 +87,23 @@ describe("openStore", () => {
     expect(store.attemptsFor("other", 7)).toBe(0);
   });
 
+  it("resolves an issue to its newest attempt, tie included", () => {
+    store.createRun(draft({ issue: 7, attempt: 1, state: "failed", startedAt: 1_000 }));
+    const newest = store.createRun(draft({ issue: 7, attempt: 2, state: "running", startedAt: 2_000 }));
+    store.createRun(draft({ issue: 8, attempt: 1, state: "running", startedAt: 3_000 }));
+
+    // `tail` follows whatever this returns, so the older attempt's transcript —
+    // finished, and never growing again — must never win.
+    expect(store.latestRun(PROJECT, 7)?.id).toBe(newest.id);
+    expect(store.latestRun(PROJECT, 999)).toBeUndefined();
+    expect(store.latestRun("other", 7)).toBeUndefined();
+
+    // Two attempts inside one millisecond is unlikely but not impossible, and
+    // "either one" is not an answer a follower can use.
+    const sameMs = store.createRun(draft({ issue: 7, attempt: 3, state: "claimed", startedAt: 2_000 }));
+    expect(store.latestRun(PROJECT, 7)?.id).toBe(sameMs.id);
+  });
+
   it("patches only the fields given to updateRun", () => {
     const created = store.createRun(draft({ turns: 4, spendUsd: 1.25, branch: "fix/thing" }));
 

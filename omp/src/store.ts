@@ -18,8 +18,12 @@ import type { RunRecord, RunState, Store } from "./types.ts";
 /**
  * States backed by a worker process. These are what worker capacity counts:
  * a slot is a process, and only a claimed or running attempt has one.
+ *
+ * Exported because it is also the answer to "is anything still writing to this
+ * run's transcript?" — `omp-conductor tail` needs that and must not re-derive
+ * it, or the two definitions drift the first time a state is added.
  */
-const LIVE_STATES: readonly RunState[] = ["claimed", "running"];
+export const LIVE_STATES: readonly RunState[] = ["claimed", "running"];
 
 /**
  * States that keep an *issue* occupied. `pushed-green` belongs here but not in
@@ -182,6 +186,16 @@ export function openStore(dbPath: string): Store {
   const countAttempts = db.query<{ n: number }, [string, number]>(
     `SELECT COUNT(*) AS n FROM runs WHERE project = ? AND issue = ?`,
   );
+  // Newest attempt for one issue. `startedAt` is millisecond-resolution and two
+  // attempts could in principle share one, so rowid breaks the tie by insertion
+  // order — a `tail` that attached to the older of two same-millisecond attempts
+  // would follow a transcript nobody is writing to any more.
+  const selectLatestRun = db.query<RunRow, [string, number]>(
+    `SELECT * FROM runs
+      WHERE project = ? AND issue = ?
+      ORDER BY startedAt DESC, rowid DESC
+      LIMIT 1`,
+  );
   const countStartedSince = db.query<{ n: number }, [string, number]>(
     `SELECT COUNT(*) AS n FROM runs WHERE project = ? AND startedAt >= ?`,
   );
@@ -253,6 +267,11 @@ export function openStore(dbPath: string): Store {
 
     attemptsFor(project: string, issue: number): number {
       return countAttempts.get(project, issue)?.n ?? 0;
+    },
+
+    latestRun(project: string, issue: number): RunRecord | undefined {
+      const row = selectLatestRun.get(project, issue);
+      return row ? toRecord(row) : undefined;
     },
 
     runsStartedSince(project: string, sinceEpochMs: number): number {

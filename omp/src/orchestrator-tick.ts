@@ -27,7 +27,10 @@
  * Beyond those four gates, every tick carries the project's `reporting.scope`
  * as one explicit constraint line, re-read from the conductor config on each
  * tick so a `/conductor setup` change binds the next heartbeat rather than
- * waiting for a session restart.
+ * waiting for a session restart — and one delivery rule
+ * ({@link TICK_DELIVERY_RULE}), because a tick is injected locally and a report
+ * written as end-of-turn text on such a turn reaches nobody. An operator's own
+ * `message` replaces both, and is re-read per tick for the same reason.
  *
  * The extension is inert unless `<cwd>/.conductor-tick.json` exists, so shipping
  * it inside `omp-conductor` costs an ordinary session nothing.
@@ -172,6 +175,21 @@ export const TICK_SCOPE_CONSTRAINTS: { readonly [K in ReportScope]: string } = {
   escalations:
     "Report NOTHING this turn except a Tier 1 or Tier 2 escalation; everything else -- releases included -- waits for the daily digest.",
 };
+
+/**
+ * The delivery clause, appended to every default tick prompt.
+ *
+ * End-of-turn text streams to the operator's Telegram only on a turn that
+ * *began* as an inbound Telegram message. A heartbeat tick is injected locally,
+ * so it is never such a turn, and a session that believes otherwise reports
+ * into a void: on 2026-08-06 the fleet this extension runs produced a release
+ * report and two tier-2 escalations as end-of-turn text, and not one of the
+ * three reached anybody. What makes a report real is a tool call the session
+ * watched succeed, so the prompt says so on every tick rather than trusting a
+ * brief that can drift, be edited, or be compacted away.
+ */
+export const TICK_DELIVERY_RULE =
+  "This tick was injected locally, not sent from Telegram, so your end-of-turn text does NOT reach your operator. Deliver anything reportable this turn by calling the telegram_send tool and confirming success; never claim a report was sent otherwise.";
 
 /**
  * The scope this tick carries, and — when it had to fall back — why.
@@ -331,6 +349,27 @@ function channelIsUp(path: string): boolean {
 }
 
 /**
+ * The operator's own prompt for this tick, re-read from the session cwd rather
+ * than taken from the startup snapshot — for the reason {@link resolveTickScope}
+ * and the channel gate re-read: the operator of a 24/7 session reconfigures it
+ * out-of-band, and a heartbeat holding a startup copy would keep injecting last
+ * week's prompt until somebody restarted the session.
+ *
+ * A re-read that succeeds owns the answer, "no `message` key any more" included:
+ * deleting the override hands the prompt back to the shipped default. A re-read
+ * that fails keeps the startup value — a mid-edit truncation, a file moved away
+ * or a fault the validator collects must not stop the heartbeat, and must not
+ * silently swap the operator's prompt for ours over a transient bad read.
+ *
+ * `intervalSeconds` is deliberately *not* re-read here: rescheduling a live
+ * managed timer is a different change, so a period edit still needs a restart.
+ */
+function currentMessage(cwd: string, startup: TickConfig): string | undefined {
+  const reread = readTickConfig(cwd);
+  return reread.kind === "ok" ? reread.config.message : startup.message;
+}
+
+/**
  * One tick: gather the four facts, ask `tickDecision`, log the reason either
  * way. Skips are deliberately silent in the UI — a paused fleet would otherwise
  * emit a notification every interval, forever.
@@ -353,16 +392,17 @@ function tick(pi: TickApi, ctx: TickContext, config: TickConfig, session: { scop
     return;
   }
 
-  // A configured message owns the whole contract, reporting clause included: an
-  // operator who wrote their own prompt did not ask for ours appended to it.
-  let content = config.message;
+  // A configured message owns the whole contract, reporting and delivery clauses
+  // included: an operator who wrote their own prompt did not ask for ours
+  // appended to it.
+  let content = currentMessage(ctx.cwd, config);
   if (content === undefined) {
     const scope = resolveTickScope();
     if (scope.fallback !== undefined && !session.scopeFallbackLogged) {
       session.scopeFallbackLogged = true;
       pi.logger.info(`[omp-conductor] tick reporting scope: using ${DEFAULT_REPORT_SCOPE} — ${scope.fallback}`);
     }
-    content = `${defaultTickMessage(new Date())}\n${TICK_SCOPE_CONSTRAINTS[scope.scope]}`;
+    content = `${defaultTickMessage(new Date())}\n${TICK_SCOPE_CONSTRAINTS[scope.scope]}\n${TICK_DELIVERY_RULE}`;
   }
 
   pi.sendMessage(

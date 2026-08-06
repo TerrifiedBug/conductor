@@ -19,6 +19,7 @@ import orchestratorTickExtension, {
   readTickConfig,
   TICK_CONFIG_FILE,
   TICK_CUSTOM_TYPE,
+  TICK_DELIVERY_RULE,
   TICK_SCOPE_CONSTRAINTS,
   defaultTickMessage,
   tickDecision,
@@ -344,6 +345,62 @@ test("a configured message is sent verbatim in place of the default", () => {
   pi.fire();
 
   expect(pi.sent[0]?.message.content).toBe("loop now");
+  // Not even the delivery rule is appended: the operator's prompt is the whole
+  // contract, and it is theirs to get wrong.
+  expect(pi.sent[0]?.message.content).not.toContain(TICK_DELIVERY_RULE);
+});
+
+test("a configured message is re-read every tick, so an edit binds the next heartbeat", () => {
+  writeTickConfig({ intervalSeconds: 600, message: "loop now" });
+  const pi = fakeHost();
+  orchestratorTickExtension(pi);
+  pi.start();
+
+  pi.fire();
+  expect(pi.sent[0]?.message.content).toBe("loop now");
+
+  // The operator rewords the prompt hours later, without restarting anything.
+  writeTickConfig({ intervalSeconds: 600, message: "loop now, and report with telegram_send" });
+  pi.fire();
+  expect(pi.sent[1]?.message.content).toBe("loop now, and report with telegram_send");
+
+  // Dropping the key hands the prompt back to the shipped default, delivery rule
+  // included: a re-read that succeeds owns the whole answer, absences included.
+  writeTickConfig({ intervalSeconds: 600 });
+  pi.fire();
+  expect(pi.sent[2]?.message.content).toContain(TICK_DELIVERY_RULE);
+
+  // The period is not re-read, and says so: rescheduling a live managed timer is
+  // a restart's job, so the one registered interval keeps its startup value.
+  writeTickConfig({ intervalSeconds: 1800, message: "loop now" });
+  pi.fire();
+  expect(pi.sent[3]?.message.content).toBe("loop now");
+  expect(pi.intervals).toHaveLength(1);
+  expect(pi.intervals[0]?.ms).toBe(600_000);
+});
+
+test("a message re-read that fails keeps the startup prompt, and keeps ticking", () => {
+  writeTickConfig({ intervalSeconds: 600, message: "loop now" });
+  const pi = fakeHost();
+  orchestratorTickExtension(pi);
+  pi.start();
+
+  // Caught mid-edit: the file on disk is truncated.
+  writeTickConfig('{ "intervalSeconds": 600, "message": ');
+  pi.fire();
+  expect(pi.sent[0]?.message.content).toBe("loop now");
+
+  // Parseable but invalid — the validator refuses a sub-minute interval, and one
+  // bad field must not cost the operator the prompt they are still editing.
+  writeTickConfig({ intervalSeconds: 5, message: "never sent" });
+  pi.fire();
+  expect(pi.sent[1]?.message.content).toBe("loop now");
+
+  // Gone entirely: the heartbeat is not the thing that stops.
+  rmSync(join(cwd, TICK_CONFIG_FILE));
+  pi.fire();
+  expect(pi.sent[2]?.message.content).toBe("loop now");
+  expect(pi.notices).toHaveLength(0);
 });
 
 test("the default message carries the tick timestamp", () => {
@@ -571,6 +628,7 @@ test("scope escalations sends the silence-by-default line, and only that one", (
   expect(content).not.toContain(TICK_SCOPE_CONSTRAINTS.material);
   // Appended to the standing prompt, not in place of it.
   expect(content).toContain("ORCHESTRATOR.md");
+  expect(content).toContain(TICK_DELIVERY_RULE);
 });
 
 test("scope material — and a config written before the key existed — send the material line", () => {
@@ -631,4 +689,30 @@ test("the scope is re-read every tick, so a setup re-run binds the next heartbea
   pi.fire();
   expect(pi.sent[1]?.message.content).toContain(TICK_SCOPE_CONSTRAINTS.escalations);
   expect(pi.sent[1]?.message.content).not.toContain(TICK_SCOPE_CONSTRAINTS.material);
+});
+
+// ---------------------------------------------------------- delivery rule
+//
+// End-of-turn text reaches the operator's Telegram only on a turn that began as
+// an inbound Telegram message, and a locally-injected tick is never one. The
+// rule rides in the prompt itself so that no fleet re-learns it the way this one
+// did on 2026-08-06, when a release report and two tier-2 escalations were
+// written as end-of-turn text and read by nobody.
+
+test("the delivery rule is pinned verbatim: it is what makes a report real", () => {
+  expect(TICK_DELIVERY_RULE).toBe(
+    "This tick was injected locally, not sent from Telegram, so your end-of-turn text does NOT reach your operator. Deliver anything reportable this turn by calling the telegram_send tool and confirming success; never claim a report was sent otherwise.",
+  );
+});
+
+test("the default tick is three lines: the prompt, the scope contract, the delivery rule", () => {
+  writeConductorConfig({ name: "fleet", scope: "material" });
+  const pi = scopeHost();
+
+  pi.fire();
+  const lines = (pi.sent[0]?.message.content ?? "").split("\n");
+  expect(lines).toHaveLength(3);
+  expect(lines[0]).toContain("ORCHESTRATOR.md");
+  expect(lines[1]).toBe(TICK_SCOPE_CONSTRAINTS.material);
+  expect(lines[2]).toBe(TICK_DELIVERY_RULE);
 });

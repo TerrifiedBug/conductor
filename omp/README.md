@@ -28,8 +28,9 @@ the line.
 When a run does get stuck, the first responder is not you. A tier-1 escalation is
 injected into a long-lived **orchestrator session** that can read the issue and the
 run's transcript and then either re-brief the worker or decide the problem genuinely
-needs a human. It never edits product code, pushes or merges. Only tier 2 pages you
-directly.
+needs a human. It never edits product code and never pushes a branch; whether it
+may *merge* is a setup answer (`authority`), and it defaults to no. Only tier 2
+pages you directly.
 
 The package ships three deployables, plus one skill:
 
@@ -66,7 +67,7 @@ second, explicit confirmation. It is a starting point rather than a contract:
 | Section | Whose |
 | --- | --- |
 | Duties (drain, groom, report), escalation tiers, hard boundaries | **Fixed** — they describe how this package already behaves. |
-| Releases | **Yours.** Ships defaulting to "humans release; the conductor and its workers never tag, pin, deploy, or publish". Replace it only if you are deliberately delegating releases to that session — and then be specific about what, when, on what proof, and what stays permanently forbidden. |
+| Releases | **Yours.** Its opening paragraph is rendered from the `authority` you answered in setup — by default "humans release, and you do not merge". Everything under it is the procedure, and a delegated session is told not to cut a release until you have written one: what, when, on what proof, and what stays permanently forbidden. |
 | Reporting | **Yours**, seeded from the scope you chose in setup. |
 
 Reporting is the one half of that the config also knows about, because the wizard
@@ -182,7 +183,9 @@ So the skill does the part a dialog cannot:
 - **Interviews you** on release policy — humans release (the default), the agent
   releases to a named boundary, or the agent releases fully — pressing on the one
   question that makes a delegated release safe: *where does the agent's leg end?*
-  Plus escalation taste, and which of the two [`reporting.scope`](#your-workflow-vs-the-package)
+  The answer becomes the [`authority`](#configuration) pair `/conductor setup`
+  records, and the brief is worded from it. Plus escalation taste, and which of
+  the two [`reporting.scope`](#your-workflow-vs-the-package)
   values your answer actually maps to.
 - **Reads your repos instead of asking about them.** It opens each routing repo's
   CI workflows, `package.json` scripts and `Makefile`/`justfile`, then *proposes*
@@ -472,9 +475,16 @@ directory, deliberately not a checkout. Delivery resolves when the harness *acce
 the prompt, not when the model answers it, so a tick never parks behind a model; an
 injection arriving mid-thought queues as a follow-up instead of interrupting the
 turn in flight. Its standing orders are explicit: re-brief the worker, file or
-comment on issues, or promote to tier 2, and never edit product code, push a branch
-or merge a PR. If it fails to start, the daemon logs a warning and runs on, with
-tier-1 escalations degraded to issue comments.
+comment on issues, or promote to tier 2, and never edit product code or push a
+branch. Merging is the one line worded from config — see [`authority`](#configuration).
+If it fails to start, the daemon logs a warning and runs on, with tier-1
+escalations degraded to issue comments.
+
+**Or no orchestrator at all.** Set `escalation.orchestrator` to `"external"` when
+you already run your own supervising session — a visible TUI session in a pane,
+typically. The daemon then starts none of its own and every tier-1 escalation
+posts as an issue comment, which is what that session drains. One brain, and it
+is the one you can watch.
 
 Tier 2 borrows the bot token that `omp-telegram` already owns, at
 `~/.omp/agent/telegram/.env` (or `$OMP_TELEGRAM_STATE_DIR/.env`). If you run that
@@ -508,7 +518,10 @@ Runtime state lives elsewhere, under `$OMP_CONDUCTOR_RUNTIME_DIR` (default
 atomically, and `daemon.log`, appended across every boot so the previous failure is
 still there when you go looking. It is kept apart from the config directory because
 it is meaningless after a reboot, and the pidfile's liveness is probed on every
-read — a stale one never blocks a `start`.
+read — a stale one never blocks a `start`. Both `start` and a bare `daemon` write
+the pidfile, so a daemon run in the foreground under systemd is as visible to
+`status` as a backgrounded one; `daemon --once` writes nothing, because that drill
+is exactly what the orphan-reconciliation guard reads the pidfile to protect.
 
 The file is validated on every read. A malformed config produces one readable error
 listing every fault, and the daemon refuses to start rather than running with half
@@ -572,7 +585,12 @@ A complete, valid config for one project with two target repos:
       "workerModel": "smol",
       "escalation": {
         "telegramChatId": "123456789",
-        "fallbackToIssueComment": true
+        "fallbackToIssueComment": true,
+        "orchestrator": "embedded"
+      },
+      "authority": {
+        "merge": "human",
+        "release": "human"
       },
       "reporting": {
         "scope": "material"
@@ -598,6 +616,8 @@ Field notes:
 | `gates` | The exact cheap commands CI also runs, each with the `cwd` it runs from (`cwd` defaults to `.`). Running the real gate locally is what makes an unattended push safe — a subset lets an error outside the source dir reach the runners. |
 | `caps` | Per-project overrides; omit it or pin only the fields you want to change. |
 | `escalation.fallbackToIssueComment` | Defaults to `true`. Absent means "yes, still tell me". |
+| `escalation.orchestrator` | Optional; `"embedded"` (default) or `"external"`. `external` means an orchestrator session already runs elsewhere: the daemon starts none, and tier-1 escalations post as issue comments for that session to drain. Any other value is an error. |
+| `authority` | Optional; `{ "merge": …, "release": … }`, each `"human"` (default) or `"orchestrator"`. It grants nothing to the daemon — it words the orchestrator's standing orders and the Releases paragraph of the rendered brief, so the config and the prompt cannot disagree about who holds the merge button. Unknown keys and any other value are errors, never folded to the default. |
 | `reporting.scope` | Optional; `"material"` (default) or `"escalations"`. Every orchestrator tick appends the matching constraint line to its prompt, re-read from this file each tick — see [Your workflow vs. the package](#your-workflow-vs-the-package). It constrains what the session is told to report; it is not an outbound filter. A config written without the key keeps reporting material events. Any other value is an error, never folded to the default. |
 | `workspaceRoot` / `mirrorRoot` | Optional; default to `worktrees/` and `mirrors/` under the state directory. `~` is expanded. |
 
@@ -630,13 +650,18 @@ in the orchestrator's working directory:
 | `intervalSeconds` | yes | — | Whole seconds between ticks, minimum `60`. A tick costs a full turn of a frontier model, so a sub-minute period is refused rather than obeyed. |
 | `armedFile` | no | none — the gate passes | Path to the arm marker. A tick does nothing while the file is missing. Relative paths resolve against the session cwd, so `state/armed` means `<cwd>/state/armed`. |
 | `accessFile` | no | none — the gate passes | Path to the Telegram bridge's `access.json`. Every tick re-reads it and requires `enabled: true` with exactly one entry in `allowFrom`. Relative paths resolve against the session cwd. **Configure this on any fleet deploy** — see below. |
-| `message` | no | `Tick <ISO timestamp>: run your standing loop from ORCHESTRATOR.md now.` followed by the `reporting.scope` line | Sent verbatim when set — and then it owns the whole contract: no scope line is appended to a prompt you wrote yourself. The default carries the timestamp, which is what makes two consecutive ticks distinguishable in the session log. |
+| `message` | no | `Tick <ISO timestamp>: run your standing loop from ORCHESTRATOR.md now.`, then the `reporting.scope` line, then the delivery rule | Sent verbatim when set — and then it owns the whole contract: neither the scope line nor the delivery rule is appended to a prompt you wrote yourself. Re-read from disk on **every** tick, so rewording it binds the next heartbeat instead of waiting for a session restart; a re-read that fails — caught mid-edit, removed, or invalid — keeps the value read at session start rather than stopping the heartbeat. `intervalSeconds` is *not* re-read: rescheduling a live timer still needs a restart. The default carries the timestamp, which is what makes two consecutive ticks distinguishable in the session log. |
 
 A tick sends one message (`customType` `omp-conductor.tick`, attributed to the
-user): the standing-loop prompt, plus the one constraint line the project's
+user): the standing-loop prompt, the one constraint line the project's
 [`reporting.scope`](#your-workflow-vs-the-package) resolves to, re-read from the
-conductor config on every tick. It starts a turn if the session is idle; while a
-turn is streaming it is queued as a follow-up and consumed when that turn ends.
+conductor config on every tick, and a delivery rule. That last line is there
+because end-of-turn text reaches the operator's Telegram only on a turn that
+*began* as an inbound Telegram message: a tick is injected locally, so anything
+the session merely writes at the end of one is read by nobody, and a reportable
+event has to be delivered by an explicit `telegram_send` call the session
+watched succeed. The tick starts a turn if the session is idle; while a turn is
+streaming it is queued as a follow-up and consumed when that turn ends.
 It sends **nothing** when:
 
 - `/conductor pause` (or `omp-conductor pause`) holds the pause flag, the same
@@ -683,6 +708,7 @@ omp-conductor start [--port N] [--project NAME]
 omp-conductor stop
 omp-conductor restart [--port N] [--project NAME]
 omp-conductor status [--project NAME]
+omp-conductor tail <issue> [--project NAME]
 omp-conductor daemon [--once] [--port N] [--project NAME]
 omp-conductor pause
 omp-conductor resume
@@ -696,8 +722,9 @@ omp-conductor help
 | `stop` | `SIGTERM`, then `SIGKILL` after a 10-second grace period. Prints `not running` when there is nothing to stop. |
 | `restart` | `stop` then `start`, inheriting the running daemon's port and project unless a flag overrides them — a restart that quietly moved to the default port would leave every existing health check pointing at nothing. |
 | `status [--project NAME]` | Pause state, config and state paths, resolved caps, active runs and today's usage, plus a `daemon` block: pid, uptime, port, project, `/healthz` result and log path. Reads while a daemon in another process writes. |
-| `daemon` | Run the loop in the **foreground**, ticking every 5 minutes and serving `/healthz`. This is what `start` launches. |
-| `daemon --once` | Run a single tick and exit. No HTTP server. |
+| `tail <issue>` | Follow the newest run for that issue: the worker's assistant text as `assistant: …` and each tool it calls as `tool: <name>`, printed as they land. Workers are omp sessions inside the daemon rather than terminals, so this is the only way to watch one live — a herdr pane running it becomes an observation window. Starts from the top of the transcript, not the end, so attaching to a run that is already ten turns in shows those ten turns. Exits `1` with `no run recorded for #N` when the issue has never been dispatched, or `no transcript yet (state: …)` when the attempt has not opened one. Otherwise it runs until `Ctrl-C`, or until the run has finished and its transcript has been silent for five seconds, and prints `run ended: <state>`. |
+| `daemon` | Run the loop in the **foreground**, ticking every 5 minutes and serving `/healthz`. This is what `start` launches, and what a systemd unit should call. Writes the pidfile itself, and refuses with `another daemon is alive (pid N); stop it first` rather than becoming a second dispatcher. |
+| `daemon --once` | Run a single tick and exit. No HTTP server, and no pidfile — a drill must not register itself as the daemon, or the next reader believes it and the real daemon's in-flight runs get reconciled as orphans. |
 | `--port N` | Accepted by `start`, `restart` and `daemon`. Both `--port 9000` and `--port=9000` work; missing or out of range exits `2` rather than falling back to the default, because probing the wrong endpoint is worse than a hard failure. |
 | `--project NAME` | Pick the project to service. One daemon process serves exactly one project; with several configured projects the name is required. |
 | `pause` | Stop claiming new work. The running daemon notices on its next tick; runs already in flight finish. |
@@ -741,7 +768,7 @@ dispatcher. The brief is explicit about the boundary:
 | Add or update tests for behaviour it introduced. | Suppress a warning, delete an assertion, or special-case an input to make a check pass. |
 | Run the repo's configured cheap gates, each from its listed `cwd`, over the whole tree. | Run docker or image builds, production builds, browser/e2e suites, or the full test suite on the shared host — CI owns the heavy gates. |
 | Review its whole diff, then commit and **push once**. One corrective push if CI is red. | Force-push, `git add -f`, or add AI/co-author attribution. Red twice means stop and report, not push a third time. |
-| Open a PR that links the issue, and watch CI to a verdict with `gh pr checks --watch`. | Run `gh pr merge`. **Merge authority is a human's alone**, so PRs land one at a time with a freshness re-check — two workers merging concurrently is how agent PRs clobber each other. |
+| Open a PR that links the issue, and watch CI to a verdict with `gh pr checks --watch`. | Run `gh pr merge`. **A worker never merges** — that one is absolute, whoever else holds the authority — so PRs land one at a time with a freshness re-check; two workers merging concurrently is how agent PRs clobber each other. Who *may* merge is the [`authority`](#configuration) answer, and it is never the worker. |
 | Escalate: ambiguity, a cross-repo contract, a needed credential, a product or data-migration decision, a blocking existing test, CI red twice, or most of the wall-clock budget burned. | **Cut a release**, push a tag, publish to npm, edit a deployment pin, deploy, or touch infrastructure or secrets — permanently out of scope. Releases are batched and decided outside this loop, so "this needs releasing" is a thing to report, never a task to take on. |
 
 The worker ends with a six-line evidence report (issue, pr, state, gates, changed,
