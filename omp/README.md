@@ -95,7 +95,7 @@ session that ignores its constraint line still reaches you. Scope is a
 constraint the model is handed each turn, not a gate it is held to — the
 enforcement roadmap (a tool-call tripwire, and config-versus-behaviour drift in
 the daily digest) is
-[issue #4](https://github.com/TerrifiedBug/conductor/issues/4).
+[issue #11](https://github.com/TerrifiedBug/conductor/issues/11).
 
 Changing the key later does not rewrite an `ORCHESTRATOR.md` you already have:
 the tick line changes, the brief does not. Edit its Reporting section too, or the

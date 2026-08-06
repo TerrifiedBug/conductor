@@ -452,7 +452,7 @@ the issues that came back unroutable, and any tick where the report was either
 noise or a surprise. Each of those maps to one line in the brief.
 
 That loop is currently manual, and productising it is the known next step:
-[issue #8](https://github.com/TerrifiedBug/conductor/issues/8) proposes a v2 where
+[issue #12](https://github.com/TerrifiedBug/conductor/issues/12) proposes a v2 where
 the daily digest itself **proposes brief amendments** from observed friction —
 repeated skip reasons, recurring unroutable patterns — for the operator to approve.
 Until then, the review is a calendar entry. Suggest they make one.
