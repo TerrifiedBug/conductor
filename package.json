@@ -9,6 +9,9 @@
     "url": "git+https://github.com/TerrifiedBug/omp-conductor.git"
   },
   "main": "./src/plugin.ts",
+  "omp": {
+    "extensions": ["./src/plugin.ts"]
+  },
   "bin": {
     "omp-conductor": "./src/cli.ts"
   },
