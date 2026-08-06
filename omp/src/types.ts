@@ -13,7 +13,7 @@
  * counts turns, wall clock and dollars itself and kills anything over the line.
  */
 export interface Caps {
-  /** Parallel omp sessions. Two, because the homelab only has 3 CI runners and
+  /** Parallel omp sessions. Two by default: on a small self-hosted runner pool
    *  a third worker would starve its own PR checks. */
   maxConcurrentWorkers: number;
   /** Rolling-day spend ceiling; the loop stops claiming work once it is hit. */

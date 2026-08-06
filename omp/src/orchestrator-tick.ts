@@ -245,7 +245,7 @@ export function readTickConfig(cwd: string): TickConfigResult {
   }
 
   // Relative paths resolve against the session cwd, so the files can sit beside
-  // the config that names them (`state/armed`) without hard-coding /root/fleet.
+  // the config that names them (`state/armed`) without hard-coding a deploy path.
   const armedFile = optionalPath(raw["armedFile"], "armedFile", cwd, problems);
   const accessFile = optionalPath(raw["accessFile"], "accessFile", cwd, problems);
 
@@ -387,11 +387,10 @@ export default function orchestratorTickExtension(pi: TickApi): void {
     // A subagent inherits the orchestrator's cwd, so it finds the same
     // activation file and would arm a heartbeat of its own — one extra tick
     // per worker, each prompting a session whose whole contract is to finish
-    // and yield. The discriminator is omp-telegram's, which has been running
-    // it in production (`isTaskSubagent`, ~/VSCode/omp/plugins/telegram/src/
-    // index.ts:87-90, applied at index.ts:1951-1952): task sessions are
-    // headless *and* always carry the `yield` tool. Neither half suffices
-    // alone — a headless root session (print/RPC mode) has no `yield`, and an
+    // and yield. The discriminator is the one omp-telegram has been running in
+    // production: task sessions are headless *and* always carry the `yield`
+    // tool. Neither half suffices alone — a headless root session (print/RPC
+    // mode) has no `yield`, and an
     // interactive session may well have one. Checked before the config read
     // so the overwhelmingly common case never touches the filesystem.
     if (!ctx.hasUI && pi.getActiveTools().includes("yield")) {
