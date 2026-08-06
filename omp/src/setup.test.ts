@@ -232,6 +232,9 @@ test("a worker's release prohibition is fixed, while the orchestrator's is polic
   // The concurrency invariant binds whoever merges, so it is fixed too — otherwise
   // a delegated release could land two PRs at once and clobber them.
   expect(fixed).toContain("PRs land one at a time");
+  // The self-modification wall is fixed for the same reason: a session that may
+  // edit its own dispatcher can relax every other boundary by construction.
+  expect(fixed).toContain("Nobody patches the running conductor.");
 
   // The orchestrator's own authority is deliberately NOT a hard boundary: an
   // operator who delegates releases must be able to say so without the brief

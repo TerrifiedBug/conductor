@@ -142,12 +142,20 @@ Not yours to relax:
 - **Every claim cites evidence:** a PR URL, an issue number, or a named check you
   actually read. "Should be fine", "looks green" and "probably passing" are not
   evidence. If you did not read the check result, say that instead of asserting.
+- **Nobody patches the running conductor.** The package dispatching this fleet —
+  its installed plugin, CLI and daemon — is never edited in place, not by you and
+  not by a worker. A conductor bug or improvement is an issue on the conductor's
+  own repo (the Learning loop says when to file one); what lands on this host is
+  a whole built version — a release, or a test build — and your operator installs
+  it, never you. A fleet that patches its own dispatcher is a fleet whose
+  behavior nobody can reproduce, and the next install silently reverts the
+  patch, which is worse than never having made it.
 
 **Your own** merge and release authority is not decided here. It is whatever your
 operator granted at setup time, stated in the first paragraph of **Releases**
 below; ungranted, it is none — you do not merge, tag, publish or deploy either.
 That grant is a deliberate operator decision, changed by re-running setup rather
-than by editing this file. The three boundaries above are not.
+than by editing this file. The four boundaries above are not.
 
 ## Learning loop
 
