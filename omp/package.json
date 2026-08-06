@@ -6,18 +6,24 @@
   "description": "A 24/7 dispatcher that takes ready GitHub issues to green, mergeable PRs using omp coding sessions, with tiered escalation first to an orchestrator session and then to a human.",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/TerrifiedBug/omp-conductor.git"
+    "url": "git+https://github.com/TerrifiedBug/conductor.git",
+    "directory": "omp"
   },
   "main": "./src/plugin.ts",
   "omp": {
-    "extensions": ["./src/plugin.ts"]
+    "extensions": [
+      "./src/plugin.ts",
+      "./src/orchestrator-tick.ts"
+    ]
   },
   "bin": {
     "omp-conductor": "./src/cli.ts"
   },
   "files": [
     "src",
-    "README.md"
+    "!src/**/*.test.ts",
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "check": "tsc --noEmit",

@@ -31,15 +31,17 @@ run's transcript and then either re-brief the worker or decide the problem genui
 needs a human. It never edits product code, pushes or merges. Only tier 2 pages you
 directly.
 
-The package ships two deployables:
+The package ships three deployables:
 
 | Deployable | Entry | What it is for |
 | --- | --- | --- |
 | omp plugin | `/conductor` slash command | Inspect and arm the conductor from inside an omp session: dry-run the queue, read status, pause, resume. |
 | Standalone daemon | `omp-conductor` binary | The dispatch loop, managed as a background process (`start` / `stop` / `restart`) with a `/healthz` endpoint for a supervisor. |
+| Orchestrator heartbeat | omp extension, activated by `.conductor-tick.json` | Prompts a 24/7 orchestrator session on a fixed interval so its standing loop actually runs. Inert in every other session. See [Orchestrator tick](#orchestrator-tick). |
 
-Both are thin wrappers over the same `daemon.ts`, so the plugin and the CLI cannot
-disagree about what a cap means or where the state lives.
+The first two are thin wrappers over the same `daemon.ts`, so the plugin and the
+CLI cannot disagree about what a cap means or where the state lives. The heartbeat
+reads the same pause flag both of them write.
 
 ## Install
 
@@ -345,6 +347,71 @@ Field notes:
 Prefer an SSH `cloneUrl`, or an https URL backed by a credential helper. A clone URL
 with credentials embedded is persisted into the mirror's git config, exactly as it
 would be for a hand-run clone.
+
+## Orchestrator tick
+
+The escalation path above assumes an orchestrator session that is actually
+running its loop. A 24/7 omp session with a standing brief and nobody typing into
+it never gets prompted, so it never runs anything — installing
+`omp plugin install omp-conductor` also installs a heartbeat that prompts it.
+
+The heartbeat is **inert unless the session's cwd contains
+`.conductor-tick.json`**, so it costs an ordinary session nothing. Drop the file
+in the orchestrator's working directory (on the fleet host, `/root/fleet`):
+
+```json
+{
+  "intervalSeconds": 900,
+  "armedFile": "state/armed",
+  "accessFile": "/root/.omp/agent/telegram/access.json",
+  "message": "Run your standing loop from ORCHESTRATOR.md now."
+}
+```
+
+| Key | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `intervalSeconds` | yes | — | Whole seconds between ticks, minimum `60`. A tick costs a full turn of a frontier model, so a sub-minute period is refused rather than obeyed. |
+| `armedFile` | no | none — the gate passes | Path to the arm marker. A tick does nothing while the file is missing. Relative paths resolve against the session cwd, so `state/armed` means `<cwd>/state/armed`. |
+| `accessFile` | no | none — the gate passes | Path to the Telegram bridge's `access.json`. Every tick re-reads it and requires `enabled: true` with exactly one entry in `allowFrom`. Relative paths resolve against the session cwd. **Configure this on any fleet deploy** — see below. |
+| `message` | no | `Tick <ISO timestamp>: run your standing loop from ORCHESTRATOR.md now. Report only material events.` | Sent verbatim when set. The default carries the timestamp, which is what makes two consecutive ticks distinguishable in the session log. |
+
+A tick sends one message (`customType` `omp-conductor.tick`, attributed to the
+user) and starts a turn if the session is idle; while a turn is streaming it is
+queued as a follow-up and consumed when that turn ends. It sends **nothing** when:
+
+- `/conductor pause` (or `omp-conductor pause`) holds the pause flag — the same
+  flag the dispatch loop reads, so pausing the fleet pauses its heartbeat;
+- `armedFile` is configured and missing;
+- `accessFile` is configured and the escalation channel is not verifiably up;
+- an earlier tick is still queued. Ticks coalesce rather than stack, so a slow
+  turn cannot leave a backlog of heartbeats behind it.
+
+### The escalation channel is a gate, and it fails closed
+
+Unattended dispatch is only defensible while a tier-2 escalation can reach a
+person. So `accessFile` is checked on **every** tick, not cached at session start:
+the bridge is reconfigured out-of-band, and a heartbeat that trusted a startup
+snapshot would keep dispatching for days after the channel went away. A stale arm
+marker must not outlive the channel that makes running unattended safe.
+
+The check passes only when the file parses to an object with `enabled: true` and
+exactly one `allowFrom` entry. Everything else stops the heartbeat: file missing,
+unreadable or truncated; not JSON, or JSON that is not an object; `enabled`
+absent or false; zero owners paired (nobody to page) or more than one (ambiguous
+— the conductor refuses to guess which human is on the hook). Failure modes are
+deliberately not distinguished in the decision: each one means a page lands
+nowhere.
+
+Leaving `accessFile` unset passes the gate, because an ordinary developer session
+that happens to have a `.conductor-tick.json` has no bridge to check. It is not an
+off switch for the check: **a fleet deploy always sets it.**
+
+Every tick — sent or skipped — is logged with its reason (`paused`, `not armed`,
+`escalation channel down`, `tick already pending`) to the omp log. Skips are
+deliberately silent in the UI: a paused fleet would otherwise raise a notification
+every interval, forever. The one exception is a malformed `.conductor-tick.json`,
+which notifies once at session start and leaves the heartbeat off; silent failure
+there is the failure mode the heartbeat exists to prevent.
 
 ## CLI reference
 
