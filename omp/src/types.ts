@@ -52,6 +52,23 @@ export interface RepoTarget {
 }
 
 /**
+ * How much the orchestrator says out loud without being asked. Declared as data
+ * so the validator, the wizard and the brief all enumerate the same two values:
+ * a third scope cannot be added while one of them still knows only two.
+ */
+export const REPORT_SCOPES = ["escalations", "material"] as const;
+
+export type ReportScope = (typeof REPORT_SCOPES)[number];
+
+/**
+ * What a project that never answered the question gets. `material` rather than
+ * `escalations` because a config written before this key existed was serviced by
+ * a brief that reported material events, and quietly muting an existing fleet is
+ * the kind of change nobody notices until the week it mattered.
+ */
+export const DEFAULT_REPORT_SCOPE: ReportScope = "material";
+
+/**
  * Everything the dispatcher needs to service one product: where work comes
  * from, where code goes, and what it may spend doing it. Config is per project
  * so unrelated products cannot consume each other's budget.
@@ -73,6 +90,12 @@ export interface ProjectConfig {
   caps: Partial<Caps>;
   /** How a stuck run reaches a human, and what to do when it cannot. */
   escalation: { telegramChatId?: string; fallbackToIssueComment: boolean };
+  /**
+   * How loud the orchestrator is. Optional on disk — a config written before
+   * this key existed loads as {@link DEFAULT_REPORT_SCOPE} — so read it through
+   * `resolveReportScope` rather than reaching for `.scope` directly.
+   */
+  reporting?: { scope: ReportScope };
   /** Parent directory for per-run worktrees. */
   workspaceRoot: string;
   /** Cache of bare clones, so N runs share one fetch instead of N. */

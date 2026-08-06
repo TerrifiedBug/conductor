@@ -43,6 +43,42 @@ The first two are thin wrappers over the same `daemon.ts`, so the plugin and the
 CLI cannot disagree about what a cap means or where the state lives. The heartbeat
 reads the same pause flag both of them write.
 
+## Your workflow vs. the package
+
+**This package stops at green PRs.** The boundary is in the worker brief and in
+the loop itself: no worker merges, tags, pins, deploys or publishes, and neither
+does the orchestrator. Everything past a green PR — when to merge, what to batch
+into a release, what to deploy — is *your* workflow, and the package deliberately
+holds no opinion about it that it could act on.
+
+Your opinion goes in `ORCHESTRATOR.md`, the standing prompt for the long-lived
+session that supervises the fleet. That file is yours: the conductor renders it
+once, on request, and then never reads it back, never rewrites it and never
+enforces a word of it. What you write there binds your orchestrator session, not
+this package.
+
+`/conductor setup` offers to render the shipped template
+(`src/briefs/orchestrator.md`) to `<workspaceRoot>/ORCHESTRATOR.md` with your
+project's coordinates filled in, and never replaces an existing file without a
+second, explicit confirmation. It is a starting point, not a contract:
+
+| Section | Whose |
+| --- | --- |
+| Duties (drain, groom, report), escalation tiers, hard boundaries | **Fixed** — they describe how this package already behaves. |
+| Releases | **Yours.** Ships defaulting to "humans release; the conductor and its workers never tag, pin, deploy, or publish". Replace it only if you are deliberately delegating releases to that session — and then be specific about what, when, on what proof, and what stays permanently forbidden. |
+| Reporting | **Yours**, seeded from the scope you chose in setup. |
+
+Reporting is the one half of that the config also knows about, because the wizard
+has to ask something in order to seed the brief:
+
+| `reporting.scope` | What the orchestrator says unprompted |
+| --- | --- |
+| `material` (default) | Escalations, plus every material event: a run reaching a green PR, a run that failed twice, an issue pulled off the queue, a cap that stopped the fleet. |
+| `escalations` | Escalations when they happen, plus one daily digest. Silent otherwise. |
+
+Changing the key later does not rewrite an `ORCHESTRATOR.md` you already have —
+edit its Reporting section too, or the session keeps honouring what it was handed.
+
 ## Where issues come from
 
 **GitHub Issues is the only supported tracker in v1.** `tracker.kind` accepts
@@ -100,6 +136,11 @@ Also required on the host:
    until you answer the "Arm omp-conductor?" confirmation. Arming does exactly two
    things: create the state database, and clear the pause flag. Declining leaves
    the machine untouched.
+
+   Two of its questions are about you rather than the fleet: how loud the
+   orchestrator should be (`reporting.scope`), and whether to write an
+   `ORCHESTRATOR.md` you then own — see
+   [Your workflow vs. the package](#your-workflow-vs-the-package).
 
 3. Start the daemon in the background:
 
@@ -344,6 +385,9 @@ A complete, valid config for one project with two target repos:
         "telegramChatId": "123456789",
         "fallbackToIssueComment": true
       },
+      "reporting": {
+        "scope": "material"
+      },
       "workspaceRoot": "~/.omp/conductor/worktrees",
       "mirrorRoot": "~/.omp/conductor/mirrors"
     }
@@ -365,6 +409,7 @@ Field notes:
 | `gates` | The exact cheap commands CI also runs, each with the `cwd` it runs from (`cwd` defaults to `.`). Running the real gate locally is what makes an unattended push safe — a subset lets an error outside the source dir reach the runners. |
 | `caps` | Per-project overrides; omit it or pin only the fields you want to change. |
 | `escalation.fallbackToIssueComment` | Defaults to `true`. Absent means "yes, still tell me". |
+| `reporting.scope` | Optional; `"material"` (default) or `"escalations"` — see [Your workflow vs. the package](#your-workflow-vs-the-package). A config written without the key keeps reporting material events. Any other value is an error, never folded to the default. |
 | `workspaceRoot` / `mirrorRoot` | Optional; default to `worktrees/` and `mirrors/` under the state directory. `~` is expanded. |
 
 Prefer an SSH `cloneUrl`, or an https URL backed by a credential helper. A clone URL

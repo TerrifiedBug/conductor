@@ -62,6 +62,12 @@ interface TickLogger {
 interface TickContext {
   /** Session cwd — where the activation file is looked for. */
   cwd: string;
+  /**
+   * Whether a UI is attached — false in print/RPC mode, and false for every
+   * subagent. Typed as the SDK types it: `ExtensionContext.hasUI: boolean`,
+   * `@oh-my-pi/pi-coding-agent/src/extensibility/extensions/types.ts:424-425`.
+   */
+  hasUI: boolean;
   ui: {
     notify(message: string, type?: "info" | "warning" | "error"): void;
   };
@@ -78,6 +84,12 @@ interface TickContext {
 
 interface TickApi {
   logger: TickLogger;
+  /**
+   * The currently active tool names. Typed as the SDK types it:
+   * `ExtensionAPI.getActiveTools(): string[]`,
+   * `@oh-my-pi/pi-coding-agent/src/extensibility/extensions/types.ts:1267-1268`.
+   */
+  getActiveTools(): string[];
   on(event: "session_start", handler: (event: { type: "session_start" }, ctx: TickContext) => void): void;
   /**
    * `deliverAs: "followUp"` + `triggerTurn: true`, verified against
@@ -298,6 +310,21 @@ export default function orchestratorTickExtension(pi: TickApi): void {
 
   pi.on("session_start", (_event, ctx) => {
     if (armed) return;
+
+    // A subagent inherits the orchestrator's cwd, so it finds the same
+    // activation file and would arm a heartbeat of its own — one extra tick
+    // per worker, each prompting a session whose whole contract is to finish
+    // and yield. The discriminator is omp-telegram's, which has been running
+    // it in production (`isTaskSubagent`, ~/VSCode/omp/plugins/telegram/src/
+    // index.ts:87-90, applied at index.ts:1951-1952): task sessions are
+    // headless *and* always carry the `yield` tool. Neither half suffices
+    // alone — a headless root session (print/RPC mode) has no `yield`, and an
+    // interactive session may well have one. Checked before the config read
+    // so the overwhelmingly common case never touches the filesystem.
+    if (!ctx.hasUI && pi.getActiveTools().includes("yield")) {
+      pi.logger.info("[omp-conductor] tick inert: subagent session");
+      return;
+    }
 
     const result = readTickConfig(ctx.cwd);
 

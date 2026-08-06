@@ -22,16 +22,27 @@ import {
   type QueuePreview,
 } from "./daemon.ts";
 import {
+  ORCHESTRATOR_BRIEF_NAME,
+  REPORT_SCOPE_CHOICES,
   SETUP_DEFAULTS,
   buildConfig,
   checkTokenScopes,
   createMissingLabels,
   detectTelegram,
+  orchestratorBriefPath,
   planLabels,
   summarisePlan,
+  writeOrchestratorBrief,
   type SetupAnswers,
 } from "./setup.ts";
-import { DEFAULT_CAPS, type Caps, type ConductorConfig, type ProjectConfig } from "./types.ts";
+import {
+  DEFAULT_CAPS,
+  DEFAULT_REPORT_SCOPE,
+  type Caps,
+  type ConductorConfig,
+  type ProjectConfig,
+  type ReportScope,
+} from "./types.ts";
 
 /**
  * The slice of the omp extension API this plugin actually touches, mirroring
@@ -40,7 +51,7 @@ import { DEFAULT_CAPS, type Caps, type ConductorConfig, type ProjectConfig } fro
  * Declared here rather than imported because the harness is a peer dependency:
  * the package has to type-check without it installed. Structural typing means
  * the real API object satisfies this on the way in, and narrowing the surface
- * to four members keeps the coupling visible.
+ * to the five members the wizard uses keeps the coupling visible.
  */
 interface Completion {
   value: string;
@@ -60,6 +71,16 @@ interface CommandContext {
      * default and submitting an empty line accepts it.
      */
     input(title: string, placeholder?: string): Promise<string | undefined>;
+    /**
+     * Single-choice list. Resolves the chosen option's **label**, or
+     * `undefined` when the operator dismisses it — so callers map labels back to
+     * their own values rather than trusting the index.
+     */
+    select(
+      title: string,
+      options: { label: string; description?: string }[],
+      dialogOptions?: { initialIndex?: number },
+    ): Promise<string | undefined>;
   };
 }
 
@@ -182,6 +203,54 @@ async function askGates(
     ctx.ui.notify(`No gates for ${repoName} — nothing will be verified before a push.`, "warning");
   }
   return gates;
+}
+
+/**
+ * How loud the orchestrator should be. A list rather than a confirm: "report
+ * scope" has no natural yes, and phrasing it as one would bury which answer
+ * means silence. The cursor starts on the current setting so Enter re-affirms
+ * it, the same contract every other prompt here has.
+ */
+async function askReportScope(ctx: CommandContext, current: ReportScope): Promise<ReportScope> {
+  const options = REPORT_SCOPE_CHOICES.map((c) => ({ label: c.label, description: c.description }));
+  const at = REPORT_SCOPE_CHOICES.findIndex((c) => c.scope === current);
+  const picked = await ctx.ui.select("What should the orchestrator report unprompted?", options, {
+    initialIndex: at === -1 ? 0 : at,
+  });
+  if (picked === undefined) throw new Cancelled();
+
+  const choice = REPORT_SCOPE_CHOICES.find((c) => c.label === picked);
+  if (choice === undefined) {
+    // The harness answers with a label we did not offer only if the dialog
+    // contract changed under us; keeping the current scope is the answer that
+    // changes nothing, and it is said out loud rather than assumed.
+    ctx.ui.notify(`Unrecognised choice "${picked}" — keeping "${current}".`, "warning");
+    return current;
+  }
+  return choice.scope;
+}
+
+/**
+ * Whether to render the operator's own brief, and — separately — whether an
+ * existing one may be replaced. Two questions on purpose: that file is where a
+ * fleet's release and reporting policy ends up, so it is never overwritten by
+ * an operator who only meant to re-run setup.
+ */
+async function askOrchestratorBrief(ctx: CommandContext, a: SetupAnswers): Promise<boolean> {
+  const path = orchestratorBriefPath(a);
+  const wanted = await ctx.ui.confirm(
+    `Write an orchestrator brief template to ${path}?`,
+    `It is the standing prompt for your supervising session: duties, tiers, and boundaries, ` +
+      `plus a release policy and a reporting section that are yours to edit. ` +
+      `The conductor never reads it back — it stops at green PRs either way.`,
+  );
+  if (!wanted) return false;
+  if (!existsSync(path)) return true;
+
+  return await ctx.ui.confirm(
+    `Overwrite the existing ${ORCHESTRATOR_BRIEF_NAME}?`,
+    `${path} already exists. Overwriting replaces it with the shipped template — any policy you wrote there is lost.`,
+  );
 }
 
 /** The project these answers would replace, so a re-run pre-fills with what is
@@ -335,6 +404,8 @@ async function collectAnswers(
     "Also comment on the issue when a run escalates? Recommended: a chat message you miss is a run nobody sees.",
   );
 
+  const reportScope = await askReportScope(ctx, prior?.reporting?.scope ?? DEFAULT_REPORT_SCOPE);
+
   const answers: SetupAnswers = {
     projectName,
     trackerRepo,
@@ -344,9 +415,13 @@ async function collectAnswers(
     targetRepos,
     caps,
     fallbackToIssueComment,
+    reportScope,
+    // Asked last, and asked with the real path in the question — which needs the
+    // rest of the answers to derive, so the decision is folded in below.
+    writeOrchestratorBrief: false,
   };
   if (telegramChatId !== undefined) answers.telegramChatId = telegramChatId;
-  return answers;
+  return { ...answers, writeOrchestratorBrief: await askOrchestratorBrief(ctx, answers) };
 }
 
 /** The dry run, rendered. Same routing code the loop uses, so this is what the
@@ -390,8 +465,8 @@ async function tryPreview(project: string): Promise<string[]> {
  * The invariant that makes this safe to run against a live tracker: nothing is
  * written or created before the confirm below returns true. Reading the config,
  * asking questions, `checkTokenScopes`, `planLabels` and `previewQueue` are all
- * reads. The three mutations — `createMissingLabels`, `saveConfig`,
- * `armConductor` — all live after it. Keep it that way.
+ * reads. The four mutations — `createMissingLabels`, `saveConfig`,
+ * `writeOrchestratorBrief`, `armConductor` — all live after it. Keep it that way.
  */
 async function setup(ctx: CommandContext, projectArg: string | undefined): Promise<void> {
   const path = configPath();
@@ -441,6 +516,9 @@ async function setup(ctx: CommandContext, projectArg: string | undefined): Promi
       scopes.missing.length > 0
         ? `WARNING: the gh token is missing ${scopes.missing.join(", ")} — the daemon will fail to label issues.`
         : "",
+      answers.writeOrchestratorBrief
+        ? `Writes ${orchestratorBriefPath(answers)}, which is then yours to edit.`
+        : "",
       "Issues are only claimed once the daemon runs.",
     ]
       .filter((s) => s.length > 0)
@@ -455,12 +533,16 @@ async function setup(ctx: CommandContext, projectArg: string | undefined): Promi
   // that starts and then fails on its first claim.
   const created = await createMissingLabels(answers.trackerRepo, labels);
   saveConfig(buildConfig(answers, existing));
+  const briefPath = answers.writeOrchestratorBrief ? writeOrchestratorBrief(answers) : undefined;
   armConductor();
 
   ctx.ui.notify(
     [
       created.length > 0 ? `Created label(s): ${created.join(", ")}` : "No labels needed creating.",
       `Wrote ${path} and armed the conductor.`,
+      briefPath === undefined
+        ? "No orchestrator brief written — the conductor stops at green PRs; merges and releases stay human."
+        : `Wrote ${briefPath} — edit its "Releases" and "Reporting" sections; nothing here reads them back.`,
       "",
       "Dry run against the config just written:",
       ...(await tryPreview(answers.projectName)),

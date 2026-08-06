@@ -7,9 +7,9 @@
  * so in practice it never is, and the first thing a new user touches is the
  * least tested code in the package.
  *
- * Exactly one function here mutates anything outside the process:
- * `createMissingLabels`. Everything else reads, or computes. That is what lets
- * the plugin show a complete plan before asking for consent, and it is a
+ * Two functions here mutate something outside the process: `createMissingLabels`
+ * and `writeOrchestratorBrief`. Everything else reads, or computes. That is what
+ * lets the plugin show a complete plan before asking for consent, and it is a
  * property worth preserving — check it before adding a function.
  *
  * ponytail: `gh` is shelled out to per call rather than shared with the tracker
@@ -20,11 +20,19 @@
  * `src/gh.ts` exposing `gh()` (throwing) over `ghTry()` (classifying).
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { configPath, resolveCaps, stateDir } from "./config.ts";
-import { DEFAULT_CAPS, type Caps, type ConductorConfig, type ProjectConfig, type RepoTarget } from "./types.ts";
+import {
+  DEFAULT_CAPS,
+  type Caps,
+  type ConductorConfig,
+  type ProjectConfig,
+  type ReportScope,
+  type RepoTarget,
+} from "./types.ts";
+import { renderBrief } from "./worker.ts";
 
 /**
  * Every decision the wizard needs, in one plain object. Collected by the UI,
@@ -42,6 +50,15 @@ export interface SetupAnswers {
   caps: Partial<Caps>;
   telegramChatId?: string;
   fallbackToIssueComment: boolean;
+  /** How loud the supervising orchestrator session should be. */
+  reportScope: ReportScope;
+  /**
+   * Whether to render `ORCHESTRATOR.md` into the project's workspace root. Not
+   * part of the config — the brief is the operator's file, and the conductor
+   * never reads it back — but it is a decision the wizard has to carry from the
+   * prompt that asked it to the step that acts on it.
+   */
+  writeOrchestratorBrief: boolean;
 }
 
 /** What `gh auth status` says the active token may do. */
@@ -69,6 +86,31 @@ export const SETUP_DEFAULTS = {
   routingLabelPrefix: "repo:",
   defaultBranch: "main",
 } as const;
+
+/**
+ * The two report scopes as the operator meets them, described once. The wizard
+ * shows these labels, the plan summary quotes the description, and the rendered
+ * brief spells the same two options out — so "material" cannot come to mean one
+ * thing in the dialog and another in the session that has to honour it.
+ */
+export const REPORT_SCOPE_CHOICES: readonly { scope: ReportScope; label: string; description: string }[] = [
+  {
+    scope: "material",
+    label: "Material events",
+    description: "escalations, plus green PRs, second failures, and anything that stops the fleet",
+  },
+  {
+    scope: "escalations",
+    label: "Escalations only",
+    description: "escalations when they happen, plus one daily digest — silent otherwise",
+  },
+];
+
+/** The operator's own brief, rendered into the project's workspace root. */
+export const ORCHESTRATOR_BRIEF_NAME = "ORCHESTRATOR.md";
+
+/** Shipped in `files[]`, so this resolves in an installed package too. */
+const ORCHESTRATOR_TEMPLATE_PATH = join(import.meta.dir, "briefs", "orchestrator.md");
 
 /**
  * `repo` writes labels and closes issues; `project` moves cards on the board.
@@ -306,6 +348,7 @@ function buildProject(a: SetupAnswers): ProjectConfig {
     routing: { labelPrefix: a.routingLabelPrefix, repos },
     caps,
     escalation,
+    reporting: { scope: a.reportScope },
     // Both under the state dir so one `rm -rf ~/.omp/conductor` is a complete
     // uninstall, and neither can land in a repo the daemon then tries to commit.
     workspaceRoot: join(dir, "worktrees"),
@@ -336,6 +379,48 @@ export function buildConfig(a: SetupAnswers, existing?: ConductorConfig): Conduc
       ? previous.map((p) => (p.name === project.name ? project : p))
       : [...previous, project],
   };
+}
+
+/**
+ * Where the operator's own brief lands: beside the worktrees, under the state
+ * directory, so it is on the same disk the fleet already owns and survives a
+ * reinstall of the package. Derived from the answers rather than fixed, so a
+ * project that ever gains a chosen workspace root keeps its brief with it.
+ */
+export function orchestratorBriefPath(a: SetupAnswers): string {
+  return join(buildProject(a).workspaceRoot, ORCHESTRATOR_BRIEF_NAME);
+}
+
+/**
+ * The shipped template with this project's real values in it.
+ *
+ * Only the coordinates and the chosen scope are substituted: the policy text is
+ * left exactly as shipped, because from here on the file is the operator's to
+ * edit and nothing in this package reads it back.
+ */
+export function renderOrchestratorBrief(a: SetupAnswers): string {
+  return renderBrief(readFileSync(ORCHESTRATOR_TEMPLATE_PATH, "utf8"), {
+    PROJECT: a.projectName,
+    TRACKER_REPO: a.trackerRepo,
+    QUEUE_LABEL: a.queueLabel,
+    REPORT_SCOPE: a.reportScope,
+  });
+}
+
+/**
+ * Writes the rendered brief and returns where it went.
+ *
+ * Unconditional by design: the "do not clobber my edits" decision belongs to the
+ * operator, is asked in the wizard, and arrives here as
+ * `answers.writeOrchestratorBrief`. A second existence check in here would make
+ * that dialog's answer un-actionable — an operator who says "yes, overwrite it"
+ * must get an overwrite.
+ */
+export function writeOrchestratorBrief(a: SetupAnswers): string {
+  const path = orchestratorBriefPath(a);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, renderOrchestratorBrief(a));
+  return path;
 }
 
 /**
@@ -518,6 +603,29 @@ export function summarisePlan(
     );
   }
   lines.push(`  fallback       ${a.fallbackToIssueComment ? "comment on the issue as well" : "disabled"}`);
+
+  const chosen = REPORT_SCOPE_CHOICES.find((c) => c.scope === a.reportScope);
+  const briefPath = orchestratorBriefPath(a);
+  lines.push(
+    "",
+    "reporting",
+    `  scope          ${a.reportScope} — ${chosen?.description ?? "unknown scope"}`,
+  );
+  if (a.writeOrchestratorBrief) {
+    lines.push(
+      existsSync(briefPath)
+        ? `  brief          would OVERWRITE ${briefPath}`
+        : `  brief          would write ${briefPath}`,
+      "                 yours to edit afterwards — release policy lives there, not in this package",
+    );
+  } else {
+    lines.push(
+      existsSync(briefPath)
+        ? `  brief          not written — ${briefPath} is left exactly as it is`
+        : `  brief          not written — no orchestrator brief at ${briefPath}`,
+      "                 the package still stops at green PRs; releases stay a human action",
+    );
+  }
 
   return lines.join("\n");
 }

@@ -15,7 +15,16 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { DEFAULT_CAPS, type Caps, type ConductorConfig, type ProjectConfig, type RepoTarget } from "./types.ts";
+import {
+  DEFAULT_CAPS,
+  DEFAULT_REPORT_SCOPE,
+  REPORT_SCOPES,
+  type Caps,
+  type ConductorConfig,
+  type ProjectConfig,
+  type ReportScope,
+  type RepoTarget,
+} from "./types.ts";
 
 /**
  * A JSON node whose fields are all still unproven. Reading a field off a
@@ -31,6 +40,9 @@ type Raw = { readonly [key: string]: unknown };
 
 /** Derived from the data so a new `Caps` field cannot be silently ignored. */
 const CAP_KEYS = Object.keys(DEFAULT_CAPS) as (keyof Caps)[];
+
+/** Quoted for error messages, from the same data the guard below reads. */
+const REPORT_SCOPE_LIST = REPORT_SCOPES.map((s) => `"${s}"`).join(" or ");
 
 /** `owner/repo`, the only tracker spelling `gh` accepts without a host. */
 const REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
@@ -249,6 +261,7 @@ function normalizeProject(parsed: unknown, index: number, problems: string[]): P
   if (nonEmptyString(chatId)) escalation.telegramChatId = chatId;
 
   const caps = coerceCaps(raw["caps"], `${label}: caps`, problems);
+  const reporting = normalizeReporting(raw["reporting"], label, problems);
 
   if (problems.length > before) return undefined;
 
@@ -264,9 +277,41 @@ function normalizeProject(parsed: unknown, index: number, problems: string[]): P
     routing: { labelPrefix, repos },
     caps,
     escalation,
+    reporting,
     workspaceRoot: expandHome(pickString(raw["workspaceRoot"], join(stateDir(), "worktrees"))),
     mirrorRoot: expandHome(pickString(raw["mirrorRoot"], join(stateDir(), "mirrors"))),
   };
+}
+
+/**
+ * Reporting scope decides whether the orchestrator speaks up or stays quiet, so
+ * a typo is rejected rather than folded to the default: a misspelt `"materal"`
+ * that silently resolved to `"material"` would read as configured on the day the
+ * operator meant to turn the volume down, and the config would keep lying.
+ */
+function normalizeReporting(parsed: unknown, label: string, problems: string[]): ProjectConfig["reporting"] {
+  if (parsed === undefined) return { scope: DEFAULT_REPORT_SCOPE };
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    problems.push(`${label}: reporting must be an object with a "scope" of ${REPORT_SCOPE_LIST}`);
+    return { scope: DEFAULT_REPORT_SCOPE };
+  }
+  const raw = parsed as Raw;
+
+  const unknownKeys = Object.keys(raw).filter((k) => k !== "scope");
+  if (unknownKeys.length > 0) {
+    // Same reasoning as an unknown cap key: the operator believes they set
+    // something, and the block that ignores it looks configured either way.
+    problems.push(`${label}: reporting has unknown key(s): ${unknownKeys.join(", ")}`);
+  }
+
+  const declared = raw["scope"];
+  if (declared === undefined) return { scope: DEFAULT_REPORT_SCOPE };
+  const scope = REPORT_SCOPES.find((s) => s === declared);
+  if (scope === undefined) {
+    problems.push(`${label}: reporting.scope must be ${REPORT_SCOPE_LIST}, found ${JSON.stringify(declared)}`);
+    return { scope: DEFAULT_REPORT_SCOPE };
+  }
+  return { scope };
 }
 
 function normalizeRepos(parsed: unknown, label: string, problems: string[]): Record<string, RepoTarget> {
