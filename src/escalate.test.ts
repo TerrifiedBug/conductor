@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { createEscalator, formatEscalation } from "./escalate.ts";
+import type { OrchestratorHandle } from "./orchestrator.ts";
 import type { Escalation, ProjectConfig, Store, Tracker } from "./types.ts";
 
 /** Obvious junk: this must never reach the network, a log or an assertion. */
@@ -247,4 +248,53 @@ test("a 200 response with ok:false is treated as a failure", async () => {
 
   await expect(createEscalator(p, tracker, store).escalate(tier2)).rejects.toThrow(/rejected/);
   expect(marked.length).toBe(0);
+});
+
+/**
+ * A handle whose `deliver` either accepts or refuses, and counts either way.
+ * Nothing else on the interface is on the escalation path.
+ */
+function makeOrchestrator(opts: { deliverRejects?: boolean } = {}) {
+  const delivered: { issue: number; project: string }[] = [];
+  const orchestrator: OrchestratorHandle = {
+    deliver: async (e, project) => {
+      delivered.push({ issue: e.issue, project });
+      if (opts.deliverRejects) throw new Error("orchestrator session is disposed");
+    },
+    busy: () => false,
+    sessionFile: () => undefined,
+    dispose: async () => {},
+  };
+  return { orchestrator, delivered };
+}
+
+test("tier 1 goes to the orchestrator, not to a human-facing issue comment", async () => {
+  const { tracker, comments } = makeTracker();
+  const { store, marked } = makeStore();
+  const { orchestrator, delivered } = makeOrchestrator();
+  const p = makeProject({ fallbackToIssueComment: true });
+
+  await createEscalator(p, tracker, store, orchestrator).escalate(tier1);
+
+  // Acceptance is the escalation: the run is parked and the orchestrator owns
+  // it now, so nobody needs a comment about it.
+  expect(delivered).toEqual([{ issue: 4211, project: "veltro" }]);
+  expect(comments.length).toBe(0);
+  expect(marked.length).toBe(1);
+});
+
+test("an orchestrator that refuses the injection falls back to an issue comment", async () => {
+  const { tracker, comments } = makeTracker();
+  const { store, marked } = makeStore();
+  const { orchestrator, delivered } = makeOrchestrator({ deliverRejects: true });
+  const p = makeProject({ fallbackToIssueComment: true });
+
+  await createEscalator(p, tracker, store, orchestrator).escalate(tier1);
+
+  expect(delivered.length).toBe(1);
+  // The re-briefing channel is down, so a human reads it instead. What must not
+  // happen is the escalation disappearing between the two.
+  expect(comments.length).toBe(1);
+  expect(comments[0]?.body).toContain(tier1.summary);
+  expect(marked.length).toBe(1);
 });

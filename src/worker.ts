@@ -30,7 +30,13 @@ export interface WorkerOpts {
   brief: string;
   cwd: string;
   caps: Caps;
-  sessionFile?: string;
+  /**
+   * Directory the harness writes this run's transcript into — a directory, not
+   * a file. The SDK takes no `sessionFile` input, so naming a path here would
+   * only name one nothing ever writes to. Omitted, the harness picks its own
+   * location; either way the real path comes back on {@link WorkerResult}.
+   */
+  sessionDir?: string;
   onTurn?: (n: number) => void;
 }
 
@@ -41,6 +47,12 @@ export interface WorkerResult {
   spendUsd: number;
   report: string;
   killedBy?: KilledBy;
+  /**
+   * Transcript the session actually opened, absent if it opened none. Recorded
+   * per run because it is the only readable evidence left once the worktree is
+   * cleaned up.
+   */
+  sessionFile?: string;
 }
 
 /**
@@ -80,6 +92,22 @@ export function deriveResult(report: string): { state: RunState; prUrl?: string 
 }
 
 /**
+ * Is this `agent_end` the end of the run?
+ *
+ * `isTerminal: false` means the harness will resume the session for maintenance
+ * or async delivery, so the messages so far are a snapshot rather than a
+ * result: completing there truncates the worker mid-flight and reports a
+ * partial run as final. An absent field is terminal — that is what older
+ * harness builds send, and treating it as non-terminal would hang every run.
+ *
+ * Exported because it is the one seam that lets this rule be tested without
+ * standing up an SDK session.
+ */
+export function shouldComplete(event: { isTerminal?: boolean }): boolean {
+  return event.isTerminal !== false;
+}
+
+/**
  * Drive one session to completion, a cap, or a failure. Never throws for a
  * failed run — a rejected `prompt()` is reported as `state: "failed"` so the
  * dispatcher's retry/escalate logic has one shape to reason about.
@@ -90,8 +118,16 @@ export async function runWorker(o: WorkerOpts): Promise<WorkerResult> {
 
   const session = await createSession({
     cwd: o.cwd,
-    ...(o.sessionFile === undefined ? {} : { sessionFile: o.sessionFile }),
+    ...(o.sessionDir === undefined ? {} : { sessionDir: o.sessionDir }),
   });
+
+  // Every exit below reports the transcript the same way: the path the session
+  // actually opened, or nothing. Read at return time so a session that
+  // materialises its file late is still reported honestly.
+  const withTranscript = (result: WorkerResult): WorkerResult => {
+    const sessionFile = session.sessionFile;
+    return sessionFile === undefined ? result : { ...result, sessionFile };
+  };
 
   let turns = 0;
   let spendUsd = 0;
@@ -99,6 +135,11 @@ export async function runWorker(o: WorkerOpts): Promise<WorkerResult> {
   let killedBy: KilledBy | undefined;
   // Bun's global timer handle; cleared on every exit path below.
   let timer: Timer | undefined;
+  // Resolved by the first terminal `agent_end`, and by every cap kill. Only
+  // ever awaited when the harness has already said it is not finished.
+  const { promise: settled, resolve: settle } = Promise.withResolvers<void>();
+  // Set by a non-terminal `agent_end`: the harness will resume this session.
+  let resuming = false;
 
   const clearWallClock = () => {
     if (timer === undefined) return;
@@ -111,18 +152,27 @@ export async function runWorker(o: WorkerOpts): Promise<WorkerResult> {
     killedBy = by;
     clearWallClock();
     session.abort();
+    // An aborted session may never reach a terminal `agent_end`. The cap is the
+    // outcome now, so nothing may still be waiting for one.
+    settle();
   };
+
+  session.on("turn_start", () => {
+    // The documented watchdog signal, and the honest one: `turn_start` fires
+    // exactly once per turn, whereas one turn can emit several assistant
+    // `message_end`s and would burn the cap on a run that is behaving.
+    turns += 1;
+    o.onTurn?.(turns);
+    if (turns > workerMaxTurns) kill("turns");
+  });
 
   session.on("message_end", (event) => {
     const message = field(event, "message");
     if (field(message, "role") !== "assistant") return;
-    turns += 1;
-    o.onTurn?.(turns);
     // Keep the newest non-empty assistant text: whatever the worker said last
     // is its report, whether it finished cleanly or was cut off.
     const text = reportText(field(message, "content"));
     if (text !== "") report = text;
-    if (turns > workerMaxTurns) kill("turns");
   });
 
   session.on("agent_end", (event) => {
@@ -132,6 +182,15 @@ export async function runWorker(o: WorkerOpts): Promise<WorkerResult> {
     // through `createSession` once the harness exposes it on the SDK options.
     const estimated = field(field(field(event, "telemetry"), "cost"), "estimatedUsd");
     if (typeof estimated === "number" && Number.isFinite(estimated)) spendUsd += estimated;
+
+    // Anything that is not literally `false` — including garbage or nothing at
+    // all — is a finished run.
+    const isTerminal = field(event, "isTerminal");
+    if (shouldComplete(typeof isTerminal === "boolean" ? { isTerminal } : {})) {
+      settle();
+      return;
+    }
+    resuming = true;
   });
 
   // A stuck session spends no turns, so turns alone cannot detect it. The
@@ -142,11 +201,20 @@ export async function runWorker(o: WorkerOpts): Promise<WorkerResult> {
 
   try {
     await session.prompt(o.brief);
+    // `prompt()` returning is not the end of the run once the harness has
+    // announced a resume: finishing here would hand back a truncated report as
+    // the final result. Wait for the terminal `agent_end`, or for a cap.
+    if (resuming && killedBy === undefined) await settled;
   } catch (cause) {
     // Our own abort surfaces here on some paths; that is a kill, not a crash.
     if (killedBy === undefined) {
       const detail = cause instanceof Error ? cause.message : String(cause);
-      return { state: "failed", turns, spendUsd, report: report === "" ? detail : report };
+      return withTranscript({
+        state: "failed",
+        turns,
+        spendUsd,
+        report: report === "" ? detail : report,
+      });
     }
   } finally {
     // Runs on every exit, including the early return above: a live timer keeps
@@ -159,12 +227,16 @@ export async function runWorker(o: WorkerOpts): Promise<WorkerResult> {
     }
   }
 
-  if (killedBy !== undefined) return { state: "killed", turns, spendUsd, report, killedBy };
+  if (killedBy !== undefined) {
+    return withTranscript({ state: "killed", turns, spendUsd, report, killedBy });
+  }
 
   const { state, prUrl } = deriveResult(report);
-  return prUrl === undefined
-    ? { state, turns, spendUsd, report }
-    : { state, prUrl, turns, spendUsd, report };
+  return withTranscript(
+    prUrl === undefined
+      ? { state, turns, spendUsd, report }
+      : { state, prUrl, turns, spendUsd, report },
+  );
 }
 
 /**

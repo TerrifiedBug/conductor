@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "type": "module",
   "license": "MIT",
-  "description": "A 24/7 dispatcher that turns ready GitHub issues into merged PRs using omp coding sessions, with tiered escalation to a human.",
+  "description": "A 24/7 dispatcher that takes ready GitHub issues to green, mergeable PRs using omp coding sessions, with tiered escalation first to an orchestrator session and then to a human.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/TerrifiedBug/omp-conductor.git"

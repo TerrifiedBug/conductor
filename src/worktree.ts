@@ -38,12 +38,11 @@ export function worktreePathFor(workspaceRoot: string, issue: number): string {
   return join(workspaceRoot, String(issue));
 }
 
-/**
- * The one way this module runs git. Non-zero exit throws with the argv, the
- * exit code and stderr, because a bare "git failed" in a daemon log is worth
- * nothing at 3am.
- */
-async function git(args: string[], cwd?: string): Promise<string> {
+/** One git invocation, decoded. Nothing here judges the exit code. */
+async function runGit(
+  args: string[],
+  cwd?: string,
+): Promise<{ code: number; stdout: string; stderr: string }> {
   const proc = Bun.spawn(["git", ...args], {
     cwd,
     stdin: "ignore",
@@ -60,6 +59,17 @@ async function git(args: string[], cwd?: string): Promise<string> {
     proc.exited,
   ]);
 
+  return { code, stdout, stderr };
+}
+
+/**
+ * The one way this module runs git *for effect*. Non-zero exit throws with the
+ * argv, the exit code and stderr, because a bare "git failed" in a daemon log
+ * is worth nothing at 3am.
+ */
+async function git(args: string[], cwd?: string): Promise<string> {
+  const { code, stdout, stderr } = await runGit(args, cwd);
+
   if (code !== 0) {
     const where = cwd === undefined ? "" : ` (cwd ${cwd})`;
     const detail = stderr.trim() || stdout.trim() || "no output";
@@ -74,6 +84,16 @@ async function git(args: string[], cwd?: string): Promise<string> {
   }
 
   return stdout.trim();
+}
+
+/**
+ * The way this module runs git *as a question*. For plumbing like `show-ref`
+ * a non-zero exit is the answer "no", not a failure, so it must not throw —
+ * otherwise every probe needs a try/catch that also swallows real breakage.
+ */
+async function gitSucceeds(args: string[], cwd?: string): Promise<boolean> {
+  const { code } = await runGit(args, cwd);
+  return code === 0;
 }
 
 /**
@@ -143,8 +163,17 @@ export async function ensureMirror(
 }
 
 /**
- * Provisions `<workspaceRoot>/<issue>` as a fresh worktree of `repo` on a new
- * branch cut from the upstream tip of its default branch, and returns the path.
+ * Provisions `<workspaceRoot>/<issue>` as a worktree of `repo` for `branch`,
+ * and returns the path. On the first attempt the branch is cut from the
+ * upstream tip of the default branch; on a retry the preserved branch is
+ * reattached (see the comment on the add below).
+ *
+ * ponytail: reattachment is the only retry mode, so attempt 2 always inherits
+ * attempt 1's tip — including a half-finished or broken state it might rather
+ * start clean from. There is no "start from upstream but keep the old work"
+ * option because that needs somewhere safe to park the old tip first. Upgrade
+ * path: snapshot the branch to `refs/conductor/attempt/<issue>/<n>` before
+ * resetting the run branch to `base`, and surface both refs in the escalation.
  */
 export async function addWorktree(
   repo: RepoTarget,
@@ -182,14 +211,59 @@ export async function addWorktree(
     mirrorPath,
   );
 
-  // `--no-track` because the start point is a remote-tracking ref: without it
-  // git would set the run branch's upstream to the default branch, and the
-  // worker's `git push` would then argue with `push.default` instead of
-  // publishing the branch.
-  await git(
-    ["worktree", "add", "--no-track", "-b", branch, worktreePath, base],
+  // `--no-track` on the create path because the start point is a
+  // remote-tracking ref: without it git would set the run branch's upstream to
+  // the default branch, and the worker's `git push` would then argue with
+  // `push.default` instead of publishing the branch. The reattach path must
+  // *omit* the flag — git dies with "--[no-]track can only be used if a new
+  // branch is created" — and does not need it, since checking out an existing
+  // branch writes no tracking config at all.
+  //
+  // `-b` is only ever correct on the *first* attempt for an issue. Branch
+  // names are a deterministic function of the issue number, `removeWorktree`
+  // deliberately leaves the branch behind in the mirror, and `git worktree add
+  // -b <existing>` is a hard error — so without this probe a second attempt
+  // could never provision a tree and `maxAttemptsPerIssue` was fiction.
+  //
+  // The retry therefore *reattaches* the existing branch rather than doing
+  // either of the two easier things. A fresh `<branch>-attempt2` would break
+  // the fleet contract of one issue = one branch = one PR. A `branch -D` or a
+  // force-reset to the upstream tip would be irreversible: that branch can
+  // hold the only copy of work attempt 1 committed but never pushed. Attaching
+  // to it hands the new worker attempt 1's commits, so it can continue or
+  // recover them, and any destructive call stays a human's to make.
+  const branchExists = await gitSucceeds(
+    ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
     mirrorPath,
   );
+  const addArgs = branchExists
+    ? ["worktree", "add", worktreePath, branch]
+    : ["worktree", "add", "--no-track", "-b", branch, worktreePath, base];
+
+  try {
+    await git(addArgs, mirrorPath);
+  } catch (err) {
+    // A hard crash can leave the branch registered to a worktree whose
+    // directory is long gone, and git then refuses the add as "already checked
+    // out". `prune` drops exactly that stale bookkeeping and never touches a
+    // commit, so run it and retry once. It is not conditioned on git's wording
+    // because that text is version- and locale-dependent; an add that is
+    // broken for any other reason simply fails the same way twice.
+    await git(["worktree", "prune"], mirrorPath);
+    try {
+      await git(addArgs, mirrorPath);
+    } catch (retryErr) {
+      const first = err instanceof Error ? err.message : String(err);
+      const second =
+        retryErr instanceof Error ? retryErr.message : String(retryErr);
+      throw new Error(
+        `failed to provision worktree ${worktreePath} for issue ${issue} on ` +
+          `branch ${branch} (${branchExists ? "reattaching an existing branch" : "creating a new branch"}), ` +
+          `both before and after \`git worktree prune\`: ${second} ` +
+          `(first attempt: ${first})`,
+      );
+    }
+  }
 
   return worktreePath;
 }

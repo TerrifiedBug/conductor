@@ -1,11 +1,13 @@
 /**
- * Deterministic worker logic only: brief rendering and the report -> state
- * derivation. Nothing here starts a session, so the suite never touches the
- * network or the omp peer dependency.
+ * Deterministic worker logic only: brief rendering, the report -> state
+ * derivation, and the `agent_end` completion rule. Nothing here starts a
+ * session, so the suite never touches the network or the omp peer dependency.
+ * Whether two real sessions run side by side is an integration question — a
+ * fake SDK here would only ever test the fake.
  */
 
 import { describe, expect, test } from "bun:test";
-import { deriveResult, renderBrief } from "./worker.ts";
+import { deriveResult, renderBrief, shouldComplete } from "./worker.ts";
 
 describe("renderBrief", () => {
   test("substitutes every known placeholder, including repeats", () => {
@@ -63,5 +65,24 @@ describe("deriveResult", () => {
     const gibberish = deriveResult("...thinking... asdfqwer 0x1f");
     expect(gibberish.state).toBe("failed");
     expect(gibberish.prUrl).toBeUndefined();
+  });
+});
+
+describe("shouldComplete", () => {
+  test("a non-terminal agent_end does not complete the run", () => {
+    // The harness resumes this session afterwards, so its messages so far are
+    // a snapshot. Completing here reports a truncated run as the final result.
+    expect(shouldComplete({ isTerminal: false })).toBe(false);
+  });
+
+  test("a terminal agent_end completes the run", () => {
+    expect(shouldComplete({ isTerminal: true })).toBe(true);
+  });
+
+  test("an agent_end with no isTerminal field completes, for older harnesses", () => {
+    // Back-compat, and it fails safe in the right direction: reading an absent
+    // field as non-terminal would hang every run on a harness that never sets
+    // it, until the wall-clock cap killed a session that had already finished.
+    expect(shouldComplete({})).toBe(true);
   });
 });

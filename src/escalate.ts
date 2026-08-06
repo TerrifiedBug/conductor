@@ -1,11 +1,13 @@
 /**
- * Escalation: the one path by which a stuck run reaches a human.
+ * Escalation: the one path by which a stuck run reaches someone who can unstick
+ * it. Tier 1 is the orchestrator session's problem, tier 2 is the human's, and
+ * an issue comment is what is left when neither transport is reachable.
  *
  * Two rules shape everything here:
  *
  *  1. An escalation is never silently dropped. Either a transport accepted it,
- *     or `escalate()` throws so the dispatcher learns the human is unreachable.
- *     A swallowed escalation looks exactly like a healthy fleet.
+ *     or `escalate()` throws so the dispatcher learns nobody is reachable. A
+ *     swallowed escalation looks exactly like a healthy fleet.
  *  2. An escalation is never repeated. The dispatcher re-notices the same
  *     unroutable issue on every poll, so the store's notification ledger — not
  *     the loop — is what stops a human being paged every five minutes.
@@ -20,6 +22,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import type { OrchestratorHandle } from "./orchestrator.ts";
 import type { Escalation, ProjectConfig, Store, Tracker } from "./types.ts";
 
 /** Telegram rejects `sendMessage` over 4096 chars; leave room for the marker. */
@@ -51,7 +54,19 @@ export function formatEscalation(e: Escalation, project: string): string {
   return lines.join("\n");
 }
 
-export function createEscalator(p: ProjectConfig, tracker: Tracker, store: Store): Escalator {
+/**
+ * `orchestrator` is the tier-1 transport when one is running: a tier-1
+ * escalation is the orchestrator's problem, not the human's, and an injected
+ * prompt is the only form of it that can actually change anything. It stays
+ * optional so a daemon whose orchestrator failed to start — and the unit suite —
+ * still escalate, just to an issue comment.
+ */
+export function createEscalator(
+  p: ProjectConfig,
+  tracker: Tracker,
+  store: Store,
+  orchestrator?: OrchestratorHandle,
+): Escalator {
   return {
     async escalate(e: Escalation): Promise<void> {
       // Stable across daemon restarts: same project, issue, tier and summary is
@@ -61,6 +76,23 @@ export function createEscalator(p: ProjectConfig, tracker: Tracker, store: Store
 
       const text = formatEscalation(e, p.name);
       const chatId = p.escalation.telegramChatId;
+
+      if (e.tier === 1 && orchestrator) {
+        try {
+          // Resolves on acceptance, not on an answer, so this does not park the
+          // tick behind a model. Acceptance *is* the escalation: the run is
+          // parked and safe, and the orchestrator now owns deciding what
+          // happens to it.
+          await orchestrator.deliver(e, p.name);
+          store.markNotified(key);
+          return;
+        } catch {
+          // The re-briefing channel is down. Fall through to the human-facing
+          // path below rather than lose the escalation — a tier-1 event that
+          // reached nobody is indistinguishable from a healthy fleet, and the
+          // marker deliberately stays unwritten until something accepts it.
+        }
+      }
 
       if (e.tier === 2 && chatId) {
         const token = readTelegramToken();
@@ -75,8 +107,9 @@ export function createEscalator(p: ProjectConfig, tracker: Tracker, store: Store
         }
       }
 
-      // Tier 1 always lands here; tier 2 lands here when omp-telegram is not
-      // installed or the project never configured a chat id.
+      // Tier 1 lands here with no orchestrator, or with one that would not take
+      // the injection; tier 2 lands here when omp-telegram is not installed or
+      // the project never configured a chat id.
       if (!p.escalation.fallbackToIssueComment) {
         throw new Error(
           `no escalation transport configured for project "${p.name}": tier ${e.tier} ` +

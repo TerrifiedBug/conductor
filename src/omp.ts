@@ -30,13 +30,43 @@ export interface AgentSessionLike {
    */
   on(event: string, cb: (e: unknown) => void): void;
   abort(): void;
-  /** Transcript path, so a human can read what the worker actually did. */
+  /**
+   * Absolute transcript path the harness opened, so a human — and the
+   * arm/monitor tooling — can read what the worker actually did. `undefined`
+   * when the session has no file backing; never a path we merely asked for.
+   */
   sessionFile?: string;
+  /**
+   * Set when the harness could not honour the requested model and quietly used
+   * another one. Carried out through this seam so the daemon can log the
+   * downgrade, instead of it vanishing and a run just reading dumber.
+   */
+  modelFallbackMessage?: string;
 }
 
-/** The one function this shim calls on the SDK module. */
+/**
+ * Module members this shim calls. Checked at the import boundary so a harness
+ * bump that drops one fails by name, instead of as `undefined is not a
+ * constructor` in the middle of session setup.
+ */
+const REQUIRED_EXPORTS = ["createAgentSession", "SessionManager", "AgentRegistry"] as const;
+
+/** The three module members this shim calls, all verified before the cast. */
 interface OmpModule {
   createAgentSession(opts: unknown): Promise<unknown>;
+  /** Only the file-backed factories: `inMemory()` would defeat the transcript. */
+  SessionManager: {
+    create(cwd: string, sessionDir?: string): unknown;
+    /**
+     * Resume path. Continues the newest transcript for `cwd`, and the harness
+     * itself starts a fresh one when there is nothing to continue. Declared
+     * optional — and absent from {@link REQUIRED_EXPORTS} — so a harness build
+     * without it degrades to a fresh session instead of failing to start.
+     */
+    continueRecent?(cwd: string, sessionDir?: string): Promise<unknown>;
+  };
+  /** Constructed once per session — see the note at the call site. */
+  AgentRegistry: new () => unknown;
 }
 
 /**
@@ -62,7 +92,18 @@ interface RawSession {
 const disposers = new WeakMap<AgentSessionLike, () => Promise<void>>();
 
 /**
- * Start one omp coding session rooted at `cwd`.
+ * Start one omp coding session rooted at `cwd`, with a private agent registry
+ * and a file-backed transcript of its own.
+ *
+ * `sessionDir` chooses the directory the harness writes that transcript into;
+ * omitted, the harness picks its default location for `cwd`. Either way the
+ * resolved path comes back on `session.sessionFile` — this function never
+ * invents one.
+ *
+ * `resume` continues the most recent transcript for `cwd` instead of opening a
+ * blank one. That is what a long-lived session (the orchestrator) wants: a
+ * daemon restart should not erase its memory of what it has already escalated.
+ * A worker wants the opposite, so it stays off by default.
  *
  * @throws if the peer dependency is absent, naming it — a missing harness is a
  * deployment mistake, and a stack trace about a failed dynamic import sends the
@@ -70,8 +111,9 @@ const disposers = new WeakMap<AgentSessionLike, () => Promise<void>>();
  */
 export async function createSession(opts: {
   cwd: string;
-  sessionFile?: string;
+  sessionDir?: string;
   model?: string;
+  resume?: boolean;
 }): Promise<AgentSessionLike> {
   let loaded: unknown;
   try {
@@ -85,32 +127,51 @@ export async function createSession(opts: {
       { cause },
     );
   }
-  if (
-    loaded === null ||
-    typeof loaded !== "object" ||
-    typeof Reflect.get(loaded, "createAgentSession") !== "function"
-  ) {
+  // Narrowed onto a `const` so the checks survive into the closure below.
+  const namespace: unknown = loaded;
+  if (namespace === null || typeof namespace !== "object") {
     throw new Error(
-      `${OMP_PACKAGE} loaded but exports no createAgentSession(); omp-conductor needs a harness build that still exposes the SDK entrypoint.`,
+      `${OMP_PACKAGE} loaded but is not a module namespace; omp-conductor needs a harness build that still exposes the SDK entrypoint.`,
+    );
+  }
+  const missing = REQUIRED_EXPORTS.filter(
+    (name) => typeof Reflect.get(namespace, name) !== "function",
+  );
+  if (missing.length > 0) {
+    throw new Error(
+      `${OMP_PACKAGE} loaded but exports no ${missing.join(", ")}; omp-conductor needs a harness build exposing createAgentSession (the session), SessionManager (a file-backed transcript) and AgentRegistry (so concurrent workers do not collide on the "Main" identity).`,
     );
   }
   // The one unchecked cast in this package: the shape is verified immediately
   // above, but only the harness itself can name its own types.
-  const mod = loaded as unknown as OmpModule;
+  const mod = namespace as unknown as OmpModule;
 
-  const raw = asRawSession(
-    await mod.createAgentSession({
-      cwd: opts.cwd,
-      // A raw pattern rather than a resolved Model: the harness resolves it
-      // after extensions load, so we never have to import its model registry.
-      ...(opts.model === undefined ? {} : { modelPattern: opts.model }),
-      // ponytail: the harness owns its sessions root and has no `sessionFile`
-      // option today, so this is a forward-compatible hint only. The path we
-      // report back below is whatever the session actually chose. Upgrade path:
-      // pass a `sessionManager` once we need transcripts at a fixed path.
-      ...(opts.sessionFile === undefined ? {} : { sessionFile: opts.sessionFile }),
-    }),
-  );
+  // File-backed on purpose. `SessionManager.inMemory()` leaves
+  // `session.sessionFile` undefined, and once the worktree is gone the
+  // transcript is the only record of what the worker actually did.
+  const sessionManager = await openSessionManager(mod, opts);
+
+  const created = await mod.createAgentSession({
+    cwd: opts.cwd,
+    // A raw pattern rather than a resolved Model: the harness resolves it
+    // after extensions load, so we never have to import its model registry.
+    ...(opts.model === undefined ? {} : { modelPattern: opts.model }),
+    sessionManager,
+    // A private registry per session, never the process-global default: that
+    // one admits only one "Main" identity per generation, so a second session
+    // sharing it fails to start. The daemon runs `maxConcurrentWorkers`
+    // (2 by default) workers at once, which makes this the normal path.
+    agentRegistry: new mod.AgentRegistry(),
+  });
+  const raw = asRawSession(created);
+  // Surfaced rather than swallowed: this is how a quiet downgrade to a weaker
+  // model reaches the daemon's log instead of only the operator's surprise.
+  const fallback =
+    created !== null && typeof created === "object"
+      ? Reflect.get(created, "modelFallbackMessage")
+      : undefined;
+  const modelFallbackMessage =
+    typeof fallback === "string" && fallback !== "" ? fallback : undefined;
 
   // One real subscription fanned out per event type, so N `on()` calls cost one
   // listener on the harness stream and unknown event types cost nothing.
@@ -132,9 +193,13 @@ export async function createSession(opts: {
     abort() {
       raw.abort();
     },
+    // The path the session actually opened, never one we asked for: the
+    // arm/monitor tooling reads this file as proof of activity, so a path
+    // nothing ever writes to is worse than no path at all.
     get sessionFile() {
-      return raw.sessionFile ?? opts.sessionFile;
+      return raw.sessionFile;
     },
+    ...(modelFallbackMessage === undefined ? {} : { modelFallbackMessage }),
   };
 
   disposers.set(session, async () => {
@@ -151,6 +216,36 @@ export async function createSession(opts: {
 export async function disposeSession(session: AgentSessionLike): Promise<void> {
   await disposers.get(session)?.();
   disposers.delete(session);
+}
+
+/**
+ * Pick the session manager for one `createSession` call.
+ *
+ * On the resume path the harness's own `continueRecent` decides whether there
+ * is anything to continue, so this never has to list or stat transcripts
+ * itself. `create` is the fallback for two cases: a harness build predating
+ * `continueRecent`, and a resume that failed outright.
+ */
+async function openSessionManager(
+  mod: OmpModule,
+  opts: { cwd: string; sessionDir?: string; resume?: boolean },
+): Promise<unknown> {
+  const fresh = (): unknown =>
+    opts.sessionDir === undefined
+      ? mod.SessionManager.create(opts.cwd)
+      : mod.SessionManager.create(opts.cwd, opts.sessionDir);
+
+  if (opts.resume !== true || typeof mod.SessionManager.continueRecent !== "function") return fresh();
+  try {
+    const resumed = await mod.SessionManager.continueRecent(opts.cwd, opts.sessionDir);
+    if (resumed !== null && typeof resumed === "object") return resumed;
+  } catch {
+    // ponytail: an unreadable newest transcript costs this session its memory
+    // rather than blocking startup — a conductor that will not boot because an
+    // old .jsonl is corrupt is worse than one that starts forgetful. Upgrade
+    // path: walk `SessionManager.list(cwd)` for the newest readable transcript.
+  }
+  return fresh();
 }
 
 /**

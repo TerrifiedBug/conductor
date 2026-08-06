@@ -1,10 +1,17 @@
 /**
  * The omp plugin surface: one `/conductor` command with four subcommands.
  *
- * Deliberately thin. Every subcommand is argument parsing plus printing over
+ * `status`, `pause` and `resume` are argument parsing plus printing over
  * ./daemon.ts, so the plugin and the `omp-conductor` CLI can never disagree
  * about what a cap means or where the state lives.
+ *
+ * `setup` is the exception, and only in volume: it owns the dialogs and nothing
+ * else. Every decision it makes lives in ./setup.ts, which is headless and
+ * tested; this file turns answers into questions and back again. The invariant
+ * worth protecting is on `setup()` below — nothing is written before the confirm.
  */
+import { existsSync } from "node:fs";
+import { configPath, loadConfig, saveConfig } from "./config.ts";
 import {
   armConductor,
   formatStatus,
@@ -12,7 +19,19 @@ import {
   previewQueue,
   setPaused,
   statusSnapshot,
+  type QueuePreview,
 } from "./daemon.ts";
+import {
+  SETUP_DEFAULTS,
+  buildConfig,
+  checkTokenScopes,
+  createMissingLabels,
+  detectTelegram,
+  planLabels,
+  summarisePlan,
+  type SetupAnswers,
+} from "./setup.ts";
+import { DEFAULT_CAPS, type Caps, type ConductorConfig, type ProjectConfig } from "./types.ts";
 
 /**
  * The slice of the omp extension API this plugin actually touches, mirroring
@@ -33,6 +52,14 @@ interface CommandContext {
   ui: {
     notify(message: string, type?: "info" | "warning" | "error"): void;
     confirm(title: string, message: string): Promise<boolean>;
+    /**
+     * Single-line text prompt. Resolves `undefined` when the operator dismisses
+     * the dialog, which the wizard treats as "abandon, change nothing".
+     *
+     * The harness has no pre-filled variant, so `placeholder` carries the
+     * default and submitting an empty line accepts it.
+     */
+    input(title: string, placeholder?: string): Promise<string | undefined>;
   };
 }
 
@@ -48,34 +75,285 @@ interface PluginApi {
 }
 
 const SUBCOMMANDS: Completion[] = [
-  { value: "setup", label: "setup", description: "dry-run the queue, then arm the conductor" },
+  { value: "setup", label: "setup", description: "onboarding wizard: config, labels, dry run, then arm" },
   { value: "status", label: "status", description: "pause state, caps, active runs, today's usage" },
   { value: "pause", label: "pause", description: "stop claiming new work" },
   { value: "resume", label: "resume", description: "allow claiming again" },
 ];
 
 const USAGE = [
-  "/conductor setup [project]   dry-run the queue, then arm after you confirm",
+  "/conductor setup [project]   create or update a project, then arm after you confirm",
   "/conductor status [project]  pause state, caps, active runs, today's usage",
   "/conductor pause             stop claiming new work",
   "/conductor resume            allow claiming again",
 ].join("\n");
 
 /**
- * The dry run. Reads the tracker through the same routing code the loop uses
- * and shows exactly what the next tick would do — no label written, no run row,
- * no worktree — so a mislabelled queue is caught before it becomes six wrong
- * PRs. Nothing is mutated until the confirm below comes back true.
+ * Dismissing any dialog abandons the whole wizard.
+ *
+ * Thrown rather than returned as a sentinel: the prompt sequence runs to a
+ * dozen questions, and a cancellation check after each one would bury the
+ * shape of the conversation under branching.
  */
-async function setup(ctx: CommandContext, project: string | undefined): Promise<void> {
-  const p = await previewQueue(project);
+class Cancelled extends Error {
+  constructor() {
+    super("setup cancelled");
+    this.name = "Cancelled";
+  }
+}
 
+/** The spelling `config.ts` validates tracker repos against. Checked here too
+ *  so a typo is fixed in the dialog instead of in an error an hour later. */
+const REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+
+/**
+ * One text answer. The placeholder shows the default and an empty submission
+ * takes it, because the harness has no pre-filled input dialog — so "Enter
+ * accepts what you see" is the contract the whole wizard is built on.
+ */
+async function ask(ctx: CommandContext, title: string, fallback: string): Promise<string> {
+  const raw = await ctx.ui.input(title, fallback.length > 0 ? fallback : undefined);
+  if (raw === undefined) throw new Cancelled();
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : fallback;
+}
+
+/**
+ * Re-asks until the answer passes `check`, which returns the complaint or
+ * `undefined`. Bounded at three tries: a dialog that cannot be escaped is worse
+ * than one that gives up and leaves the config alone.
+ */
+async function askValid(
+  ctx: CommandContext,
+  title: string,
+  fallback: string,
+  check: (value: string) => string | undefined,
+): Promise<string> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const value = await ask(ctx, title, fallback);
+    const problem = check(value);
+    if (problem === undefined) return value;
+    ctx.ui.notify(problem, "warning");
+  }
+  throw new Cancelled();
+}
+
+/** A cap. Unparseable input keeps the current value rather than writing a NaN
+ *  the validator would later reject — the operator sees why, immediately. */
+async function askNumber(ctx: CommandContext, title: string, fallback: number): Promise<number> {
+  const raw = await ask(ctx, title, String(fallback));
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) {
+    ctx.ui.notify(`"${raw}" is not a non-negative number — keeping ${fallback}.`, "warning");
+    return fallback;
+  }
+  return value;
+}
+
+/**
+ * Pre-push gates as one comma-separated line, `cmd @ cwd` for a subdirectory:
+ * `bun run check, bun test @ server`.
+ *
+ * ponytail: the ceiling is a command containing a comma or a literal " @ ",
+ * which this would split wrongly. Rare in a lint or test invocation, and the
+ * config file is hand-editable. Upgrade path is `ctx.ui.editor()`, a real
+ * multi-line buffer, once someone hits it.
+ */
+async function askGates(
+  ctx: CommandContext,
+  repoName: string,
+  seed: { cmd: string; cwd: string }[],
+): Promise<{ cmd: string; cwd: string }[]> {
+  const shown = seed.map((g) => (g.cwd === "." ? g.cmd : `${g.cmd} @ ${g.cwd}`)).join(", ");
+  const raw = await ask(ctx, `Pre-push gates for ${repoName} — exactly what CI runs, comma separated`, shown);
+
+  const gates: { cmd: string; cwd: string }[] = [];
+  for (const chunk of raw.split(",")) {
+    const entry = chunk.trim();
+    if (entry.length === 0) continue;
+    const at = entry.lastIndexOf(" @ ");
+    if (at === -1) gates.push({ cmd: entry, cwd: "." });
+    else gates.push({ cmd: entry.slice(0, at).trim(), cwd: entry.slice(at + 3).trim() });
+  }
+
+  if (gates.length === 0) {
+    // Loud, because an unattended push with no gate is how a lint failure
+    // reaches the runners at 03:00 with nobody watching.
+    ctx.ui.notify(`No gates for ${repoName} — nothing will be verified before a push.`, "warning");
+  }
+  return gates;
+}
+
+/** The project these answers would replace, so a re-run pre-fills with what is
+ *  already there instead of making the operator retype it. */
+function priorProject(existing: ConductorConfig | undefined, name: string | undefined): ProjectConfig | undefined {
+  if (existing === undefined) return undefined;
+  if (name !== undefined) return existing.projects.find((p) => p.name === name);
+  return existing.projects.length === 1 ? existing.projects[0] : undefined;
+}
+
+/**
+ * The conversation. Reads only — every answer is collected before anything is
+ * checked against GitHub, and long before anything is written.
+ */
+async function collectAnswers(
+  ctx: CommandContext,
+  existing: ConductorConfig | undefined,
+  projectArg: string | undefined,
+): Promise<SetupAnswers> {
+  const prior = priorProject(existing, projectArg);
+
+  const projectName = await askValid(
+    ctx,
+    "Project name",
+    projectArg ?? prior?.name ?? "",
+    (v) => (v.length > 0 ? undefined : "A name is required — it is how `/conductor status <name>` finds this project."),
+  );
+
+  const trackerRepo = await askValid(
+    ctx,
+    "Tracker repo (owner/repo) — where ready issues live",
+    prior?.tracker.repo ?? "",
+    (v) => (REPO_RE.test(v) ? undefined : `"${v}" is not owner/repo — e.g. TerrifiedBug/veltro.`),
+  );
+
+  const queueLabel = await ask(
+    ctx,
+    "Queue label — the human sign-off that makes an issue claimable",
+    prior?.queueLabel ?? SETUP_DEFAULTS.queueLabel,
+  );
+
+  // One confirm instead of three prompts: the namespaced defaults are right for
+  // almost everyone, and three dialogs of Enter-to-accept is how a wizard earns
+  // its reputation.
+  const stateLabels: SetupAnswers["stateLabels"] = { ...(prior?.stateLabels ?? SETUP_DEFAULTS.stateLabels) };
+  const customiseStates = await ctx.ui.confirm(
+    "State labels",
+    `The conductor writes back "${stateLabels.inProgress}", "${stateLabels.blocked}" and ` +
+      `"${stateLabels.failed}" so the tracker alone shows live state. Rename them?`,
+  );
+  if (customiseStates) {
+    stateLabels.inProgress = await ask(ctx, "Label for a run in progress", stateLabels.inProgress);
+    stateLabels.blocked = await ask(ctx, "Label for a run parked on a human", stateLabels.blocked);
+    stateLabels.failed = await ask(ctx, "Label for a run that gave up", stateLabels.failed);
+  }
+
+  const routingLabelPrefix = await ask(
+    ctx,
+    "Routing label prefix — an issue picks its checkout with <prefix><repo>",
+    prior?.routing.labelPrefix ?? SETUP_DEFAULTS.routingLabelPrefix,
+  );
+
+  const targetRepos: SetupAnswers["targetRepos"] = [];
+  const seeds = Object.values(prior?.routing.repos ?? {});
+  for (let i = 0; ; i++) {
+    const seed = seeds[i];
+    const name = await askValid(
+      ctx,
+      `Routing key for repo ${i + 1} — the "${routingLabelPrefix}<key>" label an issue carries`,
+      seed?.name ?? "",
+      (v) => (v.length > 0 ? undefined : "A routing key is required, or no issue can reach this repo."),
+    );
+    const cloneUrl = await askValid(
+      ctx,
+      `Clone URL for ${routingLabelPrefix}${name}`,
+      seed?.cloneUrl ?? "",
+      (v) => (v.length > 0 ? undefined : "A clone URL is required — the daemon mirrors it before every run."),
+    );
+    const defaultBranch = await ask(
+      ctx,
+      `Default branch for ${name} — worktrees are cut from it and PRs target it`,
+      seed?.defaultBranch ?? SETUP_DEFAULTS.defaultBranch,
+    );
+    targetRepos.push({ name, cloneUrl, defaultBranch, gates: await askGates(ctx, name, seed?.gates ?? []) });
+
+    const more = await ctx.ui.confirm(
+      "Another repo?",
+      `${targetRepos.map((r) => r.name).join(", ")} configured. Add another checkout this project routes to?`,
+    );
+    if (!more) break;
+  }
+
+  const caps: Partial<Caps> = { ...prior?.caps };
+  const tuneCaps = await ctx.ui.confirm(
+    "Caps",
+    `Defaults: ${DEFAULT_CAPS.maxConcurrentWorkers} workers, ${DEFAULT_CAPS.maxIssuesPerDay} issues/day, ` +
+      `$${DEFAULT_CAPS.dailySpendUsd}/day, ${DEFAULT_CAPS.workerMaxTurns} turns and ` +
+      `${Math.round(DEFAULT_CAPS.workerWallClockMs / 60000)} min per worker, ` +
+      `${DEFAULT_CAPS.maxAttemptsPerIssue} attempts per issue. Change them?`,
+  );
+  if (tuneCaps) {
+    // Spelled out rather than looped: adding a cap should fail to compile here,
+    // not silently go unasked.
+    caps.maxConcurrentWorkers = await askNumber(
+      ctx,
+      "Max concurrent workers",
+      caps.maxConcurrentWorkers ?? DEFAULT_CAPS.maxConcurrentWorkers,
+    );
+    caps.maxIssuesPerDay = await askNumber(
+      ctx,
+      "Max issues claimed per rolling day",
+      caps.maxIssuesPerDay ?? DEFAULT_CAPS.maxIssuesPerDay,
+    );
+    caps.dailySpendUsd = await askNumber(ctx, "Spend ceiling per rolling day (USD)", caps.dailySpendUsd ?? DEFAULT_CAPS.dailySpendUsd);
+    caps.workerMaxTurns = await askNumber(ctx, "Turn ceiling per worker", caps.workerMaxTurns ?? DEFAULT_CAPS.workerMaxTurns);
+    caps.workerWallClockMs = await askNumber(
+      ctx,
+      "Wall-clock ceiling per worker (ms)",
+      caps.workerWallClockMs ?? DEFAULT_CAPS.workerWallClockMs,
+    );
+    caps.maxAttemptsPerIssue = await askNumber(
+      ctx,
+      "Attempts per issue before it escalates",
+      caps.maxAttemptsPerIssue ?? DEFAULT_CAPS.maxAttemptsPerIssue,
+    );
+  }
+
+  const telegram = detectTelegram();
+  let telegramChatId = prior?.escalation.telegramChatId;
+  if (telegram.available && telegram.hasToken) {
+    if (telegramChatId === undefined && telegram.pairedOwnerId !== undefined) {
+      const usePaired = await ctx.ui.confirm(
+        "Tier-2 escalations",
+        `omp-telegram is paired with chat ${telegram.pairedOwnerId}. Page it when a run is stuck?`,
+      );
+      if (usePaired) telegramChatId = telegram.pairedOwnerId;
+    } else {
+      const answered = await ask(ctx, "Telegram chat id for tier-2 escalations (blank for none)", telegramChatId ?? "");
+      telegramChatId = answered.length > 0 ? answered : undefined;
+    }
+  } else {
+    // Not an error: tier 2 degrades to a comment, which is the documented fallback.
+    ctx.ui.notify(
+      `No usable omp-telegram install at ${telegram.stateDir} — tier-2 escalations will comment on the issue.`,
+      "info",
+    );
+  }
+
+  const fallbackToIssueComment = await ctx.ui.confirm(
+    "Escalation fallback",
+    "Also comment on the issue when a run escalates? Recommended: a chat message you miss is a run nobody sees.",
+  );
+
+  const answers: SetupAnswers = {
+    projectName,
+    trackerRepo,
+    queueLabel,
+    stateLabels,
+    routingLabelPrefix,
+    targetRepos,
+    caps,
+    fallbackToIssueComment,
+  };
+  if (telegramChatId !== undefined) answers.telegramChatId = telegramChatId;
+  return answers;
+}
+
+/** The dry run, rendered. Same routing code the loop uses, so this is what the
+ *  next tick would actually do — not a description of it. */
+function formatPreview(p: QueuePreview): string[] {
   const lines = [
-    `project      ${p.project}`,
-    `config       ${p.configPath}`,
-    `queue query  ${p.queueDescription}`,
     `state        ${p.paused ? "paused" : "armed"}`,
-    "",
     p.ready.length === 0
       ? "Would pick up: nothing — the queue is empty."
       : `Would pick up ${p.ready.length} issue(s), caps permitting:`,
@@ -83,31 +361,112 @@ async function setup(ctx: CommandContext, project: string | undefined): Promise<
   for (const r of p.ready) lines.push(`  #${r.number}  → ${r.repo}  ${r.branch}  ${r.title}`);
 
   if (p.unroutable.length > 0) {
-    lines.push(
-      "",
-      `Cannot route ${p.unroutable.length} issue(s) — these escalate instead of running:`,
-    );
+    lines.push("", `Cannot route ${p.unroutable.length} issue(s) — these escalate instead of running:`);
     for (const u of p.unroutable) {
       lines.push(`  #${u.number}  ${u.reason}  [${u.labels.join(", ") || "no labels"}]  ${u.title}`);
     }
   }
+  return lines;
+}
 
-  lines.push("", "Nothing has been changed yet.");
-  ctx.ui.notify(lines.join("\n"), "info");
+/**
+ * The dry run needs a saved config to read, and before the confirm there may
+ * not be one — that is the normal first run, not a failure. So the reason is
+ * reported inline and the wizard carries on; the post-write preview is the one
+ * that always has something to say.
+ */
+async function tryPreview(project: string): Promise<string[]> {
+  try {
+    return formatPreview(await previewQueue(project));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return [`  (not available yet: ${message.split("\n")[0] ?? message})`];
+  }
+}
 
-  const armed = await ctx.ui.confirm(
-    "Arm omp-conductor?",
-    `Creates the state database and clears the pause flag for ${p.project}. ` +
-      "Issues are only claimed once the daemon runs.",
-  );
-  if (!armed) {
-    ctx.ui.notify("Left untouched — nothing was armed.", "info");
+/**
+ * The onboarding wizard.
+ *
+ * The invariant that makes this safe to run against a live tracker: nothing is
+ * written or created before the confirm below returns true. Reading the config,
+ * asking questions, `checkTokenScopes`, `planLabels` and `previewQueue` are all
+ * reads. The three mutations — `createMissingLabels`, `saveConfig`,
+ * `armConductor` — all live after it. Keep it that way.
+ */
+async function setup(ctx: CommandContext, projectArg: string | undefined): Promise<void> {
+  const path = configPath();
+  // A config that exists but does not parse is a fault to report, never
+  // something to quietly replace: overwriting it would delete every project it
+  // describes. Absence, by contrast, is just the first run.
+  const existing = existsSync(path) ? loadConfig() : undefined;
+  if (existing === undefined) {
+    ctx.ui.notify(`No config at ${path} yet — let's make one. Nothing is written until you confirm.`, "info");
+  }
+
+  let answers: SetupAnswers;
+  try {
+    answers = await collectAnswers(ctx, existing, projectArg);
+  } catch (err) {
+    if (!(err instanceof Cancelled)) throw err;
+    ctx.ui.notify("Setup cancelled — nothing was changed.", "info");
     return;
   }
 
-  armConductor();
+  const scopes = await checkTokenScopes();
+  const labels = await planLabels(answers.trackerRepo, answers);
+  const telegram = detectTelegram();
+
   ctx.ui.notify(
-    "Armed. Start the loop with `omp-conductor daemon`, or `omp-conductor daemon --once` for a single tick.",
+    [
+      summarisePlan(answers, scopes, labels, telegram),
+      "",
+      existing === undefined
+        ? "Dry run: available once the config is written."
+        : "Dry run against the CURRENTLY SAVED config:",
+      ...(existing === undefined ? [] : await tryPreview(answers.projectName)),
+      "",
+      "Nothing has been changed yet.",
+    ].join("\n"),
+    "info",
+  );
+
+  const toCreate = labels.filter((l) => !l.exists).map((l) => l.name);
+  const go = await ctx.ui.confirm(
+    "Apply this setup?",
+    [
+      toCreate.length > 0
+        ? `Creates ${toCreate.length} label(s) in ${answers.trackerRepo}: ${toCreate.join(", ")}.`
+        : "Creates no labels.",
+      `Writes ${path}, creates the state database and clears the pause flag.`,
+      scopes.missing.length > 0
+        ? `WARNING: the gh token is missing ${scopes.missing.join(", ")} — the daemon will fail to label issues.`
+        : "",
+      "Issues are only claimed once the daemon runs.",
+    ]
+      .filter((s) => s.length > 0)
+      .join(" "),
+  );
+  if (!go) {
+    ctx.ui.notify("Left untouched — no labels created, no config written, nothing armed.", "info");
+    return;
+  }
+
+  // Labels first: a config pointing at labels that do not exist is a daemon
+  // that starts and then fails on its first claim.
+  const created = await createMissingLabels(answers.trackerRepo, labels);
+  saveConfig(buildConfig(answers, existing));
+  armConductor();
+
+  ctx.ui.notify(
+    [
+      created.length > 0 ? `Created label(s): ${created.join(", ")}` : "No labels needed creating.",
+      `Wrote ${path} and armed the conductor.`,
+      "",
+      "Dry run against the config just written:",
+      ...(await tryPreview(answers.projectName)),
+      "",
+      "Start the loop with `omp-conductor daemon`, or `omp-conductor daemon --once` for a single tick.",
+    ].join("\n"),
     "info",
   );
 }

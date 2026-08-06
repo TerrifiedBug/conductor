@@ -11,6 +11,8 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { configPath, findProject, loadConfig, resolveCaps, stateDir } from "./config.ts";
 import { createEscalator } from "./escalate.ts";
+import { startOrchestrator } from "./orchestrator.ts";
+import type { OrchestratorHandle } from "./orchestrator.ts";
 import { branchName, route } from "./routing.ts";
 import type { Routed, UnroutableReason } from "./routing.ts";
 import { openStore } from "./store.ts";
@@ -239,9 +241,12 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
       branch,
     );
 
-    const sessionFile = join(stateDir(), "sessions", `${project.name}-${issue}-a${attempt}.jsonl`);
-    mkdirSync(dirname(sessionFile), { recursive: true });
-    store.updateRun(runId, { worktree: worktreePath, sessionFile, state: "running" });
+    // The SDK names the transcript itself, so the daemon supplies the parent
+    // directory and learns the real path back from the result. Inventing one
+    // here would put a file that never gets written into an escalation.
+    const sessionDir = join(stateDir(), "sessions");
+    mkdirSync(sessionDir, { recursive: true });
+    store.updateRun(runId, { worktree: worktreePath, state: "running" });
 
     log(`#${issue} attempt ${attempt} → ${r.repo.name} ${branch}`);
 
@@ -249,7 +254,7 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
       brief: await buildBrief(project, r, branch, worktreePath),
       cwd: worktreePath,
       caps,
-      sessionFile,
+      sessionDir,
       onTurn: (n) => store.updateRun(runId, { turns: n }),
     });
 
@@ -259,6 +264,7 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
       turns: result.turns,
       spendUsd: result.spendUsd,
       prUrl: result.prUrl,
+      sessionFile: result.sessionFile,
     });
 
     if (result.state === "blocked") {
@@ -288,7 +294,7 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
           `${r.issue.title}`,
           r.issue.url,
           `Worktree kept for inspection: ${worktreePath}`,
-          `Session: ${sessionFile}`,
+          `Session: ${result.sessionFile ?? "(no transcript)"}`,
           "",
           result.report,
         ].join("\n"),
@@ -564,7 +570,45 @@ export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
   const caps = resolveCaps(project, cfg.defaults);
   const store = openStore(dbPath());
   const tracker = makeTracker(project);
-  const escalator = createEscalator(project, tracker, store);
+
+  // Standing orders. The orchestrator holds none of this file's context, so
+  // everything it needs to act — which tracker, which labels, what the fleet
+  // does — has to be said once, in words.
+  const brief = [
+    `You are the omp-conductor orchestrator for project "${project.name}".`,
+    `Tracker: ${project.tracker.repo}. Pass --repo ${project.tracker.repo} to every gh command:`,
+    "this working directory is the conductor's state directory, not a checkout.",
+    `Labels: queue=${project.queueLabel}, running=${project.stateLabels.inProgress}, ` +
+      `blocked=${project.stateLabels.blocked}, failed=${project.stateLabels.failed}.`,
+    "The dispatcher claims queue-labelled issues, runs one worker session per attempt in its own",
+    "worktree under hard turn/wallclock/spend caps, and escalates to you when a worker blocks or",
+    "fails twice, its gates stay red, its branch conflicts, or a tripwire fires.",
+    "Your job when that happens: re-brief the issue (comment what the next worker must do",
+    `differently, then put ${project.queueLabel} back on it), file follow-up issues, or promote to`,
+    "tier 2 and let the human decide. You never edit product code, push a branch, or merge a PR —",
+    "a worker session does all of that. Handle each escalation below before the next one.",
+  ].join("\n");
+
+  // One orchestrator per daemon run, not per tick: it is a persistent session
+  // whose whole value is remembering what it has already escalated, and a fresh
+  // one every five minutes would remember nothing. Its cwd is the state
+  // directory, deliberately not a checkout — the orchestrator re-briefs workers
+  // and talks to the tracker, it does not edit product code.
+  let orchestrator: OrchestratorHandle | undefined;
+  try {
+    orchestrator = await startOrchestrator({ cwd: stateDir(), brief });
+    const transcript = orchestrator.sessionFile();
+    log(`orchestrator session ready${transcript === undefined ? "" : ` · ${transcript}`}`);
+  } catch (err) {
+    // Loudly, but not fatally: tier-1 escalations degrade to issue comments,
+    // which a human still reads. A dispatcher that refuses to run because its
+    // re-briefing channel is down helps nobody.
+    log(
+      `WARNING: orchestrator session failed to start; tier-1 escalations will fall back to issue comments: ${errText(err)}`,
+    );
+  }
+
+  const escalator = createEscalator(project, tracker, store, orchestrator);
   const d: Deps = {
     project,
     caps,
@@ -577,6 +621,7 @@ export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
     try {
       await tick(d);
     } finally {
+      await orchestrator?.dispose();
       store.close();
     }
     return;
@@ -633,6 +678,9 @@ export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
     process.off("SIGINT", stop);
     process.off("SIGTERM", stop);
     await server.stop(true);
+    // Before the store closes: a queued injection that rejects on the way out
+    // falls back to an issue comment, and that path writes the dedup marker.
+    await orchestrator?.dispose();
     store.close();
     log("stopped");
   }
