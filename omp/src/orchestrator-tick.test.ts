@@ -126,23 +126,15 @@ function writeTickConfig(body: unknown): void {
 // ----------------------------------------------------------------- decision
 
 /** Every gate satisfied — each case below breaks exactly one of them. */
-const READY = { paused: false, armed: true, channelOk: true, hasPending: false };
+const READY = { armed: true, channelOk: true, hasPending: false };
 
-test("tickDecision sends when armed, unpaused, channel up and nothing queued", () => {
+test("tickDecision sends when armed, channel up and nothing queued", () => {
   expect(tickDecision(READY)).toEqual({ send: true, reason: "armed, nothing pending" });
-});
-
-test("tickDecision skips while paused, and pause outranks every other fact", () => {
-  expect(tickDecision({ ...READY, paused: true })).toEqual({ send: false, reason: "paused" });
-  expect(tickDecision({ paused: true, armed: false, channelOk: false, hasPending: true })).toEqual({
-    send: false,
-    reason: "paused",
-  });
 });
 
 test("tickDecision skips when the arm gate is unsatisfied, ahead of the channel and queue", () => {
   expect(tickDecision({ ...READY, armed: false })).toEqual({ send: false, reason: "not armed" });
-  expect(tickDecision({ paused: false, armed: false, channelOk: false, hasPending: true })).toEqual({
+  expect(tickDecision({ armed: false, channelOk: false, hasPending: true })).toEqual({
     send: false,
     reason: "not armed",
   });
@@ -153,7 +145,7 @@ test("tickDecision skips when the escalation channel is down, ahead of the queue
     send: false,
     reason: "escalation channel down",
   });
-  expect(tickDecision({ paused: false, armed: true, channelOk: false, hasPending: true })).toEqual({
+  expect(tickDecision({ armed: true, channelOk: false, hasPending: true })).toEqual({
     send: false,
     reason: "escalation channel down",
   });
@@ -412,20 +404,23 @@ test("the default message carries the tick timestamp", () => {
   );
 });
 
-test("a tick sends nothing while /conductor pause holds the flag", () => {
+test("a tick fires regardless of /conductor pause — that flag gates dispatch, not this session", () => {
   writeTickConfig({ intervalSeconds: 600 });
   const pi = fakeHost();
   orchestratorTickExtension(pi);
   pi.start();
 
+  // Pause once silenced the heartbeat too, which starved the external
+  // orchestrator of the duties that stay useful while dispatch is stopped —
+  // grooming, draining, even reporting that the fleet IS paused. The operator's
+  // lever for this session is the arm marker, tested below.
   setPaused(true);
-  pi.fire();
-  expect(pi.sent).toHaveLength(0);
-  expect(pi.logs.join("\n")).toContain("paused");
-
-  setPaused(false);
-  pi.fire();
-  expect(pi.sent).toHaveLength(1);
+  try {
+    pi.fire();
+    expect(pi.sent).toHaveLength(1);
+  } finally {
+    setPaused(false);
+  }
 });
 
 test("a tick sends nothing until the arm marker exists", () => {

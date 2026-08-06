@@ -691,10 +691,15 @@ Leaving `accessFile` unset passes the gate, because an ordinary developer sessio
 that happens to have a `.conductor-tick.json` has no bridge to check. It is not an
 off switch for the check: **a fleet deploy always sets it.**
 
-Every tick — sent or skipped — is logged with its reason (`paused`, `not armed`,
-`escalation channel down`, `tick already pending`) to the omp log. Skips are
-deliberately silent in the UI: a paused fleet would otherwise raise a notification
-every interval, forever. The one exception is a malformed `.conductor-tick.json`,
+Every tick — sent or skipped — is logged with its reason (`not armed`,
+`escalation channel down`, `tick already pending`) to the omp log. `/conductor
+pause` is deliberately **not** one of the gates: pause stops the *dispatcher*
+claiming work, and the tick drives a different session — one whose duties
+(grooming the queue, draining escalations, reporting) are exactly what stays
+useful while dispatch is stopped. Its own off switch is the arm marker. Skips
+are deliberately silent in the UI: a disarmed fleet would otherwise raise a
+notification every interval, forever. The one exception is a malformed
+`.conductor-tick.json`,
 which notifies once at session start and leaves the heartbeat off; silent failure
 there is the failure mode the heartbeat exists to prevent. A conductor config that
 cannot supply a reporting scope logs `tick reporting scope: using material` once
@@ -727,7 +732,7 @@ omp-conductor help
 | `daemon --once` | Run a single tick and exit. No HTTP server, and no pidfile — a drill must not register itself as the daemon, or the next reader believes it and the real daemon's in-flight runs get reconciled as orphans. |
 | `--port N` | Accepted by `start`, `restart` and `daemon`. Both `--port 9000` and `--port=9000` work; missing or out of range exits `2` rather than falling back to the default, because probing the wrong endpoint is worse than a hard failure. |
 | `--project NAME` | Pick the project to service. One daemon process serves exactly one project; with several configured projects the name is required. |
-| `pause` | Stop claiming new work. The running daemon notices on its next tick; runs already in flight finish. |
+| `pause` | Stop claiming new work. The running daemon notices on its next tick; runs already in flight finish. The orchestrator heartbeat keeps ticking — its gate is the arm marker, not this flag. |
 | `resume` | Allow claiming again. |
 | `brief-upgrade` | Compare a project's `ORCHESTRATOR.md` against the brief this version of the package ships. Reports by default; see [Keeping a brief current](#keeping-a-brief-current). |
 | `--apply` | Only for `brief-upgrade`. Replaces the half above the `YOURS TO EDIT` banner and keeps everything below it, backing the previous file up first. Ignored when the brief cannot be split or the template is unrendered. |

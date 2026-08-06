@@ -6,12 +6,9 @@
  * loop, so this extension is the heartbeat: every `intervalSeconds` it injects
  * one message that starts a turn.
  *
- * Four properties are worth protecting, and each one is a branch in
+ * Three properties are worth protecting, and each one is a branch in
  * `tickDecision()`:
  *
- * - **Pause is honoured.** `isPaused()` is imported from ./daemon.ts — the exact
- *   function `/conductor pause` writes for and the dispatch loop reads. A second
- *   spelling of "is it paused" here is how a paused fleet keeps working.
  * - **A disarmed fleet is not woken.** The arm marker is a file the operator
  *   controls; missing means "not armed", and a tick then does nothing.
  * - **The human channel must still be there.** Autonomous dispatch is only
@@ -39,7 +36,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { findProject, loadConfig } from "./config.ts";
-import { isPaused } from "./daemon.ts";
 import { DEFAULT_REPORT_SCOPE, type ReportScope } from "./types.ts";
 
 /** The activation file. Absent means "this is not an orchestrator session". */
@@ -294,8 +290,18 @@ export function readTickConfig(cwd: string): TickConfigResult {
 /**
  * Whether this tick sends, and why — the whole decision, with no clock, no
  * filesystem and no session in it. The interesting part of a heartbeat is the
- * precedence between "paused", "not armed", "channel down" and "already
- * pending", and that is worth being able to test without a session at all.
+ * precedence between "not armed", "channel down" and "already pending", and
+ * that is worth being able to test without a session at all.
+ *
+ * The pause sentinel is deliberately NOT consulted. `pause` is the dispatch
+ * daemon's flag — "stop claiming; in-flight work finishes" — and this heartbeat
+ * drives a different brain: the supervising session whose duties (groom the
+ * queue, drain escalations, report) are exactly the ones that stay useful while
+ * dispatch is stopped. Honouring it here shipped once, when the tick-driven
+ * session WAS the dispatcher; the day dispatch moved into the daemon, one flag
+ * silencing both brains became a starvation bug: a paused fleet's orchestrator
+ * could neither groom nor even say it was paused. The operator's lever for this
+ * session is the arm marker — `disarm` stops ticks, and only the operator arms.
  *
  * `armed` and `channelOk` are the *satisfied* gates, not the files behind them:
  * a config with no `armedFile` passes the first, and one with no `accessFile`
@@ -304,7 +310,6 @@ export function readTickConfig(cwd: string): TickConfigResult {
  * channel gate means "this session is not the fleet", not "the check is off".
  */
 export function tickDecision(input: {
-  paused: boolean;
   armed: boolean;
   channelOk: boolean;
   hasPending: boolean;
@@ -312,7 +317,6 @@ export function tickDecision(input: {
   send: boolean;
   reason: string;
 } {
-  if (input.paused) return { send: false, reason: "paused" };
   if (!input.armed) return { send: false, reason: "not armed" };
   if (!input.channelOk) return { send: false, reason: "escalation channel down" };
   if (input.hasPending) return { send: false, reason: "tick already pending" };
@@ -370,9 +374,9 @@ function currentMessage(cwd: string, startup: TickConfig): string | undefined {
 }
 
 /**
- * One tick: gather the four facts, ask `tickDecision`, log the reason either
- * way. Skips are deliberately silent in the UI — a paused fleet would otherwise
- * emit a notification every interval, forever.
+ * One tick: gather the three facts, ask `tickDecision`, log the reason either
+ * way. Skips are deliberately silent in the UI — a disarmed fleet would
+ * otherwise emit a notification every interval, forever.
  *
  * `session` holds the only thing one tick remembers for the next: whether the
  * scope fallback has been logged. Without it, a host with no conductor config
@@ -381,7 +385,6 @@ function currentMessage(cwd: string, startup: TickConfig): string | undefined {
  */
 function tick(pi: TickApi, ctx: TickContext, config: TickConfig, session: { scopeFallbackLogged: boolean }): void {
   const decision = tickDecision({
-    paused: isPaused(),
     armed: config.armedFile === undefined || existsSync(config.armedFile),
     channelOk: config.accessFile === undefined || channelIsUp(config.accessFile),
     hasPending: ctx.hasPendingMessages(),
