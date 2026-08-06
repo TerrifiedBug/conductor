@@ -75,7 +75,7 @@ acts on:
 | `reporting.scope` | What the orchestrator says unprompted | The line every tick carries |
 | --- | --- | --- |
 | `material` (default) | Escalations, plus every material event: a run reaching a green PR, a run that failed twice, an issue pulled off the queue, a cap that stopped the fleet. | `Report material events per your brief.` |
-| `escalations` | Escalations when they happen, plus one daily digest. Silent otherwise. | `Report NOTHING this turn except a Tier 1/2 escalation or a release you cut; everything else waits for the daily digest.` |
+| `escalations` | Escalations when they happen, plus one daily digest. Silent otherwise. | `Report NOTHING this turn except a Tier 1 or Tier 2 escalation; everything else -- releases included -- waits for the daily digest.` |
 
 **What the scope does:** the [orchestrator heartbeat](#orchestrator-tick) appends
 that line to every tick it sends, so the reporting contract arrives with the
