@@ -557,7 +557,7 @@ function scopeHost() {
 test("both constraint lines are pinned verbatim: they are the contract the turn reads", () => {
   expect(TICK_SCOPE_CONSTRAINTS.material).toBe("Report material events per your brief.");
   expect(TICK_SCOPE_CONSTRAINTS.escalations).toBe(
-    "Report NOTHING this turn except a Tier 1/2 escalation or a release you cut; everything else waits for the daily digest.",
+    "Report NOTHING this turn except a Tier 1 or Tier 2 escalation; everything else -- releases included -- waits for the daily digest.",
   );
 });
 

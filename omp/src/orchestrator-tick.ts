@@ -170,7 +170,7 @@ export function defaultTickMessage(now: Date): string {
 export const TICK_SCOPE_CONSTRAINTS: { readonly [K in ReportScope]: string } = {
   material: "Report material events per your brief.",
   escalations:
-    "Report NOTHING this turn except a Tier 1/2 escalation or a release you cut; everything else waits for the daily digest.",
+    "Report NOTHING this turn except a Tier 1 or Tier 2 escalation; everything else -- releases included -- waits for the daily digest.",
 };
 
 /**
