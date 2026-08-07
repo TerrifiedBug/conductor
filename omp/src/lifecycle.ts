@@ -313,39 +313,34 @@ export async function stopDaemon(o: { timeoutMs?: number } = {}): Promise<StopRe
     // `livingDaemon` already cleared a stale file; this covers the unparseable
     // one it refused to read. Still ask systemd: a unit can be running with
     // no pidfile (boot race, wiped runtime dir) and stop must still land.
-    const unitPid = systemdMainPid();
-    if (unitPid !== undefined && (await stopViaSystemd(undefined))) {
-      const deadline = Date.now() + (o.timeoutMs ?? STOP_TIMEOUT_MS);
-      while (isAlive(unitPid) && Date.now() < deadline) await sleep(100);
-      if (isAlive(unitPid)) {
-        throw new Error(
-          `daemon pid ${unitPid} still alive after systemctl stop ${SYSTEMD_UNIT} — ` +
-            `check \`systemctl status ${SYSTEMD_UNIT}\``,
-        );
-      }
+    const decision = decideSystemdStop(undefined);
+    if (decision.kind === "unknown") {
+      throw new Error(ownershipUnknown("stop", decision.reason));
+    }
+    if (decision.kind === "stop") {
+      await runSystemdStop(decision.mainPid, o.timeoutMs);
       clearRecord();
-      return { kind: "stopped", pid: unitPid, via: "systemctl" };
+      return { kind: "stopped", pid: decision.mainPid, via: "systemctl" };
     }
     clearRecord();
     return { kind: "not-running" };
   }
 
-  if (await stopViaSystemd(rec.pid)) {
-    // Wait out the unit: systemctl stop is synchronous for Type=simple, but
-    // a slow drain still holds the old pid briefly and the next start would
-    // refuse against it.
-    const deadline = Date.now() + (o.timeoutMs ?? STOP_TIMEOUT_MS);
-    while (isAlive(rec.pid) && Date.now() < deadline) await sleep(100);
-    if (isAlive(rec.pid)) {
-      throw new Error(
-        `daemon pid ${rec.pid} still alive after systemctl stop ${SYSTEMD_UNIT} — ` +
-          `check \`systemctl status ${SYSTEMD_UNIT}\``,
-      );
-    }
+  const decision = decideSystemdStop(rec.pid);
+  if (decision.kind === "unknown") {
+    // Pidfile stays: we could not prove the unit does *not* own this pid, and
+    // signalling it under that uncertainty is the bounce under Restart=on-failure.
+    throw new Error(ownershipUnknown("stop", decision.reason));
+  }
+  if (decision.kind === "stop") {
+    await runSystemdStop(rec.pid, o.timeoutMs);
     clearRecord();
     return { kind: "stopped", pid: rec.pid, via: "systemctl" };
   }
 
+  // decision.kind === "not-ours": confirmed no unit, inactive unit, no systemd
+  // binary, or a unit whose MainPID is somebody else. Only a *confirmed*
+  // negative is safe to signal.
   const gone = await terminate(rec.pid, o.timeoutMs ?? STOP_TIMEOUT_MS);
   if (!gone) {
     // The record stays: something is still holding that pid, and forgetting
@@ -360,11 +355,11 @@ export async function stopDaemon(o: { timeoutMs?: number } = {}): Promise<StopRe
  * Restarts the daemon.
  *
  * Same ownership rule as {@link stopDaemon}: when the unit owns the live pid,
- * `systemctl restart` keeps systemd in charge of the replacement process so
- * the new MainPID is still the unit's. Falling back to stop+start for a
- * hand-started daemon would leave the unit dead and the new process
- * unsupervised — fine for a laptop, wrong for the host that installed a unit
- * specifically so a crash comes back.
+ * `systemctl restart` is the *only* path — a failed manager call is terminal,
+ * never a fallthrough to raw signals. An *unanswered* ownership query is also
+ * terminal: "dbus blipped" is not "no unit". Falling back to stop+start is
+ * reserved for a confirmed hand-started daemon (no systemd, inactive unit, or
+ * a unit whose MainPID is someone else).
  *
  * Returns the record of the process that is now answering `/healthz`.
  */
@@ -372,34 +367,38 @@ export async function restartDaemon(
   o: { port?: number; project?: string; timeoutMs?: number } = {},
 ): Promise<{ previous: DaemonRecord | undefined; record: DaemonRecord; via: "systemctl" | "cli" }> {
   const previous = livingDaemon();
-  const unitPid = systemdMainPid();
+  const ownership = probeUnit();
+  if (ownership.kind === "unknown") {
+    throw new Error(ownershipUnknown("restart", ownership.reason));
+  }
+
   const unitOwns =
-    unitPid !== undefined && (previous === undefined || previous.pid === unitPid);
+    ownership.kind === "active" && (previous === undefined || previous.pid === ownership.pid);
 
   if (unitOwns) {
+    // Ownership is proven. A refused/timed-out restart must not fall through
+    // to stopDaemon's signal path — that is the exact bounce this module exists
+    // to prevent (SIGTERM → exit 143 → Restart=on-failure → new MainPID).
     const ran = systemctl(["restart", SYSTEMD_UNIT]);
-    if (ran.ok) {
-      // systemctl restart returns once the new MainPID is up; the pidfile is
-      // written by the daemon itself on boot, so wait for that rather than
-      // inventing a record from the unit alone.
-      const deadline = Date.now() + READY_TIMEOUT_MS;
-      for (;;) {
-        const rec = livingDaemon();
-        if (rec !== undefined) {
-          const health = await healthCheck(rec.port);
-          if (health.ok) return { previous, record: rec, via: "systemctl" };
-        }
-        if (Date.now() >= deadline) break;
-        await sleep(READY_POLL_MS);
-      }
-      throw new Error(
-        `systemctl restart ${SYSTEMD_UNIT} returned, but the daemon never answered /healthz`,
-      );
+    if (!ran.ok) {
+      throw new Error(systemctlFailure("restart", ran));
     }
-    // Unit exists and owns the pid but systemctl refused (permissions, dbus
-    // down). Fall through to the signal path rather than stranding the
-    // operator with "restart failed" and a still-running daemon they cannot
-    // reach through the unit.
+    // systemctl restart returns once the new MainPID is up; the pidfile is
+    // written by the daemon itself on boot, so wait for that rather than
+    // inventing a record from the unit alone.
+    const deadline = Date.now() + READY_TIMEOUT_MS;
+    for (;;) {
+      const rec = livingDaemon();
+      if (rec !== undefined) {
+        const health = await healthCheck(rec.port);
+        if (health.ok) return { previous, record: rec, via: "systemctl" };
+      }
+      if (Date.now() >= deadline) break;
+      await sleep(READY_POLL_MS);
+    }
+    throw new Error(
+      `systemctl restart ${SYSTEMD_UNIT} returned, but the daemon never answered /healthz`,
+    );
   }
 
   await stopDaemon({ timeoutMs: o.timeoutMs });
@@ -408,32 +407,70 @@ export async function restartDaemon(
 }
 
 /**
- * The MainPID of {@link SYSTEMD_UNIT}, or `undefined` when systemd is absent,
- * the unit is unknown, or it is not running. Never throws: a missing binary
- * or a dbus blip is "no unit", and stop falls back to SIGTERM.
+ * What we know about {@link SYSTEMD_UNIT}.
+ *
+ * - `active` — unit has a live MainPID (> 1). Includes transitional manager
+ *   states (`activating`, `deactivating`, `reloading`, `reactivating`) — the
+ *   pid is still systemd-owned, so a raw SIGTERM would bounce under
+ *   `Restart=on-failure`.
+ * - `inactive` — confirmed not running (MainPID absent/0), unit absent, *or*
+ *   no `systemctl` binary on this host. Safe to treat as "not supervised here".
+ * - `unknown` — the manager exists (or we cannot tell it does not) but the
+ *   query failed: dbus blip, permission, timeout. Must not be collapsed into
+ *   `inactive` — that is how a unit-owned daemon gets a raw SIGTERM.
  */
-export function systemdMainPid(unit = SYSTEMD_UNIT): number | undefined {
+export type UnitOwnership =
+  | { kind: "active"; pid: number }
+  | { kind: "inactive" }
+  | { kind: "unknown"; reason: string };
+
+/**
+ * Probe {@link SYSTEMD_UNIT} ownership. Never throws — the caller decides
+ * whether `unknown` is fatal (stop/restart: yes).
+ */
+export function probeUnit(unit = SYSTEMD_UNIT): UnitOwnership {
   const ran = systemctl(["show", unit, "--property=MainPID", "--property=ActiveState", "--value"]);
-  if (!ran.ok) return undefined;
+  if (!ran.ok) {
+    // No binary at all → this host has no systemd manager, so nothing here can
+    // be unit-owned. Any other failure (dbus, auth, timeout) is unknown.
+    if (ran.missing) return { kind: "inactive" };
+    const detail = (ran.stderr.trim() || ran.stdout.trim() || "systemctl show failed").split("\n")[0]!;
+    return { kind: "unknown", reason: detail };
+  }
   // `systemctl show --value` prints one property per line, MainPID then
   // ActiveState, in the order requested. Tolerate either order and blank
   // lines so a future systemctl rearrange does not silently disable the path.
+  // Unknown units still exit 0 with `0` / `inactive`, which is the confirmed
+  // negative we want — not an error.
+  //
+  // Ownership is the MainPID, not ActiveState. A successful probe that names a
+  // live pid (> 1) means systemd still owns that process — including during
+  // `activating` / `deactivating` / `reloading`. Filtering on ActiveState here
+  // used to label those transitional states "inactive" and hand the pid to a
+  // raw SIGTERM, which is exactly the Restart=on-failure bounce.
   const lines = ran.stdout
     .split("\n")
     .map((l) => l.trim())
     .filter((l) => l.length > 0);
   let pid: number | undefined;
-  let active: string | undefined;
   for (const line of lines) {
     if (/^\d+$/.test(line)) {
       const n = Number(line);
       if (Number.isInteger(n) && n > 1) pid = n;
-    } else {
-      active = line;
     }
   }
-  if (active !== undefined && active !== "active" && active !== "reactivating") return undefined;
-  return pid;
+  if (pid === undefined) return { kind: "inactive" };
+  return { kind: "active", pid };
+}
+
+/**
+ * The MainPID of an *active* {@link SYSTEMD_UNIT}, or `undefined` when the
+ * unit is confirmed inactive/absent or when ownership could not be determined.
+ * Prefer {@link probeUnit} when the caller must distinguish those two.
+ */
+export function systemdMainPid(unit = SYSTEMD_UNIT): number | undefined {
+  const ownership = probeUnit(unit);
+  return ownership.kind === "active" ? ownership.pid : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -441,40 +478,108 @@ export function systemdMainPid(unit = SYSTEMD_UNIT): number | undefined {
 // ---------------------------------------------------------------------------
 
 /**
- * Ask systemd to stop the unit, but only when it actually owns `pid`.
+ * Whether systemd should stop this daemon.
  *
- * `pid === undefined` means "no pidfile" — still stop the unit if it is
- * active, because that is the only process that could be the daemon. A unit
- * whose MainPID is some other process is left alone: stopping it would take
- * down a neighbour, and the signal path handles *our* pid.
+ * - `stop` — unit is active and owns `pid` (or there is no pidfile and the
+ *   unit is the only candidate). Caller MUST go through systemctl; a failed
+ *   manager call is terminal.
+ * - `not-ours` — confirmed inactive/absent unit, no systemd binary, or a unit
+ *   whose MainPID is someone else. Caller may SIGTERM its own pidfile process.
+ * - `unknown` — ownership query failed. Caller MUST NOT signal.
  */
-async function stopViaSystemd(pid: number | undefined): Promise<boolean> {
-  const main = systemdMainPid();
-  if (main === undefined) return false;
-  if (pid !== undefined && main !== pid) return false;
-  const ran = systemctl(["stop", SYSTEMD_UNIT]);
-  return ran.ok;
+type SystemdStopDecision =
+  | { kind: "stop"; mainPid: number }
+  | { kind: "not-ours" }
+  | { kind: "unknown"; reason: string };
+
+function decideSystemdStop(pid: number | undefined): SystemdStopDecision {
+  const ownership = probeUnit();
+  if (ownership.kind === "unknown") return { kind: "unknown", reason: ownership.reason };
+  if (ownership.kind === "inactive") return { kind: "not-ours" };
+  if (pid !== undefined && ownership.pid !== pid) return { kind: "not-ours" };
+  return { kind: "stop", mainPid: ownership.pid };
 }
 
 /**
- * Run one `systemctl` invocation. Captures output and never throws: absence
- * of the binary, a missing unit, or a permission error are all "not ok", and
- * the caller decides whether to fall back.
+ * `systemctl stop` for a pid we have already proven the unit owns.
+ *
+ * Throws on manager refusal/timeout — never returns "false" for the caller to
+ * reinterpret as "try SIGTERM instead". That reinterpretation is how stop
+ * bounced under `Restart=on-failure`.
+ */
+async function runSystemdStop(pid: number, timeoutMs?: number): Promise<void> {
+  const ran = systemctl(["stop", SYSTEMD_UNIT]);
+  if (!ran.ok) {
+    // Record stays: the unit still owns the process, and clearing it would let
+    // the next `start` believe the port is free while systemd still holds it.
+    throw new Error(systemctlFailure("stop", ran));
+  }
+  // systemctl stop is synchronous for Type=simple, but a slow drain still
+  // holds the old pid briefly and the next start would refuse against it.
+  const deadline = Date.now() + (timeoutMs ?? STOP_TIMEOUT_MS);
+  while (isAlive(pid) && Date.now() < deadline) await sleep(100);
+  if (isAlive(pid)) {
+    throw new Error(
+      `daemon pid ${pid} still alive after systemctl stop ${SYSTEMD_UNIT} — ` +
+        `check \`systemctl status ${SYSTEMD_UNIT}\``,
+    );
+  }
+}
+
+function systemctlFailure(verb: "stop" | "restart", ran: SystemctlResult): string {
+  const detail = (ran.stderr.trim() || ran.stdout.trim() || "no output").split("\n")[0] ?? "no output";
+  return (
+    `systemctl ${verb} ${SYSTEMD_UNIT} failed: ${detail} — ` +
+    `refusing to signal a unit-owned daemon (that is how Restart=on-failure turns stop into a bounce); ` +
+    `fix the unit or run \`systemctl ${verb} ${SYSTEMD_UNIT}\` yourself`
+  );
+}
+
+function ownershipUnknown(verb: "stop" | "restart", reason: string): string {
+  return (
+    `cannot determine whether ${SYSTEMD_UNIT} owns the daemon (${reason}) — ` +
+    `refusing to ${verb} via signal while ownership is unknown ` +
+    `(a raw SIGTERM under Restart=on-failure is a bounce); ` +
+    `retry when systemctl answers, or run \`systemctl ${verb} ${SYSTEMD_UNIT}\` yourself`
+  );
+}
+
+/**
+ * Run one `systemctl` invocation. Captures output and never throws: the caller
+ * classifies the result. `missing: true` means the binary is not on PATH — that
+ * is a confirmed "no systemd on this host", not a transient query failure.
  *
  * The default shells out. Tests replace it with {@link setSystemctlForTest}
  * so the ownership decision is exercised without a real systemd.
  */
-export type SystemctlFn = (args: string[]) => { ok: boolean; stdout: string; stderr: string };
+export type SystemctlResult = {
+  ok: boolean;
+  stdout: string;
+  stderr: string;
+  /** Binary not found (ENOENT). Distinct from a failed invocation of a present binary. */
+  missing?: boolean;
+};
 
-function defaultSystemctl(args: string[]): { ok: boolean; stdout: string; stderr: string } {
+export type SystemctlFn = (args: string[]) => SystemctlResult;
+
+function defaultSystemctl(args: string[]): SystemctlResult {
   try {
     const res = spawnSync("systemctl", args, {
       encoding: "utf8",
-      // A hung dbus is not worth blocking stop on; the signal path is right there.
+      // Bound the wait: a hung dbus becomes `unknown` ownership, not a hang.
+      // Callers must NOT treat that timeout as "no unit".
       timeout: 15_000,
       env: process.env,
     });
-    if (res.error) return { ok: false, stdout: "", stderr: res.error.message };
+    if (res.error) {
+      const err = res.error as NodeJS.ErrnoException;
+      return {
+        ok: false,
+        stdout: "",
+        stderr: err.message,
+        ...(err.code === "ENOENT" ? { missing: true } : {}),
+      };
+    }
     return {
       ok: res.status === 0,
       stdout: res.stdout ?? "",
