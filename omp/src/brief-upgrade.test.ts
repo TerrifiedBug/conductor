@@ -22,7 +22,9 @@ import {
   missingSections,
   proposeRetrofit,
   refreshComposedBrief,
+  isBannerSeparatorLine,
   isKnownBannerChromeLine,
+  isPhraseChromeLine,
   repairPolicyBannerCrumbs,
   sectionText,
   shippedDiff,
@@ -159,6 +161,38 @@ test("repairPolicyBannerCrumbs cleans an already-migrated POLICY.md", () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("stripLeadingBannerCrumbs preserves a separator-only leading decorative comment", () => {
+  // Sol: BANNER_SEPARATOR must not independently classify generic <!-- === -->
+  // lines as chrome. A POLICY that legitimately opens with a decorative
+  // separator would otherwise lose bytes on migrate/repair.
+  const owned = [
+    "<!-- ==================================================================== -->",
+    "",
+    "## Releases",
+    "humans release.",
+    "",
+  ].join("\n");
+  expect(isBannerSeparatorLine(owned.split("\n")[0]!)).toBe(true);
+  expect(isPhraseChromeLine(owned.split("\n")[0]!)).toBe(false);
+  expect(stripLeadingBannerCrumbs(owned)).toBe(owned);
+  expect(stripLeadingBannerCrumbs(owned)).toContain("====================================================================");
+});
+
+test("stripLeadingBannerCrumbs strips separator only when paired with a known phrase footer", () => {
+  const owned = [
+    "<!-- The conductor never reads this file back, so edit freely.             -->",
+    "<!-- ==================================================================== -->",
+    "",
+    "## Releases",
+    "humans release.",
+    "",
+  ].join("\n");
+  const cleaned = stripLeadingBannerCrumbs(owned);
+  expect(cleaned.trimStart()).toMatch(/^## Releases/);
+  expect(cleaned).not.toContain("never reads this file back");
+  expect(cleaned).not.toContain("====================================================================");
 });
 
 test("stripLeadingBannerCrumbs preserves an unrelated leading operator comment", () => {
