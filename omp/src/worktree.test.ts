@@ -286,7 +286,6 @@ describe("salvageWip", () => {
       // leaked secret to cost an orchestrator tick and a boundary violation.
       mkdirSync(join(tree, ".scratch808"), { recursive: true });
       writeFileSync(join(tree, ".scratch808/env.sh"), "export POSTGRES_PASSWORD=devpass\n");
-      writeFileSync(join(tree, ".env.local"), "DEBUG=true\n");
 
       const outcome = await salvageWip(tree, 808, 1, "the turns cap");
 
@@ -299,6 +298,55 @@ describe("salvageWip", () => {
       // Left on disk, not deleted: skipping it is a judgement about what to
       // publish, not licence to destroy something the worker may still want.
       expect(existsSync(join(tree, ".scratch808/env.sh"))).toBe(true);
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "salvages a brand-new file whose name merely looks like scaffolding",
+    async () => {
+      const { mirrorRoot, workspaceRoot } = sandbox("salvage-new-lookalike");
+      const branch = "conductor/issue-1111";
+
+      const tree = await addWorktree(repo, mirrorRoot, workspaceRoot, 1111, branch);
+
+      // A worker asked to add a local bootstrap helper and an env template — the
+      // deliverable itself, untracked because it did not exist before. An
+      // earlier version of the managed ignore listed both of these shapes, so
+      // `git add -A` skipped them and salvage published a commit that silently
+      // omitted the entire point of the run. A name is not evidence of being
+      // scratch; only `.scratch*` earns that assumption.
+      writeFileSync(join(tree, "bootstrap.local.sh"), "#!/bin/sh\necho bootstrap\n");
+      writeFileSync(join(tree, ".env.local"), "TEMPLATE=1\n");
+
+      const outcome = await salvageWip(tree, 1111, 1, "the turns cap");
+
+      expect(outcome).toMatchObject({ kind: "salvaged", pushed: true });
+      if (outcome.kind !== "salvaged") throw new Error("unreachable");
+      expect(git(["show", "--name-only", "--format=", outcome.sha], tree).split("\n").sort()).toEqual(
+        [".env.local", "bootstrap.local.sh"],
+      );
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "reports nothing only when the tree holds nothing but real scratch",
+    async () => {
+      const { mirrorRoot, workspaceRoot } = sandbox("salvage-only-lookalike");
+
+      const tree = await addWorktree(repo, mirrorRoot, workspaceRoot, 1212, "conductor/issue-1212");
+      const before = git(["rev-parse", "HEAD"], tree);
+
+      // The dangerous shape: the ONLY change is a plausible deliverable. Under
+      // the old ignore this staged nothing, returned `nothing`, and the next
+      // attempt destroyed the tree — a total loss reported as a clean no-op.
+      writeFileSync(join(tree, "deploy.local.sh"), "#!/bin/sh\necho deploy\n");
+
+      const outcome = await salvageWip(tree, 1212, 1, "the turns cap");
+
+      expect(outcome).toMatchObject({ kind: "salvaged", pushed: true });
+      expect(git(["rev-parse", "HEAD"], tree)).not.toBe(before);
     },
     TIMEOUT_MS,
   );
@@ -346,7 +394,8 @@ describe("salvageWip", () => {
 
       const tree = await addWorktree(repo, mirrorRoot, workspaceRoot, 909, "conductor/issue-909");
       const before = git(["rev-parse", "HEAD"], tree);
-      writeFileSync(join(tree, ".env.local"), "DEBUG=true\n");
+      mkdirSync(join(tree, ".scratch909"), { recursive: true });
+      writeFileSync(join(tree, ".scratch909/env.sh"), "export DEBUG=true\n");
 
       // The tree is dirty by `status`, empty by the index once excludes apply.
       // Committing an empty index exits non-zero, so without the second check
