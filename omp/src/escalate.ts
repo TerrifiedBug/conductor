@@ -233,22 +233,32 @@ async function sendTelegram(token: string, chatId: string, text: string): Promis
     throw new Error(`telegram sendMessage failed: ${redact(reason, token)}`);
   }
 
-  const payload = redact(await res.text().catch(() => ""), token).slice(0, 400);
+  // The raw body is what gets parsed; `diagnostic` is only ever for humans.
+  // These were one variable once, and the bug that produced was expensive: the
+  // 400-char cap meant for a log line was applied first, so `JSON.parse` was
+  // handed a truncated object and threw. Telegram echoes the whole message back
+  // inside `result.text`, so every page long enough to matter overflowed and was
+  // reported as rejected *after being delivered* — with the dedup marker only
+  // written on success, that also re-sent the same page every tick. Redaction
+  // stays out of the parse for the same reason: it rewrites the very bytes the
+  // decision is read from.
+  const raw = await res.text().catch(() => "");
+  const diagnostic = redact(raw, token).slice(0, 400);
   if (!res.ok) {
-    throw new Error(`telegram sendMessage failed: HTTP ${res.status} ${payload}`);
+    throw new Error(`telegram sendMessage failed: HTTP ${res.status} ${diagnostic}`);
   }
 
   // Telegram answers 200 with `{"ok":false}` for plenty of real failures
   // (kicked from the chat, bad chat_id), so the status alone proves nothing.
   let ok = false;
   try {
-    const parsed: unknown = JSON.parse(payload);
+    const parsed: unknown = JSON.parse(raw);
     ok = typeof parsed === "object" && parsed !== null && "ok" in parsed && parsed.ok === true;
   } catch {
     ok = false;
   }
   if (!ok) {
-    throw new Error(`telegram sendMessage rejected: ${payload}`);
+    throw new Error(`telegram sendMessage rejected: ${diagnostic}`);
   }
 }
 
