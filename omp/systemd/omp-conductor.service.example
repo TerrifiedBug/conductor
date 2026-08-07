@@ -1,0 +1,54 @@
+# Example unit for a supervised omp-conductor daemon.
+#
+# Why MemoryMax exists: workers are *in-process* omp sessions inside this
+# service's MainPID (not separate processes). With the default two workers plus
+# the orchestrator session, journald on a reference 7.6 GB host recorded
+# Memory peaks of ~3.2–4.2 GB for this unit (issue #51). That is expected load,
+# not a leak — and on a shared VPS it is enough to thrash swap or OOM the
+# daemon mid-flight (orphan path).
+#
+# Before enabling:
+#   1. Set User=/Group=/HOME=/PATH for the account that owns ~/.omp/conductor.
+#   2. Point ExecStart at the omp-conductor binary on that host.
+#   3. On hosts under ~16 GiB RAM, prefer maxConcurrentWorkers=1 in config and
+#      consider MemoryMax=3G.
+#   4. Do not co-locate ClickHouse + other multi-GB services beside a 2-worker
+#      fleet on a ≤8 GB box.
+#
+# Install:
+#   sudo cp omp-conductor.service.example /etc/systemd/system/omp-conductor.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now omp-conductor
+
+[Unit]
+Description=omp-conductor dispatch daemon
+Documentation=https://github.com/TerrifiedBug/conductor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# REPLACE: the account that owns ~/.omp/conductor and the gh auth the tracker uses.
+User=fleet
+Group=fleet
+Environment=HOME=/home/fleet
+# systemd's default PATH has no user installs; include wherever `omp` /
+# `omp-conductor` and `gh` live on this host.
+Environment=PATH=/home/fleet/.local/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=/home/fleet
+
+# Foreground daemon so systemd tracks MainPID. `omp-conductor start` backgrounds;
+# under a unit, call `daemon` directly.
+ExecStart=/home/fleet/.local/bin/omp-conductor daemon --port 7432
+
+Restart=on-failure
+# Handled SIGTERM exits 143; without this, Restart=on-failure brings the unit
+# straight back after `systemctl stop` / `omp-conductor stop`.
+SuccessExitStatus=0 143
+
+MemoryAccounting=yes
+# Hard ceiling just above measured 2-worker peaks. Crossing it cgroups-OOMs the
+# unit — prefer lowering maxConcurrentWorkers before raising this.
+MemoryMax=5G
+
+[Install]
+WantedBy=multi-user.target

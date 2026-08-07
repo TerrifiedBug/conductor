@@ -23,6 +23,7 @@
     "src",
     "!src/**/*.test.ts",
     "skills",
+    "systemd",
     "README.md",
     "LICENSE"
   ],

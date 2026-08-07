@@ -26,7 +26,8 @@ import {
   buildProject,
   type SetupAnswers,
 } from "./setup.ts";
-import type { ProjectConfig } from "./types.ts";
+import { DEFAULT_CAPS, type ProjectConfig } from "./types.ts";
+import { hostRamBytes, recommendedMaxWorkers } from "./host.ts";
 
 const CONDUCTOR_HOME = "OMP_CONDUCTOR_HOME";
 const TELEGRAM_HOME = "OMP_TELEGRAM_STATE_DIR";
@@ -206,6 +207,16 @@ function withoutGraph(p: ProjectConfig): ProjectConfig {
 
 // ------------------------------------------------------------------- first run
 
+
+/** Caps left empty when the host keeps the shipped worker default; otherwise
+ *  the small-host override that askCaps writes without a Caps confirm. */
+function expectedDefaultCaps(): { maxConcurrentWorkers?: number } {
+  const workers = recommendedMaxWorkers(hostRamBytes());
+  return workers === DEFAULT_CAPS.maxConcurrentWorkers
+    ? {}
+    : { maxConcurrentWorkers: workers };
+}
+
 test("a first run asks no amend question and collects what it always collected", async () => {
   const d = dialogs({
     input: {
@@ -247,7 +258,8 @@ test("a first run asks no amend question and collects what it always collected",
     `confirm: Write ${ORCHESTRATOR_BRIEF_NAME} + ${POLICY_BRIEF_NAME} under ${join(home, "worktrees")}?`,
   ]);
 
-  // Enter accepted every default, so this is the shipped configuration exactly.
+  // Enter accepted every default. Caps stay empty on ≥16 GiB hosts (inherit
+  // DEFAULT_CAPS); under 16 GiB askCaps writes maxConcurrentWorkers: 1 (#51).
   expect(answers).toEqual({
     projectName: "demo",
     trackerRepo: "acme/demo",
@@ -265,7 +277,7 @@ test("a first run asks no amend question and collects what it always collected",
         ],
       },
     ],
-    caps: {},
+    caps: expectedDefaultCaps(),
     fallbackToIssueComment: true,
     authority: { merge: "human", release: "human" },
     orchestratorMode: "embedded",
@@ -295,7 +307,7 @@ test("a project this config has never seen is created rather than amended", asyn
   // be in the same file.
   expect(answers.queueLabel).toBe("ready-for-agent");
   expect(answers.routingLabelPrefix).toBe("repo:");
-  expect(answers.caps).toEqual({});
+  expect(answers.caps).toEqual(expectedDefaultCaps());
 });
 
 // ----------------------------------------------------------------- amend mode

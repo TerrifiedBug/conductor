@@ -680,3 +680,23 @@ test("formatFleetStatus stacks dispatch/ticks/pane/recovery/herdr/daemon", () =>
   expect(text).toContain("daemon    not running");
   expect(text).toContain("project   demo  (PAUSED)");
 });
+
+test("formatFleetStatus prints daemon rss from /healthz when present", () => {
+  writeMinimalConfig();
+  writeTick();
+  hold();
+  const s = statusSnapshot();
+  const layers = fleetLayers();
+  const up = {
+    ...layers,
+    daemon: { running: true, pid: 4242, port: 7432 },
+  };
+  const withRss = formatFleetStatus(s, up, {
+    ok: true,
+    body: JSON.stringify({ ok: true, rssBytes: 3.2 * 1024 ** 3 }),
+  });
+  expect(withRss).toContain("rss       3.2 GB");
+
+  const without = formatFleetStatus(s, up, { ok: true, body: JSON.stringify({ ok: true }) });
+  expect(without).not.toContain("rss");
+});

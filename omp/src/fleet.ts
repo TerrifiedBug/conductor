@@ -36,6 +36,7 @@ import {
   type StopResult,
   SYSTEMD_UNIT,
 } from "./lifecycle.ts";
+import { formatRss, rssBytesFromHealthz } from "./host.ts";
 import {
   readTickConfig,
   TICK_CONFIG_FILE,
@@ -832,10 +833,12 @@ export function formatFleetStatus(
         : daemonHealth.ok
           ? `ok  ${daemonHealth.body ?? ""}`.trimEnd()
           : "unreachable — the process is up but not serving";
+    const rss = rssBytesFromHealthz(daemonHealth?.body);
     daemonBlock = [
       "daemon",
       `  pid       ${layers.daemon.pid}`,
       `  port      ${layers.daemon.port ?? "?"}`,
+      ...(rss === undefined ? [] : [`  rss       ${formatRss(rss)}`]),
       `  healthz   ${hz}`,
       `  unit      ${SYSTEMD_UNIT}`,
     ].join("\n");

@@ -1391,6 +1391,9 @@ export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
           paused: isPaused(),
           activeRuns: store.activeRuns(project.name).length,
           project: project.name,
+          // Resident set of *this* process: workers are in-process omp sessions,
+          // so the unit's Memory peak is this number, not a separate worker pid.
+          rssBytes: process.memoryUsage().rss,
         });
       }
       return new Response("not found\n", { status: 404 });
