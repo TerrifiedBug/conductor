@@ -13,6 +13,7 @@ import { dirname, join, relative } from "node:path";
 import { configPath, findProject, loadConfig, resolveCaps, stateDir } from "./config.ts";
 import { createEscalator } from "./escalate.ts";
 import { livingDaemon } from "./lifecycle.ts";
+import { STALL_MARKER_FILE } from "./orchestrator-tick.ts";
 import { startOrchestrator } from "./orchestrator.ts";
 import type { OrchestratorHandle } from "./orchestrator.ts";
 import { branchName, route } from "./routing.ts";
@@ -70,6 +71,7 @@ interface Deps {
   store: Store;
   escalate(e: Escalation): Promise<void>;
   integrity: IntegrityGate;
+  stall: StallGate;
 }
 
 // ---------------------------------------------------------------- paths & pause
@@ -77,6 +79,97 @@ interface Deps {
 /** Single database for every project; the store partitions by project name. */
 export function dbPath(): string {
   return join(stateDir(), "conductor.db");
+}
+
+// ------------------------------------------------------- orchestrator liveness
+
+/**
+ * Whether the wedged-orchestrator page has already gone out for the stall
+ * currently on disk. One page per episode: the marker persists until a tick is
+ * consumed, so paging per five minutes would be paging forever.
+ */
+export interface StallGate {
+  paged: boolean;
+}
+
+export interface StallVerdict {
+  /** The marker's own line, when one is there. */
+  since?: string;
+  page: boolean;
+}
+
+/**
+ * Reads the orchestrator's stall marker and decides whether this tick pages.
+ *
+ * The marker is written by the tick extension inside the orchestrator session
+ * ({@link STALL_MARKER_FILE}) when two of its own prompts go unconsumed — the
+ * one signal that separates "the process is alive" from "the loop is reading
+ * its queue". Every other guard in this system reads healthy through a wedge:
+ * the herdr recovery plugin tests for a live process and an agent label, both
+ * of which survive it, and `/healthz` describes this daemon, which is a
+ * different process entirely.
+ *
+ * The daemon is the natural watcher precisely because it is that different
+ * process: it already wakes every five minutes, it owns a working escalation
+ * path, and nothing about its health depends on the session that is stuck. A
+ * wedged loop cannot page for itself, and the herdr plugin only runs on session
+ * lifecycle events — a session that stays alive and stops working emits none.
+ *
+ * Resets when the marker disappears, so a second stall days later pages again.
+ */
+export function checkStall(gate: StallGate, marker: string): StallVerdict {
+  if (!existsSync(marker)) {
+    gate.paged = false;
+    return { page: false };
+  }
+  const page = !gate.paged;
+  let since: string | undefined;
+  try {
+    const body = readFileSync(marker, "utf8").split("\n")[0]?.trim();
+    if (body !== undefined && body !== "") since = body;
+  } catch {
+    // An unreadable marker still means stalled; the timestamp is a nicety.
+  }
+  return { ...(since === undefined ? {} : { since }), page };
+}
+
+/**
+ * Pages tier 2 once when the orchestrator session stops draining its queue.
+ *
+ * Deliberately does not restart anything. A wedge lands mid-turn, this process
+ * cannot tell a half-applied edit from an idle loop, and killing the session
+ * could destroy work an operator would rather read first — the same refusal to
+ * guess that the recovery plugin is built on.
+ */
+async function watchOrchestrator(d: Deps): Promise<void> {
+  const marker = join(stateDir(), STALL_MARKER_FILE);
+  const verdict = checkStall(d.stall, marker);
+  if (!verdict.page) return;
+
+  log(`ERROR: the orchestrator session is not draining its queue — ${verdict.since ?? "no timestamp"}`);
+  const delivered = await safeEscalate(d, {
+    tier: 2,
+    project: d.project.name,
+    issue: NO_ISSUE,
+    // Dated like the other tier-2 summaries: the dedup key is the summary, and
+    // a second wedge next month must not read as a repeat of this one.
+    summary:
+      `Orchestrator session wedged on ${new Date().toISOString().slice(0, 10)} — ` +
+      `it has stopped reading its queue (${d.project.name})`,
+    detail: [
+      verdict.since ?? "Marker present with no readable timestamp.",
+      `Marker: ${marker}`,
+      "",
+      "Its process and its herdr agent label are both healthy, which is why nothing else noticed:",
+      "the loop is alive and consuming nothing, so ticks and your messages queue behind it unread.",
+      "",
+      "Attach and look before you act — a wedge lands mid-turn. Then SIGTERM the omp process:",
+      "herdr-conductor resumes it by exact identity, and the first consumed tick clears this marker.",
+      "",
+      "Dispatch is unaffected: workers keep running. What stops is drain, groom, report and merge.",
+    ].join("\n"),
+  });
+  markPaged(d.stall, delivered);
 }
 
 /**
@@ -177,16 +270,19 @@ export function manifestDiff(before: Map<string, string>, after: Map<string, str
  *
  * `pause` stays true on every divergent tick, deliberately: an operator who
  * resumes without restarting gets re-paused, because the boundary is still
- * broken. `page` fires once — the gate is mutated here rather than returned for
- * the caller to store, since the one call site that forgets to store it pages
- * every five minutes forever.
+ * broken. `page` asks whether this tick should *try* — the caller latches the
+ * gate with {@link markPaged} only once a page actually went out, so a Telegram
+ * outage during the one tick that noticed does not buy permanent silence.
  */
 export function checkIntegrity(gate: IntegrityGate, current: Map<string, string>): IntegrityVerdict {
   const diff = manifestDiff(gate.baseline, current);
   if (diff.length === 0) return { diff, pause: false, page: false };
-  const page = !gate.paged;
-  gate.paged = true;
-  return { diff, pause: true, page };
+  return { diff, pause: true, page: !gate.paged };
+}
+
+/** Latch a once-only page, after delivery is confirmed and never before. */
+export function markPaged(gate: { paged: boolean }, delivered: boolean): void {
+  if (delivered) gate.paged = true;
 }
 
 // ---------------------------------------------------------------------- helpers
@@ -257,12 +353,19 @@ async function swapLabel(tracker: Tracker, issue: number, from: string, to: stri
  * The escalator throws when no transport is configured or Telegram rejects, and
  * only records the dedup marker on success. A page that cannot be delivered
  * must not take the tick down with it — log it and let the next tick retry.
+ *
+ * Returns whether it actually went out, because "page once" and "page once
+ * *successfully*" are different promises: a caller that latches a once-only
+ * gate on the attempt turns one failed delivery into permanent silence about a
+ * condition that is still true.
  */
-async function safeEscalate(d: Pick<Deps, "escalate">, e: Escalation): Promise<void> {
+async function safeEscalate(d: Pick<Deps, "escalate">, e: Escalation): Promise<boolean> {
   try {
     await d.escalate(e);
+    return true;
   } catch (err) {
     log(`escalation for #${e.issue} could not be delivered: ${errText(err)}`);
+    return false;
   }
 }
 
@@ -608,6 +711,13 @@ export async function admitCandidates(
 // ----------------------------------------------------------------------- a tick
 
 async function tick(d: Deps): Promise<void> {
+  // Before the pause check, deliberately. This one is not about dispatch: the
+  // orchestrator is a different process, and it can be wedged while this fleet
+  // is paused — which is exactly the state the reference fleet was in when the
+  // failure happened. A pause silences claiming, not the operator's right to
+  // know their supervising session stopped reading its queue.
+  await watchOrchestrator(d);
+
   // A paused fleet claims nothing. Checked first so pausing takes effect on the
   // next tick without signalling the process.
   if (isPaused()) return;
@@ -630,7 +740,7 @@ async function tick(d: Deps): Promise<void> {
     );
     setPaused(true);
     if (integrity.page) {
-      await safeEscalate(d, {
+      const delivered = await safeEscalate(d, {
         tier: 2,
         project: project.name,
         issue: NO_ISSUE,
@@ -651,6 +761,7 @@ async function tick(d: Deps): Promise<void> {
           "`omp-conductor resume` alone will not hold — the next tick re-pauses while the files differ.",
         ].join("\n"),
       });
+      markPaged(d.integrity, delivered);
     }
     return;
   }
@@ -969,6 +1080,9 @@ export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
     store,
     escalate: (e) => escalator.escalate(e),
     integrity,
+    // Fresh per daemon run, like the integrity gate: a restart is entitled to
+    // page again about a stall that is still on disk.
+    stall: { paged: false },
   };
 
   if (o.once) {

@@ -762,13 +762,30 @@ the reference 1800-second interval, generous by construction — mean the last
 prompt was never consumed, and the extension:
 
 - writes `<session cwd>/.conductor-stalled`, one line of `<ISO timestamp>
-  <diagnosis>`, which any watchdog can stat and treat as "not live". The file is
-  the signal; restarting or paging is the watchdog's policy, not this package's.
+  <diagnosis>`.
 - logs at **error** level: `orchestrator stalled: 2 ticks queued unconsumed —
   the agent loop is not draining; see .conductor-stalled`.
 
 Both escapes deliberately leave the session, because a loop that cannot drain
 its queue cannot report on itself — that is the whole failure.
+
+**Two things read it.** A marker nobody consumes is an artifact, not an alert:
+
+- **The daemon**, on its own five-minute tick, and *before* its pause check. The
+  orchestrator is a different process and can be wedged while the fleet is
+  deliberately paused — precisely the state the dogfood fleet was in when this
+  happened. One tier-2 page per stall, dated, re-armed when the marker clears,
+  and latched only once the page is confirmed delivered, so an escalation
+  channel that fails on the one tick that noticed does not buy permanent
+  silence. It restarts nothing: a wedge lands mid-turn, and this process cannot
+  tell a half-applied edit from an idle loop.
+- **herdr-conductor's recovery**, which treats marker-present as *not live*. Its
+  liveness test — agent listed AND a non-shell foreground process — passes
+  straight through a wedge, so without this a recovery run certifies a stuck
+  session as healthy and returns "nothing to do".
+
+The daemon is what covers a wedge beginning *between* herdr's lifecycle events,
+since a session that stays alive and stops working emits none of them.
 
 The first tick that actually sends clears the counter and deletes the marker,
 and it deletes one it did not write: recovery normally arrives as a fresh

@@ -442,6 +442,34 @@ check 'live agent short-circuits' "ok: agent 'fleet' is live in pane w1:p1" "$ou
 assert_inert 'live agent short-circuits' "$d"
 
 # --------------------------------------------------------------------------
+# case 1b — the same live agent, but omp-conductor's tick has left a stall
+# marker in the fleet cwd: alive is not the same as working, so this pages
+# instead of short-circuiting. Regression for the 2026-08-07 wedge, where the
+# process and the label were both healthy for 23 minutes while the loop read
+# nothing off its queue.
+# --------------------------------------------------------------------------
+
+d=$(newcase live-agent-stalled)
+mkdir -p "$d/fleet-cwd"
+printf '2026-08-07T06:27:55.123Z 2 ticks queued unconsumed\n' >"$d/fleet-cwd/.conductor-stalled"
+sed -i.bak "s|^FLEET_CWD=.*|FLEET_CWD=$d/fleet-cwd|" "$d/config/config.env"
+saved_session_json fleet "$REF" >"$d/session/session.json"
+live_agent_list fleet 'w1:p1' "$REF" >"$d/agent-list.json"
+process_info_omp 'w1:p1' >"$d/process-info-w1:p1.json"
+out=$(run_recover "$d")
+check 'a wedged live agent pages instead of reading as healthy' \
+  "page: agent 'fleet' is running in pane w1:p1 but its loop is wedged" "$out"
+assert_inert 'a wedged live agent pages instead of reading as healthy' "$d"
+
+# The marker is the only difference between this case and case 1: with it gone
+# the very same fixture must go back to short-circuiting, or the detector would
+# be pinning something other than the marker.
+rm "$d/fleet-cwd/.conductor-stalled"
+out=$(run_recover "$d")
+check 'clearing the marker restores the healthy verdict' \
+  "ok: agent 'fleet' is live in pane w1:p1" "$out"
+
+# --------------------------------------------------------------------------
 # case 2 — exactly one saved pane and one live pane: a resume plan
 # --------------------------------------------------------------------------
 
