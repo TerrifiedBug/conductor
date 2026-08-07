@@ -1029,6 +1029,15 @@ export function formatStatus(s: StatusSnapshot): string {
       );
     }
   }
+  // Deploy hint: a restart while workers are live orphans them (salvage runs
+  // first — #35). Prefer pause + drain to zero live workers when you can wait.
+  if (s.liveWorkers > 0) {
+    lines.push(
+      "",
+      `deploy    ${s.liveWorkers} live worker(s) — restart salvages dirty trees then orphans the rows; ` +
+        `pause and wait for workers 0/${s.caps.maxConcurrentWorkers} when you can drain instead`,
+    );
+  }
   return lines.join("\n");
 }
 
@@ -1085,18 +1094,18 @@ export function armConductor(): void {
 }
 
 /**
- * Settles the runs a previous daemon process left in flight.
+ * Settles `claimed`/`running` rows left by a dead daemon process and, before
+ * marking each one `orphaned`, salvages any dirty worktree.
  *
- * A `claimed` or `running` row is a promise that a worker exists in *some*
- * process. This is called from a freshly started daemon, so when no other
- * daemon is alive every such row is a worker that died with the previous
- * process. Left "active", those rows deadlock admission forever: the slot
- * count reads full while nothing runs, and the fleet looks busy doing nothing
- * (found live, after a host restart killed two workers mid-run).
+ * Found live after a host restart killed two workers mid-run, and again on
+ * every package deploy that restarted while workers were live (#35): without
+ * the salvage call the next attempt's `worktree remove --force` destroyed
+ * uncommitted edits that had no other copy. Cap-kills already salvaged (#27);
+ * this is the same call site for the restart path.
  *
  * Only the rows change. The issue keeps its in-progress label — that label is
  * the crash guard against double-dispatch, and deciding what a dead worker's
- * remains are worth (an open PR? unpushed commits? a dirty tree?) is the
+ * remains are worth (an open PR? a salvaged sha? a clean tree?) is the
  * orchestrator's drain-duty judgement, not something to automate here. The
  * rows also keep counting toward `maxAttemptsPerIssue`, so a loop of deaths
  * still escalates instead of retrying forever.
@@ -1107,12 +1116,21 @@ export function armConductor(): void {
  * them is {@link settlePushedGreen}, on the tick, by asking the tracker what
  * became of the PR — the one question a restart cannot answer by inference.
  */
-export function reconcileOrphanedRuns(store: Store, project: string): RunRecord[] {
+export async function reconcileOrphanedRuns(
+  store: Store,
+  project: string,
+): Promise<RunRecord[]> {
   // Live runs only: `pushed-green` holds no process, so it cannot be orphaned by
   // a process dying — it is finished work waiting on a human merge.
   const stale = store.liveRuns(project);
   const endedAt = Date.now();
   for (const r of stale) {
+    // Salvage before the row flips: the worktree path is on the record, and
+    // salvageWip is a no-op for a missing/clean tree. Reason string matches
+    // the cap-kill wording so triage reads the same either way.
+    if (r.worktree !== "") {
+      await salvage(r.issue, r.attempt, "a daemon restart", r.worktree);
+    }
     store.updateRun(r.id, { state: "orphaned", endedAt });
   }
   return stale;
@@ -1141,7 +1159,7 @@ export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
   // daemon must not orphan that daemon's real, live workers).
   const alive = livingDaemon();
   if (alive === undefined || alive.pid === process.pid) {
-    for (const r of reconcileOrphanedRuns(store, project.name)) {
+    for (const r of await reconcileOrphanedRuns(store, project.name)) {
       log(
         `#${r.issue} orphaned by a previous daemon (attempt ${r.attempt}, was ${r.state}, worktree ${r.worktree}) — ` +
           `slot freed; the ${project.stateLabels.inProgress} label stays until the orchestrator triages what the worker left`,

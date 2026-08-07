@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -429,6 +429,52 @@ describe("salvageWip", () => {
       // The reason has to reach the escalation, or the operator learns only
       // that something did not happen.
       if (outcome.kind === "failed") expect(outcome.error).toContain("git status");
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "heals a stale managed exclude before staging, so lookalike deliverables survive",
+    async () => {
+      const { mirrorRoot, workspaceRoot } = sandbox("salvage-stale-exclude");
+      const branch = "conductor/issue-44";
+
+      const tree = await addWorktree(repo, mirrorRoot, workspaceRoot, 44, branch);
+
+      // Plant the broad 0.3.6 managed block the live mirrors still carried after
+      // 0.3.7 narrowed the list. Without a heal inside salvage, `.env.local`
+      // stays ignored and the commit silently omits the deliverable (#44).
+      const common = git(["rev-parse", "--git-common-dir"], tree);
+      const commonDir = common.startsWith("/") ? common : join(tree, common);
+      const exclude = join(commonDir, "info", "exclude");
+      writeFileSync(
+        exclude,
+        [
+          "# >>> omp-conductor (managed; edit outside this block)",
+          ".scratch*/",
+          ".scratch*",
+          ".env.local",
+          "*.local.sh",
+          "# <<< omp-conductor",
+          "",
+        ].join("\n"),
+      );
+      writeFileSync(join(tree, ".env.local"), "TEMPLATE=1\n");
+      writeFileSync(join(tree, "bootstrap.local.sh"), "#!/bin/sh\n");
+
+      const outcome = await salvageWip(tree, 44, 1, "a daemon restart");
+
+      expect(outcome).toMatchObject({ kind: "salvaged", pushed: true });
+      if (outcome.kind !== "salvaged") throw new Error("unreachable");
+      expect(
+        git(["show", "--name-only", "--format=", outcome.sha], tree).split("\n").sort(),
+      ).toEqual([".env.local", "bootstrap.local.sh"]);
+      // The on-disk block must also drop the retired patterns so a later
+      // worker `git add -A` sees the same world salvage just used.
+      const healed = readFileSync(exclude, "utf8");
+      expect(healed).toContain(".scratch*/");
+      expect(healed).not.toContain(".env.local");
+      expect(healed).not.toContain("*.local.sh");
     },
     TIMEOUT_MS,
   );
