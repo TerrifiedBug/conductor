@@ -170,7 +170,7 @@ Onboarding this package has two layers, and installing it gives you both.
 
 | Layer | What it is | What it owns |
 | --- | --- | --- |
-| **`/conductor setup`** | The deterministic wizard. Closed questions, a label plan, a dry run, one confirm. | **Mechanical config.** It is the only thing that writes `config.json`, and it mutates nothing before you confirm. |
+| **`/conductor setup`** | The deterministic wizard. Closed questions, a label plan, a dry run, one confirm. On a project it already knows, it offers to amend one area instead of re-asking everything — see [Changing one setting](#changing-one-setting). | **Mechanical config.** It is the only thing that writes `config.json`, and it mutates nothing before you confirm. |
 | **`skill://conductor-onboarding`** | A skill bundled in this package (`skills/conductor-onboarding/SKILL.md`), discovered automatically by any omp session once the plugin is installed. | **Brief authoring.** The judgement the wizard cannot prompt for. |
 
 The split exists because the two halves fail differently. A wrong config value is
@@ -214,6 +214,59 @@ turned on you can also invoke it directly:
 
 Nothing about the wizard changes: `/conductor setup` on its own remains a
 complete, supported path, and the brief it renders is safe unedited.
+
+### Changing one setting
+
+`config.json` is wizard-written, so changing a value means running the wizard —
+and a wizard that re-asks twenty questions to add one key is a wizard people edit
+the file behind instead. So a re-run against a project that is already configured
+opens with one question:
+
+```text
+"veltro" is already configured — what would you like to do?
+> Change one area
+    asks one area's questions; every other answer is carried through from the saved config
+  Walk every question again
+    the full interview, every prompt pre-filled with what is configured now
+```
+
+Amending is the default. Pick it and the eight areas are listed with what each one
+says right now, so the row you want is the row you can see:
+
+```text
+Which area? Each row shows what it says now
+  tracker & repos — veltrosecurity/veltro, queue "ready-for-agent", "repo:" → veltro, chad, warden, vectorflow
+  gates — veltro: none; chad: ruff check . @ backend, pnpm lint @ frontend; warden: ruff check . @ backen…
+  caps & worker model — 2 workers, 120 turns, 90m, $25/day, 2 attempts (all defaults) — harness default model
+  code graph — not configured — workers grep
+  authority — merge=orchestrator, release=orchestrator
+  escalation & triage — tier 2 pages Telegram 8236653927, comments too, triage external
+  reporting scope — material — escalations, plus green PRs, second failures, and anything that stops the fleet
+  orchestrator brief — none at /root/.omp/conductor/worktrees/ORCHESTRATOR.md
+```
+
+Only that area's questions are asked. Every other answer is read back out of
+`config.json` and written again unchanged — the same answers, the same builder,
+the same single confirm, so there is still exactly one thing in this package that
+writes a config, and it still writes nothing before you agree. The consent screen
+leads with the delta and then shows the whole project as it would be written:
+
+```text
+amending       code graph  —  project veltro
+  was            not configured — workers grep
+  now            /root/.cache/conductor-graph/veltrosecurity — 4 clone(s): veltro, chad, warden, vectorflow
+  carried over   tracker & repos, gates, caps & worker model, authority, escalation & triage, reporting scope, orchestrator brief
+                 read back from /root/.omp/conductor/config.json and rewritten unchanged
+```
+
+A first run, or a project name this config has never seen, never sees either
+question: there is nothing to amend, so it is the full interview exactly as
+before. Choosing *Walk every question again* is also unchanged — every prompt
+pre-filled with what is configured, Enter to keep it — with one wrinkle worth
+knowing: the two authority confirms and the orchestrator-session confirm cannot
+start on "yes", so Entering through the full interview **revokes** a delegation
+rather than renewing it. Amending the `authority` area names the current grant in
+the question, which is the safer way to leave one alone.
 
 ### Keeping a brief current
 
@@ -552,7 +605,10 @@ Say yes and the wizard asks for one root, then derives one clone per routed repo
 underneath it (default `~/.cache/conductor-graph/<org>/<repo>`) and writes it to
 each repo's [`graphProject`](#configuration). Nothing else changes: this package
 never runs an indexer, never imports one, and behaves identically with the graph
-server absent — dispatch, caps and escalation do not know it exists.
+server absent — dispatch, caps and escalation do not know it exists. On a fleet
+that was configured before this key existed, `/conductor setup` and the `code
+graph` area add it in two prompts — see
+[Changing one setting](#changing-one-setting).
 
 ### Why the clone, and not your checkout or the worktree
 
@@ -685,6 +741,10 @@ is exactly what the orphan-reconciliation guard reads the pidfile to protect.
 The file is validated on every read. A malformed config produces one readable error
 listing every fault, and the daemon refuses to start rather than running with half
 a project.
+
+`/conductor setup` is the only thing here that writes this file, and on a project
+it already knows it can rewrite one area of it without re-asking the rest — see
+[Changing one setting](#changing-one-setting).
 
 `version` is `2`. A `version: 1` file still loads: caps it names that this build no
 longer enforces are dropped rather than treated as typos, and the next save writes

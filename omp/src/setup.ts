@@ -404,9 +404,11 @@ export async function createMissingLabels(trackerRepo: string, plan: LabelPlan[]
  *
  * Split out of `buildConfig` so the plan summary can show the exact project
  * that would be written — including the derived worktree and mirror paths —
- * without assembling a whole config and indexing back into its array.
+ * without assembling a whole config and indexing back into its array. Exported
+ * for the amend summary's before-and-after, and so a test can pin its round-trip
+ * with {@link answersFromProject} — the pair an amend's carry-through rests on.
  */
-function buildProject(a: SetupAnswers): ProjectConfig {
+export function buildProject(a: SetupAnswers): ProjectConfig {
   const dir = stateDir();
 
   const repos: Record<string, RepoTarget> = {};
@@ -484,6 +486,89 @@ export function buildConfig(a: SetupAnswers, existing?: ConductorConfig): Conduc
       ? previous.map((p) => (p.name === project.name ? project : p))
       : [...previous, project],
   };
+}
+
+/**
+ * The seed a brand-new project starts from: the shipped defaults, and nothing
+ * answered yet.
+ *
+ * Exists so "what does an unanswered field start as" has exactly one spelling.
+ * The wizard pre-fills every prompt from an answers object — this one on a first
+ * run, {@link answersFromProject} on a re-run — rather than reaching for a
+ * default at each prompt, which is how one prompt comes to disagree with the
+ * config key it writes.
+ */
+export function defaultAnswers(projectName: string): SetupAnswers {
+  return {
+    projectName,
+    // Empty rather than a plausible guess: both are required, and a pre-filled
+    // tracker repo is the one default an operator would Enter straight past.
+    trackerRepo: "",
+    queueLabel: SETUP_DEFAULTS.queueLabel,
+    stateLabels: { ...SETUP_DEFAULTS.stateLabels },
+    routingLabelPrefix: SETUP_DEFAULTS.routingLabelPrefix,
+    targetRepos: [],
+    caps: {},
+    fallbackToIssueComment: true,
+    authority: { ...SETUP_DEFAULTS.authority },
+    orchestratorMode: SETUP_DEFAULTS.orchestratorMode,
+    reportScope: DEFAULT_REPORT_SCOPE,
+    writeOrchestratorBrief: false,
+  };
+}
+
+/**
+ * The answers that describe a project already on disk — the inverse of
+ * {@link buildProject}, and what makes amending one area possible.
+ *
+ * Every field is derived here, in one function, rather than field by field at
+ * each prompt: an amend asks one area's questions and carries everything else
+ * through untouched, so anything this forgets is a setting the operator loses by
+ * changing an unrelated one. `buildProject(answersFromProject(p))` is pinned to
+ * `p` by a test for exactly that reason.
+ *
+ * Three fields cannot be a straight copy:
+ *
+ * - `writeOrchestratorBrief` is a decision rather than a value, and it starts
+ *   `false` so an amend that never visits the brief area leaves that file alone.
+ * - `reportScope` reads through {@link DEFAULT_REPORT_SCOPE}, because the key is
+ *   optional on disk. A config written before it existed gains it explicitly on
+ *   the next write, saying what it already meant.
+ * - `graphRoot` is one answer for a whole project while the config stores one
+ *   path per repo, so it comes back from whichever repo already has one. Repos
+ *   that disagree — only a hand-edit can produce that — widen to all of them on
+ *   the next write exactly as a full re-run would, and the plan summary names
+ *   every clone before anything is written.
+ */
+export function answersFromProject(p: ProjectConfig): SetupAnswers {
+  const answers: SetupAnswers = {
+    projectName: p.name,
+    trackerRepo: p.tracker.repo,
+    queueLabel: p.queueLabel,
+    stateLabels: { ...p.stateLabels },
+    routingLabelPrefix: p.routing.labelPrefix,
+    targetRepos: Object.values(p.routing.repos).map((r) => ({
+      name: r.name,
+      cloneUrl: r.cloneUrl,
+      defaultBranch: r.defaultBranch,
+      gates: r.gates.map((g) => ({ cmd: g.cmd, cwd: g.cwd })),
+    })),
+    caps: { ...p.caps },
+    fallbackToIssueComment: p.escalation.fallbackToIssueComment,
+    authority: { ...p.authority },
+    orchestratorMode: p.escalation.orchestrator,
+    reportScope: p.reporting?.scope ?? DEFAULT_REPORT_SCOPE,
+    writeOrchestratorBrief: false,
+  };
+
+  // Set only when present, never as an explicit `undefined`: an absent key is
+  // what keeps the rewritten config identical to the one that was read.
+  if (p.workerModel !== undefined) answers.workerModel = p.workerModel;
+  if (p.escalation.telegramChatId !== undefined) answers.telegramChatId = p.escalation.telegramChatId;
+  const graphed = graphRepos(p)[0];
+  if (graphed !== undefined) answers.graphRoot = dirname(graphed.graphProject);
+
+  return answers;
 }
 
 /**
@@ -791,5 +876,201 @@ export function summarisePlan(
     );
   }
 
+  return lines.join("\n");
+}
+
+/**
+ * Gates as the wizard both shows and reads them back: `cmd`, or `cmd @ cwd` when
+ * one runs from a subdirectory. One spelling, so the pre-filled prompt line and
+ * the amend menu's current value cannot drift apart.
+ */
+export function formatGates(gates: readonly { cmd: string; cwd: string }[]): string {
+  return gates.map((g) => (g.cwd === "." ? g.cmd : `${g.cmd} @ ${g.cwd}`)).join(", ");
+}
+
+/**
+ * The wizard's questions, grouped as the areas a re-run can amend one of, in the
+ * order the full interview asks them.
+ *
+ * Data rather than a switch so the menu, the exhaustiveness of the dialog table
+ * in ./plugin.ts, and the amend summary all enumerate the same eight areas: an
+ * added area fails to compile until it has a name, a current value and a set of
+ * questions.
+ */
+export const AMEND_AREA_IDS = [
+  "tracker",
+  "gates",
+  "caps",
+  "graph",
+  "authority",
+  "escalation",
+  "reporting",
+  "brief",
+] as const;
+
+export type AmendAreaId = (typeof AMEND_AREA_IDS)[number];
+
+/**
+ * The pure half of amend mode: what each area is called, what choosing it asks,
+ * and what it says right now.
+ *
+ * `describe` is the reason the pick-list is worth anything — an operator picking
+ * blind from eight nouns cannot tell which one holds the setting they came to
+ * change, so every row carries its own current value. It reads only the config,
+ * so the whole menu can be rendered and reviewed without a terminal.
+ */
+export const AMEND_AREAS: {
+  readonly [K in AmendAreaId]: {
+    readonly name: string;
+    readonly asks: string;
+    readonly describe: (p: ProjectConfig) => string;
+  };
+} = {
+  tracker: {
+    name: "tracker & repos",
+    asks: "tracker repo, queue and state labels, routing prefix, then every routed repo with its gates",
+    describe: (p) => {
+      const names = Object.values(p.routing.repos).map((r) => r.name);
+      return (
+        `${p.tracker.repo}, queue "${p.queueLabel}", ` +
+        `"${p.routing.labelPrefix}" → ${names.join(", ") || "no repos"}`
+      );
+    },
+  },
+  gates: {
+    name: "gates",
+    asks: "the pre-push commands for each configured repo, and nothing else",
+    describe: (p) => {
+      const repos = Object.values(p.routing.repos);
+      if (repos.length === 0) return "no repos configured";
+      return repos.map((r) => `${r.name}: ${r.gates.length === 0 ? "none" : formatGates(r.gates)}`).join("; ");
+    },
+  },
+  caps: {
+    // The model rides with the caps because it is the other per-worker knob, and
+    // an area no menu offers is a setting only a full re-interview can reach.
+    name: "caps & worker model",
+    asks: "concurrency, spend, turns, wall clock, attempts per issue — then the worker model",
+    describe: (p) => {
+      const c = resolveCaps(p, DEFAULT_CAPS);
+      const answered = Object.keys(p.caps).length > 0;
+      return (
+        `${c.maxConcurrentWorkers} workers, ${c.workerMaxTurns} turns, ` +
+        `${Math.round(c.workerWallClockMs / 60000)}m, $${c.dailySpendUsd}/day, ` +
+        `${c.maxAttemptsPerIssue} attempts${answered ? "" : " (all defaults)"} — ` +
+        `${p.workerModel === undefined ? "harness default model" : `model ${p.workerModel}`}`
+      );
+    },
+  },
+  graph: {
+    name: "code graph",
+    asks: "whether workers query a code-graph index, and the root its one-clone-per-repo lives under",
+    describe: (p) => {
+      const graphed = graphRepos(p);
+      const first = graphed[0];
+      if (first === undefined) return "not configured — workers grep";
+      return `${dirname(first.graphProject)} — ${graphed.length} clone(s): ${graphed.map((r) => r.name).join(", ")}`;
+    },
+  },
+  authority: {
+    name: "authority",
+    asks: "who lands green PRs, and who cuts releases",
+    describe: (p) => `merge=${p.authority.merge}, release=${p.authority.release}`,
+  },
+  escalation: {
+    name: "escalation & triage",
+    asks: "the tier-2 Telegram chat, whether escalations also comment, and where the orchestrator session lives",
+    describe: (p) =>
+      [
+        p.escalation.telegramChatId === undefined
+          ? "tier 2 by issue comment only"
+          : `tier 2 pages Telegram ${p.escalation.telegramChatId}`,
+        p.escalation.fallbackToIssueComment ? "comments too" : "no comment fallback",
+        `triage ${p.escalation.orchestrator}`,
+      ].join(", "),
+  },
+  reporting: {
+    name: "reporting scope",
+    asks: "how much the orchestrator says unprompted",
+    describe: (p) => {
+      const scope = p.reporting?.scope ?? DEFAULT_REPORT_SCOPE;
+      const choice = REPORT_SCOPE_CHOICES.find((c) => c.scope === scope);
+      return `${scope} — ${choice?.description ?? "unknown scope"}`;
+    },
+  },
+  brief: {
+    name: "orchestrator brief",
+    asks: `whether to render ${ORCHESTRATOR_BRIEF_NAME} — the one area that writes no config key`,
+    describe: (p) => {
+      const path = briefPathForProject(p);
+      return existsSync(path) ? `written at ${path}` : `none at ${path}`;
+    },
+  },
+};
+
+/**
+ * How much of a current value fits on a menu row before it costs more than it
+ * tells. Chosen so a four-repo fleet's tracker row — the longest one worth
+ * keeping whole — survives intact. The full text is never lost either way: the
+ * amend summary prints it unelided, and the area's own prompts pre-fill from it.
+ */
+const AMEND_LABEL_MAX = 96;
+
+/**
+ * The amend pick-list, rendered.
+ *
+ * The label carries the current value because the harness's select resolves to
+ * the label it showed, so the row an operator picked has to be recognisable from
+ * its own text alone — and it is the value, not the noun, that tells them
+ * whether this is the row they came for.
+ */
+export function amendChoices(p: ProjectConfig): { id: AmendAreaId; label: string; description: string }[] {
+  return AMEND_AREA_IDS.map((id) => {
+    const area = AMEND_AREAS[id];
+    const current = area.describe(p);
+    return {
+      id,
+      label: `${area.name} — ${current.length > AMEND_LABEL_MAX ? `${current.slice(0, AMEND_LABEL_MAX - 1).trimEnd()}…` : current}`,
+      description: area.asks,
+    };
+  });
+}
+
+/**
+ * What an amend leads its consent screen with: the area, what it said, what it
+ * would say, and the seven areas nobody was asked about.
+ *
+ * The whole plan still follows this, because the confirm has to name every
+ * mutation it authorises — creating labels, writing the config, replacing a
+ * brief — and a delta alone names none of them. What this adds is the sentence
+ * the operator is actually looking for: one area changed, everything else came
+ * back off disk.
+ */
+export function summariseAmend(area: AmendAreaId, before: ProjectConfig, a: SetupAnswers): string {
+  const it = AMEND_AREAS[area];
+  const was = it.describe(before);
+  // The brief is a decision, not a config key, so its "after" is what the wizard
+  // is about to do rather than what a rebuilt project would say.
+  const now =
+    area === "brief"
+      ? a.writeOrchestratorBrief
+        ? `would ${existsSync(orchestratorBriefPath(a)) ? "OVERWRITE" : "write"} ${orchestratorBriefPath(a)}`
+        : "not written — left exactly as it is"
+      : it.describe(buildProject(a));
+
+  const others = AMEND_AREA_IDS.filter((o) => o !== area).map((o) => AMEND_AREAS[o].name);
+  const lines = [`amending       ${it.name}  —  project ${before.name}`];
+  if (was === now) {
+    lines.push(`  no change      ${was}`, "                 you answered through without changing anything here");
+  } else {
+    lines.push(`  was            ${was}`, `  now            ${now}`);
+  }
+  lines.push(
+    `  carried over   ${others.join(", ")}`,
+    `                 read back from ${configPath()} and rewritten unchanged`,
+    "",
+    "The whole project as it would then be written:",
+    "",
+  );
   return lines.join("\n");
 }
