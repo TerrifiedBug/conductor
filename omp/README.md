@@ -355,8 +355,11 @@ a yes over Telegram, which is the same protocol it uses for any other amendment.
    omp-conductor daemon --once
    ```
 
-The loop ticks every 5 minutes. `omp-conductor stop` sends `SIGTERM`, and the loop
-shuts down after the current tick rather than mid-run.
+The loop ticks every 5 minutes. `omp-conductor stop` shuts the loop down after
+the current tick rather than mid-run. When the live process is the MainPID of
+`omp-conductor.service`, stop goes through `systemctl stop` so a unit with
+`Restart=on-failure` cannot bring it straight back; otherwise it is a raw
+`SIGTERM` (then `SIGKILL` after 10 seconds).
 
 ## How one tick works
 
@@ -1094,8 +1097,8 @@ omp-conductor help
 | Command | Behaviour |
 | --- | --- |
 | `start` | Spawn the loop in the background, detached, and wait until it answers `GET /healthz` on `:8787`. Refuses if one is already live, naming its pid. If the process dies or never serves, `start` cleans up after it and quotes the tail of `daemon.log`. |
-| `stop` | `SIGTERM`, then `SIGKILL` after a 10-second grace period. Prints `not running` when there is nothing to stop. |
-| `restart` | `stop` then `start`, inheriting the running daemon's port and project unless a flag overrides them. The new process **salvages dirty live worktrees before orphaning** those rows — see [Deploying a new package onto a busy fleet](#deploying-a-new-package-onto-a-busy-fleet). |
+| `stop` | Prefer `systemctl stop omp-conductor.service` when that unit's MainPID is the live daemon — systemd then owns the stop and will not schedule a restart for the exit it just requested. Otherwise `SIGTERM`, then `SIGKILL` after a 10-second grace period. Prints `not running` when there is nothing to stop, and tags the confirmation with `(via systemctl)` when the unit path was used. |
+| `restart` | Prefer `systemctl restart` when the unit owns the live pid so the replacement stays supervised; otherwise `stop` then `start`, inheriting the running daemon's port and project unless a flag overrides them. The new process **salvages dirty live worktrees before orphaning** those rows — see [Deploying a new package onto a busy fleet](#deploying-a-new-package-onto-a-busy-fleet). |
 | `status [--project NAME]` | Pause state, config and state paths, resolved caps, active runs and today's usage, plus a `daemon` block: pid, uptime, port, project, `/healthz` result and log path. While live workers > 0, prints a `deploy` line naming the count so a busy restart is visible before you take it. A `.conductor-stalled` marker in the state directory adds an `orchestrator   STALLED since …` line — see [the stall marker](#a-wedged-session-and-the-marker-that-notices). Reads while a daemon in another process writes. |
 | `tail <issue>` | Follow the newest run for that issue: the worker's assistant text as `assistant: …` and each tool it calls as `tool: <name>`, printed as they land. Workers are omp sessions inside the daemon rather than terminals, so this is the only way to watch one live — a herdr pane running it becomes an observation window. Starts from the top of the transcript, not the end, so attaching to a run that is already ten turns in shows those ten turns. Exits `1` with `no run recorded for #N` when the issue has never been dispatched, or `no transcript yet (state: …)` when the attempt has not opened one. Otherwise it runs until `Ctrl-C`, or until the run has finished and its transcript has been silent for five seconds, and prints `run ended: <state>`. |
 | `unblock <issue>` | Remove that issue's `blocked` and `failed` state labels through the tracker, so the next tick can claim it again. This is the supported way back for an escalation you answered: eligibility disqualifies any issue carrying a state label, so an answered issue that keeps one is never re-claimed and the answer is inert. Removing a label the issue does not carry is a no-op, so both are always cleared and neither has to be looked up first. `agent:in-progress` is deliberately not touched — it means a worker process exists, which is not something an answer changes. The run history is left exactly as it is: an answered block still spent a worker, so it still counts toward `maxAttemptsPerIssue`, and the output says how many attempts remain — or warns that the next tick will escalate instead of dispatching, when none do. Exits `2` with `unblock needs an issue number` on a missing or malformed positional. |
@@ -1216,10 +1219,14 @@ Known and deliberate in this version:
   retried rather than corrupted.
 - **Mirrors grow one branch ref per run.** Unpushed work is never discarded, so
   refs accumulate until you reap them.
-- **`stop` is a deadline, not a clean drain.** `SIGTERM` asks the loop to finish the
-  tick it is on, and a tick with a worker in flight can run for that worker's whole
-  wall clock; after 10 seconds it is `SIGKILL`. There is no "stop once the current
-  worker lands".
+- **`stop` is a deadline, not a clean drain.** Whether it goes through
+  `systemctl` or a raw signal, the loop is asked to finish the tick it is on, and
+  a tick with a worker in flight can run for that worker's whole wall clock; the
+  signal path escalates to `SIGKILL` after 10 seconds. There is no "stop once the
+  current worker lands". A unit that supervises the daemon should set
+  `SuccessExitStatus=0 143` (belt-and-braces for a handled `SIGTERM` exit) and
+  operators should prefer `omp-conductor stop` / `systemctl stop` over a raw
+  `kill`, so `Restart=on-failure` cannot misread a deliberate stop as a crash.
 - **A failed orchestrator degrades quietly.** The daemon logs a warning and keeps
   running, but tier-1 escalations then land in issue comments — which is exactly the
   "nobody reads it until morning" path the orchestrator exists to avoid. The warning

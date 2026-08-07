@@ -1301,5 +1301,11 @@ export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
     await orchestrator?.dispose();
     store.close();
     log("stopped");
+    // A handled SIGTERM still leaves some runtimes with a non-zero default
+    // (historically 128+signal). Under systemd `Restart=on-failure` that looks
+    // like a crash and the unit comes straight back — the exact failure mode
+    // `omp-conductor stop` hit on the reference fleet. Force success so a
+    // graceful drain is not a restart.
+    process.exitCode = 0;
   }
 }

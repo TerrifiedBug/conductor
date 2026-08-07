@@ -16,6 +16,7 @@ import {
   DEFAULT_PORT,
   healthCheck,
   livingDaemon,
+  restartDaemon,
   startDaemon,
   stopDaemon,
   writeRecord,
@@ -46,11 +47,14 @@ usage:
   start    run the dispatch loop in the background and wait until it answers
            GET /healthz on :8787 (override with --port). Refuses if one is
            already running.
-  stop     signal the running daemon and wait for it to exit.
+  stop     stop the running daemon. Uses systemctl when the omp-conductor
+           unit owns the process (so Restart=on-failure cannot bring it back);
+           otherwise SIGTERM then SIGKILL.
   restart  stop then start, keeping the running daemon's port and project
            unless a flag overrides them. On boot the new process salvages any
            dirty live worktrees before orphaning those rows — see README
-           "Deploying a new package onto a busy fleet".
+           "Deploying a new package onto a busy fleet". Goes through systemctl
+           when the unit owns the live pid.
   status   show pause state, caps, active runs, today's usage, and whether a
            daemon is alive.
   tail     follow the newest run for <issue>: the worker's assistant text and
@@ -400,27 +404,35 @@ try {
     }
 
     case "stop": {
-      // Read the pid before it stops existing, so the confirmation can name it.
-      const pid = livingDaemon()?.pid;
       const result = await stopDaemon();
-      process.stdout.write(result === "stopped" ? `stopped — pid ${pid ?? "?"}\n` : "not running\n");
+      if (result.kind === "not-running") {
+        process.stdout.write("not running\n");
+      } else {
+        process.stdout.write(
+          `stopped — pid ${result.pid}${result.via === "systemctl" ? " (via systemctl)" : ""}\n`,
+        );
+      }
       break;
     }
 
     case "restart": {
       // Inherit the running daemon's port and project: a restart that quietly
       // moved to the default port would leave every existing health check
-      // pointing at nothing.
-      const previous = livingDaemon();
-      const result = await stopDaemon();
-      if (result === "stopped") process.stdout.write(`stopped — pid ${previous?.pid ?? "?"}\n`);
-      const rec = await startDaemon({
-        port: portFlag(argv) ?? previous?.port,
-        project: flag(argv, "project") ?? previous?.project,
+      // pointing at nothing. When the unit owns the live pid, restartDaemon
+      // goes through systemctl so the replacement stays supervised.
+      const { previous, record, via } = await restartDaemon({
+        port: portFlag(argv),
+        project: flag(argv, "project"),
       });
+      if (previous !== undefined) {
+        process.stdout.write(
+          `stopped — pid ${previous.pid}${via === "systemctl" ? " (via systemctl)" : ""}\n`,
+        );
+      }
       process.stdout.write(
-        `started — pid ${rec.pid}, /healthz on :${rec.port}` +
-          `${rec.project === undefined ? "" : `, project ${rec.project}`}\nlog ${rec.logFile}\n`,
+        `started — pid ${record.pid}, /healthz on :${record.port}` +
+          `${record.project === undefined ? "" : `, project ${record.project}`}` +
+          `${via === "systemctl" ? " (via systemctl)" : ""}\nlog ${record.logFile}\n`,
       );
       break;
     }

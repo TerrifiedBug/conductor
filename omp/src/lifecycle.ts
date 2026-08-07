@@ -10,15 +10,29 @@
  * operator real time are `start` refusing against a ghost and `status`
  * reporting a daemon that died hours ago.
  *
+ * When the live pid is the MainPID of the `omp-conductor.service` unit,
+ * `stop`/`restart` go through `systemctl` rather than a raw `SIGTERM`. A
+ * raw signal against a unit with `Restart=on-failure` is read as a crash and
+ * the unit comes straight back — the bug that made `omp-conductor stop` look
+ * like a no-op on a systemd-managed host.
+ *
  * Deliberately free of every other module in this package: nothing here opens
  * the store, loads the config or talks to `gh`, so `stop` and `status` keep
  * working when the config is the very thing that is broken.
  */
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+
+/**
+ * The systemd unit name operators are expected to install for a supervised
+ * daemon. Hardcoded rather than configured: one name on the host is the
+ * whole point of a unit, and a wrong name would silently fall back to the
+ * SIGTERM path and reintroduce the restart loop this module exists to avoid.
+ */
+export const SYSTEMD_UNIT = "omp-conductor.service";
 
 /**
  * Mirrors `DEFAULT_PORT` in ./daemon.ts. Duplicated rather than imported so
@@ -271,23 +285,67 @@ export async function startDaemon(o: { port?: number; project?: string } = {}): 
 }
 
 /**
- * Stops the daemon: `SIGTERM`, wait, then `SIGKILL`.
- *
- * `SIGTERM` asks the loop to finish the tick it is on, and a tick that has a
- * worker in flight can run for the worker's whole wall clock. The grace period
- * is therefore a deadline, not a promise of a clean drain.
- * // ponytail: no way to say "stop when the current worker lands". If that
- * // matters, take a `--timeout` on the CLI verb, or poll `activeRuns` before
- * // escalating.
+ * How the last stop actually landed. Callers print this so an operator can
+ * tell a supervised stop from a bare SIGTERM without reading the journal.
  */
-export async function stopDaemon(o: { timeoutMs?: number } = {}): Promise<"stopped" | "not-running"> {
+export type StopResult =
+  | { kind: "stopped"; pid: number; via: "systemctl" | "signal" }
+  | { kind: "not-running" };
+
+/**
+ * Stops the daemon.
+ *
+ * Prefer `systemctl stop omp-conductor.service` when that unit's MainPID is
+ * the live daemon: systemd then owns the stop and will not schedule a restart
+ * for the exit it just requested. A raw `SIGTERM` against a unit with
+ * `Restart=on-failure` is what made `omp-conductor stop` look like a no-op on
+ * the reference fleet — exit 143 was a "failure", and the unit came back five
+ * seconds later.
+ *
+ * Falls back to `SIGTERM` then `SIGKILL` when there is no unit, the unit is
+ * not running, or its MainPID is somebody else (a hand-started daemon next to
+ * a stopped unit). The grace period is a deadline, not a clean drain: a tick
+ * with a worker in flight can run for that worker's whole wall clock.
+ */
+export async function stopDaemon(o: { timeoutMs?: number } = {}): Promise<StopResult> {
   const rec = livingDaemon();
   if (rec === undefined) {
     // `livingDaemon` already cleared a stale file; this covers the unparseable
-    // one it refused to read.
+    // one it refused to read. Still ask systemd: a unit can be running with
+    // no pidfile (boot race, wiped runtime dir) and stop must still land.
+    const unitPid = systemdMainPid();
+    if (unitPid !== undefined && (await stopViaSystemd(undefined))) {
+      const deadline = Date.now() + (o.timeoutMs ?? STOP_TIMEOUT_MS);
+      while (isAlive(unitPid) && Date.now() < deadline) await sleep(100);
+      if (isAlive(unitPid)) {
+        throw new Error(
+          `daemon pid ${unitPid} still alive after systemctl stop ${SYSTEMD_UNIT} — ` +
+            `check \`systemctl status ${SYSTEMD_UNIT}\``,
+        );
+      }
+      clearRecord();
+      return { kind: "stopped", pid: unitPid, via: "systemctl" };
+    }
     clearRecord();
-    return "not-running";
+    return { kind: "not-running" };
   }
+
+  if (await stopViaSystemd(rec.pid)) {
+    // Wait out the unit: systemctl stop is synchronous for Type=simple, but
+    // a slow drain still holds the old pid briefly and the next start would
+    // refuse against it.
+    const deadline = Date.now() + (o.timeoutMs ?? STOP_TIMEOUT_MS);
+    while (isAlive(rec.pid) && Date.now() < deadline) await sleep(100);
+    if (isAlive(rec.pid)) {
+      throw new Error(
+        `daemon pid ${rec.pid} still alive after systemctl stop ${SYSTEMD_UNIT} — ` +
+          `check \`systemctl status ${SYSTEMD_UNIT}\``,
+      );
+    }
+    clearRecord();
+    return { kind: "stopped", pid: rec.pid, via: "systemctl" };
+  }
+
   const gone = await terminate(rec.pid, o.timeoutMs ?? STOP_TIMEOUT_MS);
   if (!gone) {
     // The record stays: something is still holding that pid, and forgetting
@@ -295,12 +353,145 @@ export async function stopDaemon(o: { timeoutMs?: number } = {}): Promise<"stopp
     throw new Error(`daemon pid ${rec.pid} survived SIGTERM and SIGKILL — it may belong to another user`);
   }
   clearRecord();
-  return "stopped";
+  return { kind: "stopped", pid: rec.pid, via: "signal" };
+}
+
+/**
+ * Restarts the daemon.
+ *
+ * Same ownership rule as {@link stopDaemon}: when the unit owns the live pid,
+ * `systemctl restart` keeps systemd in charge of the replacement process so
+ * the new MainPID is still the unit's. Falling back to stop+start for a
+ * hand-started daemon would leave the unit dead and the new process
+ * unsupervised — fine for a laptop, wrong for the host that installed a unit
+ * specifically so a crash comes back.
+ *
+ * Returns the record of the process that is now answering `/healthz`.
+ */
+export async function restartDaemon(
+  o: { port?: number; project?: string; timeoutMs?: number } = {},
+): Promise<{ previous: DaemonRecord | undefined; record: DaemonRecord; via: "systemctl" | "cli" }> {
+  const previous = livingDaemon();
+  const unitPid = systemdMainPid();
+  const unitOwns =
+    unitPid !== undefined && (previous === undefined || previous.pid === unitPid);
+
+  if (unitOwns) {
+    const ran = systemctl(["restart", SYSTEMD_UNIT]);
+    if (ran.ok) {
+      // systemctl restart returns once the new MainPID is up; the pidfile is
+      // written by the daemon itself on boot, so wait for that rather than
+      // inventing a record from the unit alone.
+      const deadline = Date.now() + READY_TIMEOUT_MS;
+      for (;;) {
+        const rec = livingDaemon();
+        if (rec !== undefined) {
+          const health = await healthCheck(rec.port);
+          if (health.ok) return { previous, record: rec, via: "systemctl" };
+        }
+        if (Date.now() >= deadline) break;
+        await sleep(READY_POLL_MS);
+      }
+      throw new Error(
+        `systemctl restart ${SYSTEMD_UNIT} returned, but the daemon never answered /healthz`,
+      );
+    }
+    // Unit exists and owns the pid but systemctl refused (permissions, dbus
+    // down). Fall through to the signal path rather than stranding the
+    // operator with "restart failed" and a still-running daemon they cannot
+    // reach through the unit.
+  }
+
+  await stopDaemon({ timeoutMs: o.timeoutMs });
+  const record = await startDaemon({ port: o.port ?? previous?.port, project: o.project ?? previous?.project });
+  return { previous, record, via: "cli" };
+}
+
+/**
+ * The MainPID of {@link SYSTEMD_UNIT}, or `undefined` when systemd is absent,
+ * the unit is unknown, or it is not running. Never throws: a missing binary
+ * or a dbus blip is "no unit", and stop falls back to SIGTERM.
+ */
+export function systemdMainPid(unit = SYSTEMD_UNIT): number | undefined {
+  const ran = systemctl(["show", unit, "--property=MainPID", "--property=ActiveState", "--value"]);
+  if (!ran.ok) return undefined;
+  // `systemctl show --value` prints one property per line, MainPID then
+  // ActiveState, in the order requested. Tolerate either order and blank
+  // lines so a future systemctl rearrange does not silently disable the path.
+  const lines = ran.stdout
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+  let pid: number | undefined;
+  let active: string | undefined;
+  for (const line of lines) {
+    if (/^\d+$/.test(line)) {
+      const n = Number(line);
+      if (Number.isInteger(n) && n > 1) pid = n;
+    } else {
+      active = line;
+    }
+  }
+  if (active !== undefined && active !== "active" && active !== "reactivating") return undefined;
+  return pid;
 }
 
 // ---------------------------------------------------------------------------
 // internals
 // ---------------------------------------------------------------------------
+
+/**
+ * Ask systemd to stop the unit, but only when it actually owns `pid`.
+ *
+ * `pid === undefined` means "no pidfile" — still stop the unit if it is
+ * active, because that is the only process that could be the daemon. A unit
+ * whose MainPID is some other process is left alone: stopping it would take
+ * down a neighbour, and the signal path handles *our* pid.
+ */
+async function stopViaSystemd(pid: number | undefined): Promise<boolean> {
+  const main = systemdMainPid();
+  if (main === undefined) return false;
+  if (pid !== undefined && main !== pid) return false;
+  const ran = systemctl(["stop", SYSTEMD_UNIT]);
+  return ran.ok;
+}
+
+/**
+ * Run one `systemctl` invocation. Captures output and never throws: absence
+ * of the binary, a missing unit, or a permission error are all "not ok", and
+ * the caller decides whether to fall back.
+ *
+ * The default shells out. Tests replace it with {@link setSystemctlForTest}
+ * so the ownership decision is exercised without a real systemd.
+ */
+export type SystemctlFn = (args: string[]) => { ok: boolean; stdout: string; stderr: string };
+
+function defaultSystemctl(args: string[]): { ok: boolean; stdout: string; stderr: string } {
+  try {
+    const res = spawnSync("systemctl", args, {
+      encoding: "utf8",
+      // A hung dbus is not worth blocking stop on; the signal path is right there.
+      timeout: 15_000,
+      env: process.env,
+    });
+    if (res.error) return { ok: false, stdout: "", stderr: res.error.message };
+    return {
+      ok: res.status === 0,
+      stdout: res.stdout ?? "",
+      stderr: res.stderr ?? "",
+    };
+  } catch (err) {
+    return { ok: false, stdout: "", stderr: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+let systemctl: SystemctlFn = defaultSystemctl;
+
+/** Test-only: replace the `systemctl` runner. Pass `undefined` to restore. */
+export function setSystemctlForTest(fn: SystemctlFn | undefined): void {
+  systemctl = fn ?? defaultSystemctl;
+}
+
 
 function sleep(ms: number): Promise<void> {
   return new Promise<void>((resolve) => {
