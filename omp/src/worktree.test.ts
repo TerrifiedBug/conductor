@@ -245,9 +245,15 @@ describe("salvageWip", () => {
       // On the branch, not merely in the object database: the branch is what
       // survives `worktree remove --force` and what the next attempt reattaches.
       expect(git(["rev-parse", branch], tree)).toBe(outcome.sha);
+      expect(outcome.files).toEqual([SEED_FILE, "detection_pipeline.py"]);
+      expect(outcome.newPaths).toEqual(["detection_pipeline.py"]);
       expect(git(["log", "-1", "--format=%s", branch], tree)).toBe(
         "wip(#606): attempt 1 killed by the turns cap — auto-salvaged",
       );
+      expect(git(["log", "-1", "--format=%b", branch], tree)).toContain(
+        "2 files. New (untracked before salvage):",
+      );
+      expect(git(["log", "-1", "--format=%b", branch], tree)).toContain("detection_pipeline.py");
       expect(git(["show", "--name-only", "--format=", outcome.sha], tree).split("\n")).toEqual([
         SEED_FILE,
         "detection_pipeline.py",

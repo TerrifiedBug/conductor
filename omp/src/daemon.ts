@@ -393,13 +393,22 @@ export function salvageLines(outcome: SalvageOutcome, worktree: string): string[
     ];
   }
 
-  return [
+  const where =
     `WIP committed to ${outcome.branch} @ ${outcome.sha}` +
-      (outcome.pushed
-        ? " and pushed — the work outlives this worktree"
-        : ` but NOT pushed (${outcome.pushError ?? "no reason given"}) — it lives only in this host's mirror`),
-    kept,
-  ];
+    (outcome.pushed
+      ? " and pushed — the work outlives this worktree"
+      : ` but NOT pushed (${outcome.pushError ?? "no reason given"}) — it lives only in this host's mirror`);
+  // Manifest belongs in the escalation too: opening the commit is how the
+  // orchestrator talked itself into scrubbing a worker tree (#38).
+  const n = outcome.files.length;
+  const count = `${n} file${n === 1 ? "" : "s"}`;
+  const manifest =
+    outcome.newPaths.length === 0
+      ? `${count} (all modifications to tracked paths)`
+      : `${count}; new: ${outcome.newPaths.slice(0, 12).join(", ")}${
+          outcome.newPaths.length > 12 ? `, … +${outcome.newPaths.length - 12} more` : ""
+        }`;
+  return [where, manifest, kept];
 }
 
 /**
