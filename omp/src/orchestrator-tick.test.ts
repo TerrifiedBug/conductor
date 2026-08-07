@@ -947,7 +947,7 @@ test("herdr's agent list parses through its envelope, and a null name is no name
   expect(parseHerdrAgents('{"result":{}}').kind).toBe("unavailable");
 });
 
-test("a herdr that does not answer declines rather than assuming this pane is the fleet", () => {
+test("a herdr that does not answer is unresolved, not declined — the difference is retryability", () => {
   const decision = resolveTickOwnership({
     cwd,
     agentName: "fleet",
@@ -957,9 +957,12 @@ test("a herdr that does not answer declines rather than assuming this pane is th
     listAgents: () => ({ kind: "unavailable", problem: "socket refused" }),
   });
 
+  // Both outcomes refuse to tick. Only this one may be retried: herdr failing to
+  // answer says nothing about who this pane is, so latching it would let a
+  // single CLI timeout stop the real orchestrator until a human restarts it.
   expect(decision).toEqual({
-    kind: "declined",
-    reason: 'cannot prove this pane is the fleet agent "fleet" — socket refused — this session will not tick',
+    kind: "unresolved",
+    reason: 'cannot yet prove this pane is the fleet agent "fleet" — socket refused — not ticking until it can',
   });
   // And it wrote no claim: under herdr the pane name is the answer, and a claim
   // file would be a second, disagreeing source of truth.
@@ -1064,7 +1067,7 @@ test("under herdr, the expected agent name comes from the activation config", ()
   expect(pi.intervals).toHaveLength(1);
 });
 
-test("a `herdr agent list` that exits non-zero stops the heartbeat and quotes it", () => {
+test("a `herdr agent list` that exits non-zero withholds the heartbeat but keeps asking", () => {
   writeTickConfig({ intervalSeconds: 600 });
   process.env["HERDR_ENV"] = "1";
   process.env["HERDR_PANE_ID"] = "w1:p1";
@@ -1074,8 +1077,62 @@ test("a `herdr agent list` that exits non-zero stops the heartbeat and quotes it
   orchestratorTickExtension(pi);
   pi.start();
 
-  expect(pi.intervals).toHaveLength(0);
-  expect(pi.logs.join("\n")).toContain("cannot prove this pane is the fleet agent");
+  // One interval, and it is the ownership retry — not the heartbeat. An
+  // unproven identity still must not tick.
+  expect(pi.intervals).toHaveLength(1);
+  expect(pi.logs.join("\n")).toContain("cannot yet prove this pane is the fleet agent");
+  expect(pi.logs.join("\n")).toContain("tick pending");
+  expect(pi.logs.join("\n")).not.toContain("tick active");
+});
+
+test("a herdr blip costs a retry, not the fleet: the heartbeat arms once it answers", () => {
+  // The regression this exists for. Ownership used to latch on any failure, so a
+  // single 3-second CLI timeout at session start disabled the real orchestrator
+  // until a human noticed and restarted the pane — silent, and indistinguishable
+  // from a fleet that was never meant to tick.
+  writeTickConfig({ intervalSeconds: 600 });
+  process.env["HERDR_ENV"] = "1";
+  process.env["HERDR_PANE_ID"] = "w1:p1";
+  process.env["HERDR_BIN_PATH"] = fakeHerdrBin('{"error":"socket refused"}', 2);
+  const pi = fakeHost();
+
+  orchestratorTickExtension(pi);
+  pi.start();
+  expect(pi.intervals).toHaveLength(1); // the retry only
+
+  // herdr comes back, and this pane is the fleet.
+  process.env["HERDR_BIN_PATH"] = fakeHerdrBin(agentListJson([{ pane: "w1:p1", name: "fleet" }]));
+  pi.intervals[0]?.callback();
+
+  expect(pi.intervals).toHaveLength(2); // heartbeat armed
+  expect(pi.logs.join("\n")).toContain("ownership resolved on retry");
+
+  // And the retry disarms itself rather than arming a second heartbeat: the
+  // harness owns timer lifecycle, so this is a flag, not a clearInterval.
+  pi.intervals[0]?.callback();
+  expect(pi.intervals).toHaveLength(2);
+});
+
+test("a retry that proves this pane is NOT the fleet latches, and never arms", () => {
+  writeTickConfig({ intervalSeconds: 600 });
+  process.env["HERDR_ENV"] = "1";
+  process.env["HERDR_PANE_ID"] = "w1:p5";
+  process.env["HERDR_BIN_PATH"] = fakeHerdrBin('{"error":"socket refused"}', 2);
+  const pi = fakeHost();
+
+  orchestratorTickExtension(pi);
+  pi.start();
+
+  process.env["HERDR_BIN_PATH"] = fakeHerdrBin(agentListJson([{ pane: "w1:p1", name: "fleet" }]));
+  pi.intervals[0]?.callback();
+
+  expect(pi.intervals).toHaveLength(1); // still just the retry; no heartbeat
+  expect(pi.logs.join("\n")).toContain("owns the fleet tick here");
+
+  // Definitive, so it stops asking — a rival must not keep re-testing its luck.
+  const before = pi.logs.length;
+  pi.intervals[0]?.callback();
+  expect(pi.logs).toHaveLength(before);
 });
 
 test("with no herdr at all, a lone session behaves exactly as it did — and records its claim", () => {

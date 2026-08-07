@@ -60,6 +60,16 @@ export const TICK_CUSTOM_TYPE = "omp-conductor.tick";
 export const MIN_INTERVAL_SECONDS = 60;
 
 /**
+ * How often to re-ask who owns the fleet tick after herdr failed to answer.
+ *
+ * Retrying rather than latching is the whole point: a declined identity is
+ * permanent, an unanswered one is a blip. Cheap enough to run every minute — one
+ * short-lived `herdr agent list` — and it stops the moment the answer is
+ * definitive, either way.
+ */
+const RETRY_OWNERSHIP_MS = 60_000;
+
+/**
  * The stall marker — written beside the activation file, in the session cwd —
  * and the number of consecutive coalesced ticks that earn it.
  *
@@ -428,7 +438,17 @@ export type HerdrAgentList =
  */
 export type TickOwnership =
   | { kind: "owner"; note?: string }
-  | { kind: "declined"; reason: string };
+  /** Proven not to be the fleet's session. Permanent until this session ends. */
+  | { kind: "declined"; reason: string }
+  /**
+   * Could not be determined — herdr did not answer. Deliberately NOT `declined`:
+   * both refuse to tick, but only this one is worth retrying, and conflating
+   * them means a single 3-second CLI timeout silently disables the real
+   * orchestrator until someone restarts the pane. An unproven identity still
+   * must not tick; a heartbeat that stopped for a transient blip and never came
+   * back is the exact silent stall this package keeps having to fix.
+   */
+  | { kind: "unresolved"; reason: string };
 
 /**
  * `herdr agent list`, over the socket herdr injected into this pane's
@@ -669,14 +689,17 @@ export function resolveTickOwnership(input: {
     const list = (input.listAgents ?? readHerdrAgents)(input.env);
     if (list.kind === "ok") return paneOwnership({ paneId, agentName: input.agentName, agents: list.agents });
 
-    // Fail closed. Under herdr this session is one pane of possibly several in the
-    // fleet's directory, and an unproven identity is the case this whole check
-    // exists for; a second orchestrator with merge authority is worse than a
-    // heartbeat that stops and says why.
+    // Fail closed, but not forever. Under herdr this session is one pane of
+    // possibly several in the fleet's directory, and an unproven identity is the
+    // case this whole check exists for — so it does not tick. It is `unresolved`
+    // rather than `declined` because herdr not answering says nothing about who
+    // this pane is: the caller retries, and the moment herdr answers the real
+    // orchestrator arms. Latching here would mean one CLI timeout stops the
+    // fleet until a human notices and restarts the pane.
     return {
-      kind: "declined",
+      kind: "unresolved",
       reason:
-        `cannot prove this pane is the fleet agent "${input.agentName}" — ${list.problem} — this session will not tick`,
+        `cannot yet prove this pane is the fleet agent "${input.agentName}" — ${list.problem} — not ticking until it can`,
     };
   }
 
@@ -932,16 +955,53 @@ export default function orchestratorTickExtension(pi: TickApi): void {
     // held both. Asked after the config read because the config names the agent,
     // and before the timer because arming first is the bug.
     const agentName = config.agentName ?? DEFAULT_FLEET_AGENT_NAME;
-    const ownership = resolveTickOwnership({
-      cwd: ctx.cwd,
-      agentName,
-      env: process.env,
-      pid: process.pid,
-      now: new Date(),
-      ...(ctx.sessionManager.getSessionFile() === undefined
-        ? {}
-        : { sessionFile: ctx.sessionManager.getSessionFile() }),
-    });
+    const resolve = (): TickOwnership =>
+      resolveTickOwnership({
+        cwd: ctx.cwd,
+        agentName,
+        env: process.env,
+        pid: process.pid,
+        now: new Date(),
+        ...(ctx.sessionManager.getSessionFile() === undefined
+          ? {}
+          : { sessionFile: ctx.sessionManager.getSessionFile() }),
+      });
+
+    const ownership = resolve();
+
+    // Only a definitive answer is final. "You are not the fleet agent" cannot
+    // become untrue while this session lives, so it latches. "herdr did not
+    // answer" says nothing about identity, so it must not — otherwise one CLI
+    // timeout at session start is indistinguishable from a fleet that was never
+    // meant to tick, and the heartbeat is gone until a human notices.
+    if (ownership.kind === "unresolved") {
+      pi.logger.info(`[omp-conductor] orchestrator tick pending: ${ownership.reason}`, { agentName });
+      // Faster than the tick interval so a blip costs a minute rather than a
+      // whole cycle, and never slower than one — a fleet on a short interval
+      // should not wait longer to recover than it would to tick.
+      const retryMs = Math.min(RETRY_OWNERSHIP_MS, config.intervalSeconds * 1000);
+      // Disarmed by a flag, not `clearInterval`: `ctx.setInterval` hands back an
+      // opaque handle precisely because the harness owns timer lifecycle and
+      // clears them on `session_shutdown`. A settled retry is a no-op that costs
+      // one boolean per minute until the session ends.
+      let settled = false;
+      ctx.setInterval(() => {
+        if (settled) return;
+        const next = resolve();
+        if (next.kind === "unresolved") return; // already logged once; stay quiet
+        settled = true;
+        if (next.kind === "declined") {
+          pi.logger.info(`[omp-conductor] orchestrator tick inactive: ${next.reason}`, { agentName });
+          return;
+        }
+        if (next.note !== undefined) pi.logger.error(`[omp-conductor] tick ownership: ${next.note}`);
+        ctx.setInterval(() => tick(pi, ctx, config, session), config.intervalSeconds * 1000);
+        pi.logger.info(`[omp-conductor] orchestrator tick active: ownership resolved on retry`, { agentName });
+      }, retryMs);
+      decided = true;
+      return;
+    }
+
     if (ownership.kind === "declined") {
       decided = true;
       pi.logger.info(`[omp-conductor] orchestrator tick inactive: ${ownership.reason}`, { agentName });
