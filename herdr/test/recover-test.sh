@@ -442,11 +442,13 @@ check 'live agent short-circuits' "ok: agent 'fleet' is live in pane w1:p1" "$ou
 assert_inert 'live agent short-circuits' "$d"
 
 # --------------------------------------------------------------------------
-# case 1b — the same live agent, but omp-conductor's tick has left a stall
-# marker in the fleet cwd: alive is not the same as working, so this pages
-# instead of short-circuiting. Regression for the 2026-08-07 wedge, where the
-# process and the label were both healthy for 23 minutes while the loop read
-# nothing off its queue.
+# case 1b — a stall marker in the fleet cwd does NOT change this hook's
+# verdict. The wedge case belongs to the daemon (omp/src/daemon.ts,
+# watchOrchestrator): this hook only runs on lifecycle events, so it could
+# never fire during a wedge, while it WOULD fire on the operator's own
+# recovery — the marker outlives a restart until the new session consumes a
+# tick. Pinned so the tempting check is not re-added without the process-start
+# comparison that would make it safe.
 # --------------------------------------------------------------------------
 
 d=$(newcase live-agent-stalled)
@@ -457,17 +459,9 @@ saved_session_json fleet "$REF" >"$d/session/session.json"
 live_agent_list fleet 'w1:p1' "$REF" >"$d/agent-list.json"
 process_info_omp 'w1:p1' >"$d/process-info-w1:p1.json"
 out=$(run_recover "$d")
-check 'a wedged live agent pages instead of reading as healthy' \
-  "page: agent 'fleet' is running in pane w1:p1 but its loop is wedged" "$out"
-assert_inert 'a wedged live agent pages instead of reading as healthy' "$d"
-
-# The marker is the only difference between this case and case 1: with it gone
-# the very same fixture must go back to short-circuiting, or the detector would
-# be pinning something other than the marker.
-rm "$d/fleet-cwd/.conductor-stalled"
-out=$(run_recover "$d")
-check 'clearing the marker restores the healthy verdict' \
+check 'a stall marker does not make this hook page about a live agent' \
   "ok: agent 'fleet' is live in pane w1:p1" "$out"
+assert_inert 'a stall marker does not make this hook page about a live agent' "$d"
 
 # --------------------------------------------------------------------------
 # case 2 — exactly one saved pane and one live pane: a resume plan

@@ -769,23 +769,30 @@ prompt was never consumed, and the extension:
 Both escapes deliberately leave the session, because a loop that cannot drain
 its queue cannot report on itself — that is the whole failure.
 
-**Two things read it.** A marker nobody consumes is an artifact, not an alert:
+**The daemon reads it.** A marker nobody consumes is an artifact, not an alert,
+so the dispatch daemon checks it on its own five-minute tick — and *before* its
+pause check. The orchestrator is a different process and can be wedged while
+the fleet is deliberately paused, which is precisely the state the dogfood
+fleet was in when this happened. One tier-2 page per stall, keyed on the
+marker's own timestamp so a second wedge the same day is not swallowed as a
+repeat, re-armed when the marker clears, and latched only once the page is
+confirmed delivered — an escalation channel that fails on the one tick that
+noticed must not buy permanent silence.
 
-- **The daemon**, on its own five-minute tick, and *before* its pause check. The
-  orchestrator is a different process and can be wedged while the fleet is
-  deliberately paused — precisely the state the dogfood fleet was in when this
-  happened. One tier-2 page per stall, dated, re-armed when the marker clears,
-  and latched only once the page is confirmed delivered, so an escalation
-  channel that fails on the one tick that noticed does not buy permanent
-  silence. It restarts nothing: a wedge lands mid-turn, and this process cannot
-  tell a half-applied edit from an idle loop.
-- **herdr-conductor's recovery**, which treats marker-present as *not live*. Its
-  liveness test — agent listed AND a non-shell foreground process — passes
-  straight through a wedge, so without this a recovery run certifies a stuck
-  session as healthy and returns "nothing to do".
+It restarts nothing. A wedge lands mid-turn, and no other process can tell a
+half-applied edit from an idle loop; the operator attaches, looks, and decides.
 
-The daemon is what covers a wedge beginning *between* herdr's lifecycle events,
-since a session that stays alive and stops working emits none of them.
+**herdr-conductor deliberately does not read it**, though its liveness test
+(agent listed AND a non-shell foreground process) passes straight through a
+wedge. That plugin only runs on `startup`, `pane.exited` and
+`pane.agent_detected`, and a session that stays alive and stops working emits
+none of them — so the check could never fire during the wedge itself. What it
+*would* catch is the recovery afterwards: the marker survives a restart until
+the new session consumes a tick, so every operator SIGTERM-and-resume would
+page about the healthy session they just fixed. Telling those apart needs the
+process start time against the marker's, and herdr's `pane process-info`
+reports pids, not start times. The daemon gives up at most one tick of
+coverage and never cries wolf.
 
 The first tick that actually sends clears the counter and deletes the marker,
 and it deletes one it did not write: recovery normally arrives as a fresh
