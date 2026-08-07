@@ -364,6 +364,19 @@ Four control planes used to answer "stop" differently. The package verbs:
 
 `status` prints a layered header (`dispatch` / `ticks` / `pane` / `recovery` / `herdr` / `daemon`) so a paused fleet cannot hide an armed orchestrator still spending turns.
 
+`halt --pane` is **fail-closed**: it exits `0` only when the conductor agent is
+*proven* gone. It writes the recovery pin first, so a failed stop still cannot be
+undone by `herdr-conductor` respawning the agent, and then refuses (nonzero exit,
+message on stderr) on every uncertainty:
+
+- `herdr agent list` unreachable, or the configured agent name is not unique
+- the claimed pane runs some other agent
+- `pane process-info` fails, or the claim is live `omp` but names no recognizable
+  omp foreground PID — "cannot see it" is never reported as "it is stopped"
+- the process is still alive after `SIGTERM` then `SIGKILL`
+
+Clear the pin with `omp-conductor release-pane` when you want recovery again.
+
 
 ## How one tick works
 

@@ -197,7 +197,8 @@ export interface HaltResult {
 
 export interface PaneStopResult {
   pinPath: string;
-  stopped: "herdr-agent" | "already-gone" | "unavailable";
+  /** How the pane was confirmed gone. Failures throw — never silent success. */
+  stopped: "herdr-agent" | "already-gone";
   detail: string;
   agentName: string;
 }
@@ -263,6 +264,8 @@ export interface PaneStopDeps {
   herdrSession?: string;
   signalPid?: (pid: number, sig: NodeJS.Signals) => boolean;
   isAlive?: (pid: number) => boolean;
+  /** Clock for deterministic deadline tests. */
+  now?: () => number;
   sleep?: (ms: number) => Promise<void>;
   listAgents?: () => Promise<HerdrAgent[]>;
   panePids?: (paneId: string) => Promise<number[]>;
@@ -271,6 +274,11 @@ export interface PaneStopDeps {
 /**
  * hold + pin recovery first + stop exact omp conductor agent.
  * Never systemctl stop herdr-fleet.
+ *
+ * Pin is written even when the pane stop throws — recovery stays off so a
+ * failed kill cannot be undone by herdr-conductor respawning the agent. The
+ * command still fails (throws) so operators never see a green "halted" while
+ * the pane is still alive.
  */
 export async function haltWithPane(
   projectName?: string,
@@ -278,10 +286,19 @@ export async function haltWithPane(
 ): Promise<HaltWithPaneResult> {
   const pin = pinPaneHalt(projectName);
   const result = await halt(projectName);
+  // Throws on uncertainty or if the agent survives SIGTERM+SIGKILL.
   const stopped = await stopConductorPane(projectName, deps);
   return { ...result, pane: { pinPath: pin.path, ...stopped } };
 }
 
+/**
+ * Stop the configured conductor agent only. Recovery must already be pinned.
+ *
+ * Success returns only when the pane is confirmed gone (`herdr-agent` or
+ * `already-gone`). Any uncertainty — herdr down, ambiguous identity, live omp
+ * claim with no recognized PID, process that survives SIGKILL — **throws**.
+ * Callers must not treat a thrown error as "maybe stopped".
+ */
 export async function stopConductorPane(
   projectName?: string,
   deps: PaneStopDeps = {},
@@ -290,6 +307,7 @@ export async function stopConductorPane(
   const agentName =
     tick.kind === "ok" && tick.config.agentName !== undefined ? tick.config.agentName : "fleet";
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const now = deps.now ?? Date.now;
   const signalPid =
     deps.signalPid ??
     ((pid: number, sig: NodeJS.Signals) => {
@@ -315,11 +333,11 @@ export async function stopConductorPane(
   try {
     agents = deps.listAgents ? await deps.listAgents() : await herdrAgentList(deps);
   } catch (err) {
-    return {
-      stopped: "unavailable",
-      detail: `herdr agent list failed — refusing to guess a pane (${err instanceof Error ? err.message : String(err)})`,
-      agentName,
-    };
+    throw new Error(
+      `halt --pane: herdr agent list failed — refusing to guess a pane ` +
+        `(${err instanceof Error ? err.message : String(err)}). ` +
+        `Recovery pin was written; fix herdr and re-run halt --pane or kill the agent by hand.`,
+    );
   }
 
   const matches = agents.filter((a) => a.name === agentName);
@@ -327,22 +345,25 @@ export async function stopConductorPane(
     return { stopped: "already-gone", detail: `no herdr agent named ${agentName}`, agentName };
   }
   if (matches.length > 1) {
-    return {
-      stopped: "unavailable",
-      detail: `refusing to stop: ${matches.length} herdr agents named ${agentName} — not unique`,
-      agentName,
-    };
+    throw new Error(
+      `halt --pane: refusing to stop — ${matches.length} herdr agents named ${agentName} (not unique). ` +
+        `Recovery pin was written; resolve the identity and re-run or kill by hand.`,
+    );
   }
   const claim = matches[0]!;
   if (claim.agent !== "omp") {
-    return {
-      stopped: claim.agent === undefined || claim.agent === "" ? "already-gone" : "unavailable",
-      detail:
-        claim.agent === undefined || claim.agent === ""
-          ? `agent ${agentName} pane ${claim.paneId} has no live agent label (sticky name only)`
-          : `agent ${agentName} pane ${claim.paneId} is ${claim.agent}, not omp — refusing`,
-      agentName,
-    };
+    if (claim.agent === undefined || claim.agent === "") {
+      // Sticky name after exit — herdr still lists the claim but no live agent.
+      return {
+        stopped: "already-gone",
+        detail: `agent ${agentName} pane ${claim.paneId} has no live agent label (sticky name only)`,
+        agentName,
+      };
+    }
+    throw new Error(
+      `halt --pane: agent ${agentName} pane ${claim.paneId} is ${claim.agent}, not omp — refusing. ` +
+        `Recovery pin was written.`,
+    );
   }
 
   let pids: number[];
@@ -351,25 +372,26 @@ export async function stopConductorPane(
       ? await deps.panePids(claim.paneId)
       : await herdrOmpForegroundPids(claim.paneId, deps);
   } catch (err) {
-    return {
-      stopped: "unavailable",
-      detail: `pane process-info failed for ${claim.paneId}: ${err instanceof Error ? err.message : String(err)}`,
-      agentName,
-    };
+    throw new Error(
+      `halt --pane: pane process-info failed for ${claim.paneId} ` +
+        `(${err instanceof Error ? err.message : String(err)}). ` +
+        `Live omp claim exists but PIDs are unknown — refusing to report success. Recovery pin was written.`,
+    );
   }
 
   const live = pids.filter((pid) => alive(pid));
   if (live.length === 0) {
-    return {
-      stopped: "already-gone",
-      detail: `agent ${agentName} pane ${claim.paneId} has no live omp foreground process`,
-      agentName,
-    };
+    // Live agent=omp claim but no recognizable omp PID: we cannot prove gone.
+    // Treating this as already-gone would exit 0 while the pane may still run.
+    throw new Error(
+      `halt --pane: agent ${agentName} pane ${claim.paneId} is live omp but no omp foreground PID ` +
+        `was recognized — refusing to report success. Recovery pin was written; inspect the pane and kill by hand if needed.`,
+    );
   }
 
   for (const pid of live) signalPid(pid, "SIGTERM");
-  const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline) {
+  const softDeadline = now() + 10_000;
+  while (now() < softDeadline) {
     if (!live.some((pid) => alive(pid))) {
       return {
         stopped: "herdr-agent",
@@ -379,12 +401,25 @@ export async function stopConductorPane(
     }
     await sleep(100);
   }
+
   for (const pid of live) signalPid(pid, "SIGKILL");
-  return {
-    stopped: "herdr-agent",
-    detail: `SIGKILL omp in agent ${agentName} pane ${claim.paneId} pids ${live.join(",")} after SIGTERM grace`,
-    agentName,
-  };
+  const hardDeadline = now() + 2_000;
+  while (now() < hardDeadline) {
+    if (!live.some((pid) => alive(pid))) {
+      return {
+        stopped: "herdr-agent",
+        detail: `SIGKILL omp in agent ${agentName} pane ${claim.paneId} pids ${live.join(",")} after SIGTERM grace`,
+        agentName,
+      };
+    }
+    await sleep(50);
+  }
+
+  const survivors = live.filter((pid) => alive(pid));
+  throw new Error(
+    `halt --pane: agent ${agentName} pane ${claim.paneId} still alive after SIGTERM+SIGKILL ` +
+      `(pids ${survivors.join(",")}). Recovery pin was written; kill by hand before trusting a quiet fleet.`,
+  );
 }
 
 async function herdrAgentList(deps: PaneStopDeps): Promise<HerdrAgent[]> {

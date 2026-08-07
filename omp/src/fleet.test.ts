@@ -4,7 +4,7 @@
  */
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -215,18 +215,133 @@ test("halt --pane pin is written even when agent already gone", async () => {
   expect(r.pane.stopped).toBe("already-gone");
 });
 
-test("halt --pane refuses without unique live omp claim", async () => {
+test("halt --pane throws when identity is ambiguous — pin remains", async () => {
   writeMinimalConfig();
   writeTick();
-  const r = await haltWithPane(undefined, {
-    listAgents: async () => [
-      { name: "fleet", paneId: "w1:p1", agent: "omp" },
-      { name: "fleet", paneId: "w1:p2", agent: "omp" },
-    ],
-    sleep: async () => {},
-  });
-  expect(r.pane.stopped).toBe("unavailable");
-  expect(existsSync(r.pane.pinPath)).toBe(true);
+  await expect(
+    haltWithPane(undefined, {
+      listAgents: async () => [
+        { name: "fleet", paneId: "w1:p1", agent: "omp" },
+        { name: "fleet", paneId: "w1:p2", agent: "omp" },
+      ],
+      sleep: async () => {},
+    }),
+  ).rejects.toThrow(/not unique/);
+  // Pin was written before the throw so recovery cannot race a respawn.
+  expect(existsSync(paneHaltPath())).toBe(true);
+});
+
+test("halt --pane throws when live omp claim has no recognized PID", async () => {
+  writeMinimalConfig();
+  writeTick();
+  await expect(
+    haltWithPane(undefined, {
+      listAgents: async () => [{ name: "fleet", paneId: "w1:p1", agent: "omp" }],
+      panePids: async () => [],
+      sleep: async () => {},
+    }),
+  ).rejects.toThrow(/no omp foreground PID/);
+  expect(existsSync(paneHaltPath())).toBe(true);
+});
+
+test("halt --pane throws when agent survives SIGKILL — never exits success while alive", async () => {
+  writeMinimalConfig();
+  writeTick();
+  const living = new Set<number>([5150]);
+  let clock = 0;
+  await expect(
+    haltWithPane(undefined, {
+      listAgents: async () => [{ name: "fleet", paneId: "w1:p1", agent: "omp" }],
+      panePids: async () => [5150],
+      isAlive: (pid) => living.has(pid),
+      // Signal is a no-op — process stays alive.
+      signalPid: () => true,
+      now: () => clock,
+      sleep: async (ms) => {
+        clock += ms;
+      },
+    }),
+  ).rejects.toThrow(/still alive after SIGTERM\+SIGKILL/);
+  expect(living.has(5150)).toBe(true);
+  expect(existsSync(paneHaltPath())).toBe(true);
+});
+
+test("halt --pane throws when herdr is down", async () => {
+  writeMinimalConfig();
+  writeTick();
+  await expect(
+    haltWithPane(undefined, {
+      listAgents: async () => {
+        throw new Error("server_not_running");
+      },
+      sleep: async () => {},
+    }),
+  ).rejects.toThrow(/herdr agent list failed/);
+  expect(existsSync(paneHaltPath())).toBe(true);
+});
+
+test("CLI halt --pane exits nonzero while a live claimed agent cannot be stopped", async () => {
+  writeMinimalConfig();
+  writeTick();
+
+  // A real process the pane "owns" — the herdr stub reports it as the only
+  // foreground process, but it is not an omp process, so no PID is
+  // recognizable. The command must refuse rather than call that "halted".
+  const child = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
+  const bin = join(home, "bin");
+  mkdirSync(bin);
+
+  const herdr = join(bin, "herdr");
+  writeFileSync(
+    herdr,
+    `#!/bin/sh
+case "$*" in
+  *"agent list"*)
+    printf '%s\\n' '{"result":{"agents":[{"name":"fleet","pane_id":"w1:p1","agent":"omp"}]}}'
+    ;;
+  *"pane process-info"*)
+    printf '%s\\n' '{"result":{"process_info":{"foreground_processes":[{"pid":${child.pid},"name":"sleep","argv0":"sleep","argv":["sleep","60"]}]}}}'
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+`,
+  );
+  chmodSync(herdr, 0o755);
+
+  // Confirmed-inactive unit so the daemon half of halt behaves the same on a
+  // laptop with no systemd and on a CI box whose systemd is not booted.
+  const systemctl = join(bin, "systemctl");
+  writeFileSync(systemctl, "#!/bin/sh\nprintf '0\\ninactive\\n'\nexit 0\n");
+  chmodSync(systemctl, 0o755);
+
+  try {
+    const proc = Bun.spawn(["bun", "src/cli.ts", "halt", "--pane"], {
+      cwd: import.meta.dir.replace(/\/src$/, ""),
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env["PATH"] ?? ""}`,
+        HERDR_SESSION: "fleet",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [exitCode, stdout, stderr] = await Promise.all([
+      proc.exited,
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+
+    expect(exitCode).toBe(1);
+    expect(stdout).not.toContain("halted");
+    expect(stderr).toContain("live omp but no omp foreground PID");
+    expect(child.exitCode).toBeNull();
+    expect(existsSync(paneHaltPath())).toBe(true);
+  } finally {
+    child.kill("SIGKILL");
+    await child.exited;
+  }
 });
 
 test("disarm removes marker; arm requires inbound user-turn proof", async () => {
