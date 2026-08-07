@@ -194,6 +194,56 @@ test("tier 2 with a chat id sends one Telegram request and no issue comment", as
   expect(sent).toMatchObject({ chat_id: "123456789", text: formatEscalation(tier2, "demo") });
 });
 
+test("a long page that Telegram accepted is not reported as rejected", async () => {
+  // Telegram echoes the whole message back inside `result.text`, so a real
+  // tier-2 body puts the success response well past 400 characters. The
+  // delivery check used to parse the *truncated* diagnostic string, so exactly
+  // the pages worth sending came back as `sendMessage rejected` — after they
+  // had already arrived. Live on 2026-08-07: message_id 99 reached the operator
+  // and the daemon logged "could not be delivered". Because the dedup marker is
+  // only written on success, that also re-sent the same page every tick.
+  // Shaped on the real integrity-tripwire page: a summary, a package root, the
+  // differing files, and the four lines telling an operator what to do about
+  // it. The fixtures above are one-liners, which is why nothing here ever hit
+  // the 400-char cap and the bug survived to production.
+  const bigPage: Escalation = {
+    tier: 2,
+    project: "demo",
+    issue: 0,
+    summary: "Installed conductor changed under a running daemon on 2026-08-07: 4 file(s) differ (first: changed daemon.ts) — demo is paused",
+    detail: [
+      "Package root: /root/node_modules/omp-conductor/src",
+      "changed daemon.ts",
+      "changed briefs/orchestrator.md",
+      "changed cli.ts",
+      "added evil.ts",
+      "",
+      "If you deployed a new build, restart the daemon — the restart re-records the baseline.",
+      "If you did not, the host edited itself while it was dispatching work: treat every run since",
+      "the last known-good restart as unattributable before resuming.",
+      "`omp-conductor resume` alone will not hold — the next tick re-pauses while the files differ.",
+    ].join("\n"),
+  };
+  const body = JSON.stringify({
+    ok: true,
+    result: { message_id: 99, chat: { id: 123456789 }, text: formatEscalation(bigPage, "demo") },
+  });
+  expect(body.length).toBeGreaterThan(400);
+
+  const calls = stubFetch(() => new Response(body, { status: 200 }));
+  const { tracker, comments } = makeTracker();
+  const { store, marked } = makeStore();
+  const p = makeProject({ telegramChatId: "123456789", fallbackToIssueComment: true });
+
+  await createEscalator(p, tracker, store).escalate(bigPage);
+
+  expect(calls.length).toBe(1);
+  // Delivered exactly once, no fallback comment, and marked notified — the
+  // three things a false rejection got wrong.
+  expect(comments.length).toBe(0);
+  expect(marked.length).toBe(1);
+});
+
 test("tier 2 with no chat id and no fallback throws instead of dropping the page", async () => {
   const { tracker, comments } = makeTracker();
   const { store, marked } = makeStore();
