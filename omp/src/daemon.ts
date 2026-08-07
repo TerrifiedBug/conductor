@@ -11,7 +11,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { configPath, findProject, loadConfig, resolveCaps, stateDir } from "./config.ts";
-import { createEscalator } from "./escalate.ts";
+import { createEscalator, escalationIssueRef } from "./escalate.ts";
 import { graphHint } from "./graph.ts";
 import { livingDaemon } from "./lifecycle.ts";
 import { STALL_MARKER_FILE } from "./orchestrator-tick.ts";
@@ -369,7 +369,7 @@ async function safeEscalate(d: Pick<Deps, "escalate">, e: Escalation): Promise<b
     await d.escalate(e);
     return true;
   } catch (err) {
-    log(`escalation for #${e.issue} could not be delivered: ${errText(err)}`);
+    log(`escalation for ${escalationIssueRef(e.issue)} could not be delivered: ${errText(err)}`);
     return false;
   }
 }

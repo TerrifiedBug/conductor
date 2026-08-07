@@ -45,11 +45,21 @@ export interface Escalator {
  * send, turning a cosmetic problem into a lost escalation. Plain text is also
  * valid Markdown, so the same string renders fine as an issue comment.
  */
+/**
+ * Fleet-scoped pages (integrity tripwire, spend-cap halt, stall) use issue `0`
+ * as a sentinel — there is no tracker issue. Rendering that as `#0` made
+ * Telegram pages and daemon logs look like a bug (#52). Keep the sentinel in
+ * the typed field; only the human-facing label changes here.
+ */
+export function escalationIssueRef(issue: number): string {
+  return issue === 0 ? "fleet" : `#${issue}`;
+}
+
 export function formatEscalation(e: Escalation, project: string): string {
   const lines = [
     `omp-conductor · tier ${e.tier} escalation`,
     `project: ${project}`,
-    `issue: #${e.issue}`,
+    `issue: ${escalationIssueRef(e.issue)}`,
     `summary: ${e.summary}`,
   ];
   if (e.detail) lines.push(`detail: ${e.detail}`);
@@ -99,18 +109,21 @@ export function createEscalator(
           const onTurnFailed = async (cause: unknown): Promise<void> => {
             if (!p.escalation.fallbackToIssueComment) {
               warn(
-                `tier 1 escalation on issue #${e.issue} was accepted by the orchestrator but its ` +
+                `tier 1 escalation on ${escalationIssueRef(e.issue)} was accepted by the orchestrator but its ` +
                   `turn failed (${errText(cause)}), and no fallback is configured — left unmarked ` +
                   `so the next tick retries`,
               );
               return;
             }
             try {
+              if (e.issue === 0) {
+                throw new Error("fleet-scoped escalation has no issue to comment on");
+              }
               await tracker.comment(e.issue, text);
               store.markNotified(key);
             } catch (err) {
               warn(
-                `tier 1 escalation on issue #${e.issue} failed after acceptance ` +
+                `tier 1 escalation on ${escalationIssueRef(e.issue)} failed after acceptance ` +
                   `(${errText(cause)}) and its issue-comment fallback failed too ` +
                   `(${errText(err)}) — left unmarked so the next tick retries`,
               );
@@ -154,8 +167,17 @@ export function createEscalator(
       if (!p.escalation.fallbackToIssueComment) {
         throw new Error(
           `no escalation transport configured for project "${p.name}": tier ${e.tier} ` +
-            `escalation on issue #${e.issue} (${e.summary}) could not be delivered — ` +
+            `escalation on ${escalationIssueRef(e.issue)} (${e.summary}) could not be delivered — ` +
             `set escalation.telegramChatId or escalation.fallbackToIssueComment`,
+        );
+      }
+      // Fleet pages (issue 0) have nowhere to comment. Falling through here used
+      // to call `issues/0/comments` and surface as a confusing "#0" delivery
+      // failure after Telegram had already been tried (#52).
+      if (e.issue === 0) {
+        throw new Error(
+          `fleet-scoped tier ${e.tier} escalation (${e.summary}) has no issue to comment on — ` +
+            `configure escalation.telegramChatId so integrity/spend/stall pages can reach an operator`,
         );
       }
       await tracker.comment(e.issue, text);
