@@ -372,6 +372,9 @@ message on stderr) on every uncertainty:
 - the tick config does not parse — the agent name would be a guess
 - `herdr agent list` is unreachable, prints nothing, or prints output with no
   explicit `agents` array; only a real `agents: []` means "no agents"
+- an agent row is unreadable — a missing `name`/`pane_id`, or an `agent` field
+  present with a non-string value. An *absent* or `null` `agent` is the sticky
+  claim herdr reports after the agent exits, and stays a normal answer
 - the configured agent name is not unique, or the claimed pane runs some other agent
 - `pane process-info` fails, or the claim is live `omp` but names no recognizable
   omp foreground PID — "cannot see it" is never reported as "it is stopped"

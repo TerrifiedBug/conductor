@@ -565,7 +565,19 @@ async function herdrAgentList(deps: PaneStopDeps): Promise<HerdrAgent[]> {
           "cannot tell whether it is the conductor pane",
       );
     }
-    const agent = typeof a["agent"] === "string" ? a["agent"] : undefined;
+    // An absent (or null) `agent` is how herdr reports a sticky claim whose
+    // agent has exited — recover.sh reads the same field as `(.agent // "")`,
+    // and the released-agent fixture omits the key entirely. A *present* value
+    // of any other type is a row we cannot read: coercing it to `undefined`
+    // would report a live pane as already-gone.
+    const rawAgent = a["agent"];
+    if (rawAgent !== undefined && rawAgent !== null && typeof rawAgent !== "string") {
+      throw new Error(
+        `herdr agent list row for ${name} has a non-string \`agent\` (${typeof rawAgent}) — ` +
+          `cannot tell whether an agent is live`,
+      );
+    }
+    const agent = typeof rawAgent === "string" ? rawAgent : undefined;
     let sessionPath: string | undefined;
     const sess = a["agent_session"];
     if (sess !== null && typeof sess === "object") {

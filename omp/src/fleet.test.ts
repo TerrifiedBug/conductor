@@ -333,6 +333,16 @@ test("herdr agent list output that is not an explicit agent array throws", async
       body: `printf '%s\\n' '{"result":{"agents":[{"pane_id":"w1:p1"}]}}'`,
       expected: /missing a string/,
     },
+    {
+      label: "numeric agent value",
+      body: `printf '%s\\n' '{"result":{"agents":[{"name":"fleet","pane_id":"w1:p1","agent":7}]}}'`,
+      expected: /non-string .agent. \(number\)/,
+    },
+    {
+      label: "object agent value",
+      body: `printf '%s\\n' '{"result":{"agents":[{"name":"fleet","pane_id":"w1:p1","agent":{}}]}}'`,
+      expected: /non-string .agent. \(object\)/,
+    },
   ];
 
   for (const c of cases) {
@@ -340,6 +350,19 @@ test("herdr agent list output that is not an explicit agent array throws", async
     await expect(stopConductorPane(undefined, { herdrBin: bin, sleep: async () => {} })).rejects.toThrow(
       c.expected,
     );
+  }
+});
+
+test("an omitted or null agent is a sticky claim, not a malformed row", async () => {
+  writeMinimalConfig();
+  writeTick();
+  // recover-test.sh's released-agent fixture omits the key; recover.sh reads
+  // the field as `(.agent // "")`, so null means the same thing.
+  for (const row of ['{"name":"fleet","pane_id":"w1:p1"}', '{"name":"fleet","pane_id":"w1:p1","agent":null}']) {
+    const bin = writeHerdrStub(`printf '%s\\n' '{"result":{"agents":[${row}]}}'`);
+    const r = await stopConductorPane(undefined, { herdrBin: bin, sleep: async () => {} });
+    expect(r.stopped).toBe("already-gone");
+    expect(r.detail).toContain("sticky name only");
   }
 });
 
