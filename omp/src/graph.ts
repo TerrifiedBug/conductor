@@ -24,7 +24,7 @@
  *   human edits — and {@link graphHint} is the text that makes that unmissable.
  */
 
-import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { expandHome, stateDir } from "./config.ts";
@@ -42,6 +42,54 @@ export const REINDEX_UNIT = "cbm-reindex";
 
 /** Where a system timer has to live to be enabled by `systemctl`. */
 export const SYSTEMD_UNIT_DIR = "/etc/systemd/system";
+
+/** Where the upstream indexer lives, for an operator who has to go install it. */
+const INDEXER_SOURCE = "https://github.com/DeusData/codebase-memory-mcp";
+
+/**
+ * The two things that must be true of the *host* before any index is useful,
+ * neither of which conductor installs: the indexer has to be on PATH, and the
+ * agent has to mount it as an MCP server or worker sessions get no graph tools
+ * at all. Indexing without the mount produces a perfectly good database that
+ * nothing can read — the failure this preflight exists to make visible.
+ */
+export interface GraphPrereqs {
+  /** Resolved indexer path, or null when nothing on PATH answers to the name. */
+  indexer: string | null;
+  /** The agent's MCP server config, whether or not it exists yet. */
+  mcpConfig: string;
+  /** Whether that config already mounts the indexer for sessions. */
+  mounted: boolean;
+}
+
+/** Reads the host. Split from {@link formatGraphSetup} so the plan stays pure. */
+export function resolvePrereqs(home: string = homedir()): GraphPrereqs {
+  const onPath = (process.env["PATH"] ?? "")
+    .split(":")
+    .filter((d) => d !== "")
+    .map((d) => join(d, INDEXER))
+    .find((c) => existsSync(c));
+
+  const mcpConfig = join(home, ".omp", "agent", "mcp.json");
+  let mounted = false;
+  try {
+    // Any mention of the binary counts as mounted. Parsing the whole schema to
+    // decide would make this preflight fail on configs it does not understand,
+    // and a false "not mounted" costs an operator a confusing duplicate entry.
+    const raw = JSON.parse(readFileSync(mcpConfig, "utf8")) as Record<string, unknown>;
+    const servers = (raw["mcpServers"] ?? raw) as Record<string, unknown>;
+    mounted = Object.keys(servers).some((k) => k.includes(INDEXER));
+  } catch {
+    // No file, or unreadable: not mounted, and the plan says how to add it.
+  }
+  return { indexer: onPath ?? null, mcpConfig, mounted };
+}
+
+/** The `mcp.json` entry a fresh host needs, using the resolved path when known. */
+export function mcpEntry(prereqs: GraphPrereqs): string {
+  const command = prereqs.indexer ?? `/usr/local/bin/${INDEXER}`;
+  return JSON.stringify({ [INDEXER]: { type: "stdio", command } }, null, 2);
+}
 
 /**
  * Default parent of every index-only clone, under the cache directory because
@@ -239,18 +287,25 @@ export function reindexService(p: ProjectConfig, scriptPath = reindexScriptPath(
 export function reindexTimer(p: ProjectConfig): string {
   return [
     "[Unit]",
-    `Description=Nightly code-graph reindex for omp-conductor project "${p.name}"`,
+    `Description=Periodic code-graph reindex for omp-conductor project "${p.name}"`,
     "",
     "[Timer]",
-    "# Nightly, at an hour a shared host is quiet. The graph is orientation-grade —",
-    "# the worker brief tells every session to verify against the real file before",
-    "# editing — so a same-day snapshot is worth far more than a constant reindex.",
-    "# Add another OnCalendar= line for a midday refresh if your repos move fast.",
-    "OnCalendar=*-*-* 03:30:00",
-    "# Persistent catches a host that was down at 03:30; the jitter keeps every",
-    "# install of this unit off the same second.",
+    "# Twenty minutes, because the measured cost is small and the cost of",
+    "# staleness is not: refreshing four repos takes ~40s of CPU, which at this",
+    "# interval is roughly 3% of one core, and the service runs at Nice=10 with",
+    "# idle IO so it yields to the fleet. A nightly refresh would be cheaper and",
+    "# much worse — a fleet merging several PRs a day would spend most of its",
+    "# dispatches querying a graph that predates the code the worker was sent to",
+    "# change, which is the one way this feature actively misleads. Lengthen it",
+    "# for quiet repos; the brief has workers verify against the real file",
+    "# regardless, so staleness degrades the graph rather than making it lie.",
+    "OnBootSec=3min",
+    "OnUnitActiveSec=20min",
+    "# Persistent catches a host that was down; the jitter keeps every install",
+    "# of this unit off the same second.",
     "Persistent=true",
-    "RandomizedDelaySec=15m",
+    "RandomizedDelaySec=2m",
+    "AccuracySec=1min",
     `Unit=${REINDEX_UNIT}.service`,
     "",
     "[Install]",
@@ -274,7 +329,11 @@ function block(title: string, body: string): string[] {
  * `graph-setup`, and it is a plan an operator can read, paste, or ignore —
  * including on a host where they are not root and `--write` would fail.
  */
-export function formatGraphSetup(p: ProjectConfig, unitDir = SYSTEMD_UNIT_DIR): string {
+export function formatGraphSetup(
+  p: ProjectConfig,
+  unitDir = SYSTEMD_UNIT_DIR,
+  prereqs: GraphPrereqs = resolvePrereqs(),
+): string {
   const repos = graphRepos(p);
   const missing = repos.filter((r) => !existsSync(r.graphProject));
   // Seeded with 0 so these are still widths when the caller ignored the exit-1
@@ -296,6 +355,31 @@ export function formatGraphSetup(p: ProjectConfig, unitDir = SYSTEMD_UNIT_DIR): 
     // the one thing an operator scans this list for.
     const marker = missing.includes(r) ? "  (missing)" : "";
     lines.push(`  ${r.name.padEnd(nameWidth)}  ${r.graphProject.padEnd(marker === "" ? 0 : pathWidth)}${marker}`);
+  }
+
+  // Before anything else, because both of these are host state conductor does
+  // not own and neither failure is self-announcing: a missing binary surfaces
+  // as command-not-found halfway down the plan, and a missing mount surfaces
+  // as workers that never mention the graph and quietly grep instead.
+  lines.push("", "0. host prerequisites", "");
+  lines.push(
+    prereqs.indexer === null
+      ? `   [ ] ${INDEXER} is NOT on your PATH. Install it first — conductor never
+       does, and never depends on it: ${INDEXER_SOURCE}`
+      : `   [x] indexer: ${prereqs.indexer}`,
+  );
+  if (prereqs.mounted) {
+    lines.push(`   [x] mounted for sessions in ${prereqs.mcpConfig}`);
+  } else {
+    lines.push(
+      `   [ ] NOT mounted as an MCP server, so worker sessions have no graph`,
+      `       tools and every index below would be unreadable. Add to`,
+      `       ${prereqs.mcpConfig}:`,
+      "",
+      ...mcpEntry(prereqs)
+        .split("\n")
+        .map((l) => `       ${l}`),
+    );
   }
 
   lines.push("", "1. create the clones that are missing", "");

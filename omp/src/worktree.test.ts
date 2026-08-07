@@ -303,6 +303,41 @@ describe("salvageWip", () => {
   );
 
   it(
+    "keeps a tracked file the excludes would match by name",
+    async () => {
+      const { mirrorRoot, workspaceRoot } = sandbox("salvage-tracked-collision");
+      const branch = "conductor/issue-1010";
+
+      const tree = await addWorktree(repo, mirrorRoot, workspaceRoot, 1010, branch);
+
+      // A repo that legitimately versions a file matching an exclude pattern —
+      // a committed bootstrap helper, an env template. Plenty of repos do.
+      writeFileSync(join(tree, "bootstrap.local.sh"), "#!/bin/sh\necho v1\n");
+      writeFileSync(join(tree, ".env.local"), "TEMPLATE=1\n");
+      git(["add", "bootstrap.local.sh", ".env.local"], tree);
+      git(["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "track them"], tree);
+
+      // Now a worker edits both as ordinary product work, and dies.
+      writeFileSync(join(tree, "bootstrap.local.sh"), "#!/bin/sh\necho v2 — the fix\n");
+      writeFileSync(join(tree, ".env.local"), "TEMPLATE=2\n");
+
+      const outcome = await salvageWip(tree, 1010, 1, "the turns cap");
+
+      expect(outcome).toMatchObject({ kind: "salvaged", pushed: true });
+      if (outcome.kind !== "salvaged") throw new Error("unreachable");
+
+      // Both survive. Matching a scratch *name* must never outrank the fact
+      // that the repo already owns the file: dropping these would be salvage
+      // silently destroying the work it exists to save.
+      expect(git(["show", "--name-only", "--format=", outcome.sha], tree).split("\n").sort()).toEqual(
+        [".env.local", "bootstrap.local.sh"],
+      );
+      expect(git(["show", `${outcome.sha}:bootstrap.local.sh`], tree)).toContain("v2 — the fix");
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
     "reports nothing, not a failure, when only scratch is dirty",
     async () => {
       const { mirrorRoot, workspaceRoot } = sandbox("salvage-only-scratch");

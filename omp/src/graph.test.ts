@@ -19,7 +19,7 @@
  */
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -30,6 +30,8 @@ import {
   graphProjectPath,
   graphRepos,
   indexCommand,
+  mcpEntry,
+  resolvePrereqs,
   reindexScript,
   reindexScriptPath,
   reindexService,
@@ -179,10 +181,17 @@ test("the service spells out HOME and PATH, because systemd supplies neither", (
   expect(unit).not.toContain("[Install]");
 });
 
-test("the timer says why it exists, since the server has a watcher of its own", () => {
+test("the timer refreshes on an interval a busy fleet can trust", () => {
   const unit = reindexTimer(project(graphed("api")));
 
-  expect(unit).toContain("OnCalendar=");
+  // The contract is "minutes, not a day". A graph that predates the code a
+  // worker was just dispatched to change is the one state in which this
+  // feature misleads rather than merely underperforms, so the schedule is
+  // load-bearing, not cosmetic.
+  expect(unit).toContain("OnUnitActiveSec=20min");
+  expect(unit).toContain("OnBootSec=3min");
+  expect(unit).not.toContain("OnCalendar=");
+
   expect(unit).toContain("Persistent=true");
   expect(unit).toContain("Unit=cbm-reindex.service");
   expect(unit).toContain("WantedBy=timers.target");
@@ -244,6 +253,58 @@ test("--write leaves the files and the systemctl step, and runs neither", () => 
   expect(result.next).toContain("never runs systemctl");
   expect(result.next).toContain("systemctl daemon-reload && systemctl enable --now cbm-reindex.timer");
   // The clone does not exist, and the script fails rather than skipping it, so
-  // the missing step is named here instead of at 03:30.
+  // the missing step is named here instead of on the next tick.
   expect(result.next).toContain("do not exist yet");
+});
+
+// ------------------------------------------------------- host prerequisites
+
+test("an indexed-but-unmounted host is called out, because nothing else says so", () => {
+  // The exact fresh-install trap: indexing succeeds, the databases are real and
+  // correct, and worker sessions still have no graph tools — so every worker
+  // silently falls back to grepping and the feature looks like it did nothing.
+  const prereqs = { indexer: "/usr/local/bin/codebase-memory-mcp", mcpConfig: join(home, "mcp.json"), mounted: false };
+  const text = formatGraphSetup(project(graphed("api")), "/etc/systemd/system", prereqs);
+
+  expect(text).toContain("0. host prerequisites");
+  expect(text).toContain("[x] indexer: /usr/local/bin/codebase-memory-mcp");
+  expect(text).toContain("NOT mounted");
+  // The remedy, not just the diagnosis: the entry is printed ready to paste,
+  // pointed at the binary that was actually found rather than a guess.
+  expect(text).toContain('"command": "/usr/local/bin/codebase-memory-mcp"');
+});
+
+test("a missing binary names the source instead of inventing an install command", () => {
+  const prereqs = { indexer: null, mcpConfig: join(home, "mcp.json"), mounted: true };
+  const text = formatGraphSetup(project(graphed("api")), "/etc/systemd/system", prereqs);
+
+  expect(text).toContain("is NOT on your PATH");
+  expect(text).toContain("github.com/DeusData/codebase-memory-mcp");
+  expect(text).toContain("[x] mounted for sessions");
+});
+
+test("resolvePrereqs reads a real mcp.json, and tolerates one it cannot parse", () => {
+  const agent = join(home, ".omp", "agent");
+  mkdirSync(agent, { recursive: true });
+  const cfg = join(agent, "mcp.json");
+
+  writeFileSync(cfg, JSON.stringify({ "codebase-memory-mcp": { command: "/x" } }));
+  expect(resolvePrereqs(home).mounted).toBe(true);
+
+  // Wrapped form, which is the other shape in the wild.
+  writeFileSync(cfg, JSON.stringify({ mcpServers: { "codebase-memory-mcp": { command: "/x" } } }));
+  expect(resolvePrereqs(home).mounted).toBe(true);
+
+  // Garbage must read as "not mounted" and never throw: this runs inside a
+  // plan an operator asked to *see*, and crashing on their config helps no one.
+  writeFileSync(cfg, "{ not json");
+  expect(resolvePrereqs(home).mounted).toBe(false);
+  expect(resolvePrereqs(home).mcpConfig).toBe(cfg);
+});
+
+test("the pasted entry falls back to a plausible path when the binary is absent", () => {
+  expect(mcpEntry({ indexer: null, mcpConfig: "x", mounted: false })).toContain("/usr/local/bin/");
+  expect(JSON.parse(mcpEntry({ indexer: "/opt/cbm", mcpConfig: "x", mounted: false }))).toEqual({
+    "codebase-memory-mcp": { type: "stdio", command: "/opt/cbm" },
+  });
 });

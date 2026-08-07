@@ -301,16 +301,22 @@ const SALVAGE_COMMIT_CONFIG = [
 
 /**
  * Shapes a worker creates for itself and no one else ever wants committed: a
- * local env helper, a scratch directory, a debug dump, an editor's droppings.
+ * local env helper, a scratch directory, a debug dump.
  *
  * Excluded from salvage rather than left to each repo's `.gitignore`, because
  * salvage runs against whatever repo the fleet was pointed at and cannot assume
  * the operator has anticipated this. A repo that *does* ignore them loses
  * nothing here — the patterns simply never match.
  *
- * Deliberately narrow. Anything ambiguous belongs in the commit, because the
+ * Applied to **untracked files only**, which is what makes matching by name
+ * safe. Scratch is untracked by definition; a *tracked* file of the same name
+ * is the repo's own, and a worker editing it is doing product work. Matching
+ * that on filename would silently drop a real change — salvage destroying
+ * tracked work is the precise failure this whole mechanism exists to prevent.
+ *
+ * Deliberately narrow even so. Anything ambiguous belongs in the commit: the
  * cost of over-keeping is a reviewer deleting a file, and the cost of
- * over-skipping is the destroyed work this whole mechanism exists to prevent.
+ * over-skipping is destroyed work.
  */
 const SALVAGE_EXCLUDES = [
   ":(exclude).scratch*",
@@ -364,14 +370,21 @@ export async function salvageWip(
     // string ends up in an escalation as the place to go looking.
     const branch = await git(["rev-parse", "--abbrev-ref", "HEAD"], worktree);
 
-    // `-A` on purpose: the losses this exists for were mostly *new* files.
-    // Everything except the shapes below, which are a worker's own scaffolding
-    // — a local env helper, a scratch dir, a debug dump. They are worthless to
-    // the next attempt and actively harmful in a pushed commit: on 2026-08-07 a
-    // salvage swept up a `.scratch82/env.sh` of loopback dev defaults, which
-    // read enough like a leaked secret that the orchestrator broke its own
-    // "never touch a worker's branch" boundary trying to scrub it. Excluding
-    // them is cheaper than every future reader having to judge them.
+    // Two steps, and the order encodes the safety argument.
+    //
+    // Tracked first, unconditionally: `-u` stages every modification and
+    // deletion to a file the repo already owns. No pathspec, no excludes — a
+    // tracked file is the repo's, whatever it is called, and dropping a
+    // worker's edit to one would be salvage destroying the work it exists to
+    // save.
+    await git(["add", "-u"], worktree);
+
+    // Then untracked, minus the worker's own scaffolding. `-A` here because the
+    // losses this exists for were mostly *new* files; the excludes because on
+    // 2026-08-07 a salvage swept up a `.scratch82/env.sh` of loopback dev
+    // defaults, which read enough like a leaked secret that the orchestrator
+    // broke its own "never touch a worker's branch" boundary trying to scrub
+    // it. Safe to match on filename only because nothing tracked reaches here.
     await git(["add", "-A", "--", ".", ...SALVAGE_EXCLUDES], worktree);
 
     // The dirty check above ran before the excludes, so a tree whose only

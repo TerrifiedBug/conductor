@@ -534,6 +534,20 @@ fifths of a 120-turn budget — and the runs that died at the turns cap died wit
 the work unfinished. A code graph answers "who calls this" and "where is this
 defined" in one call instead of twenty greps.
 
+### Two things this package does not do for you
+
+`omp-conductor` never installs, spawns, imports or depends on the indexer — with
+`graphProject` unset, nothing about dispatch, caps or escalation changes. That
+means a fresh host needs both of these before an index is worth anything, and
+`graph-setup` reports them as step 0:
+
+1. **`codebase-memory-mcp` on PATH** — a separate project,
+   [DeusData/codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp).
+2. **Mounted as an MCP server** in `~/.omp/agent/mcp.json`, on the account the
+   daemon runs as. Miss this and the failure is silent: every index builds
+   correctly, no worker session can read any of them, so workers fall back to
+   grepping and the feature looks like a no-op. `graph-setup` prints the entry.
+
 Say yes and the wizard asks for one root, then derives one clone per routed repo
 underneath it (default `~/.cache/conductor-graph/<org>/<repo>`) and writes it to
 each repo's [`graphProject`](#configuration). Nothing else changes: this package

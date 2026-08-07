@@ -634,6 +634,25 @@ be indexed, pinned to the repo's default branch, never edited by a human. Say th
 out loud, because an operator who points it at `~/projects/<repo>` to "save disk"
 has armed something that will one day `git reset --hard` over their work.
 
+Two host prerequisites come before any of that, and neither is conductor's to
+install. `graph-setup` reports both as step 0, so run it first and read that
+block before running anything else.
+
+- **The indexer must be on PATH.** `codebase-memory-mcp` is a separate project
+  ([source](https://github.com/DeusData/codebase-memory-mcp)); the package never
+  installs, spawns or depends on it. A host without it gets command-not-found
+  partway down the plan.
+- **It must be mounted as an MCP server for sessions**, in `~/.omp/agent/mcp.json`
+  on the account the daemon runs as. This is the one that bites, because it fails
+  *silently*: indexing succeeds, the databases are real and correct, and worker
+  sessions have no graph tools at all — so every worker quietly greps and the
+  whole thing looks like it simply did not help. `graph-setup` prints the exact
+  entry to paste, pointed at the binary it found.
+
+Check the mount on the daemon's account, not yours — a per-user config that is
+present for the operator and absent for the service account looks fine from the
+shell they are typing in.
+
 Then, on the host that runs the daemon:
 
 ```bash
