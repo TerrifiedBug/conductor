@@ -310,28 +310,30 @@ describe("salvageWip", () => {
 
       const tree = await addWorktree(repo, mirrorRoot, workspaceRoot, 1111, branch);
 
-      // A worker asked to add a local bootstrap helper and an env template — the
-      // deliverable itself, untracked because it did not exist before. An
-      // earlier version of the managed ignore listed both of these shapes, so
+      // A worker asked to add local bootstrap/configuration files — the
+      // deliverables themselves, untracked because they did not exist before.
+      // Earlier versions of the managed ignore listed these shapes, so
       // `git add -A` skipped them and salvage published a commit that silently
       // omitted the entire point of the run. A name is not evidence of being
-      // scratch; only `.scratch*` earns that assumption.
+      // scratch; only a `.scratch*/` directory earns that assumption.
       writeFileSync(join(tree, "bootstrap.local.sh"), "#!/bin/sh\necho bootstrap\n");
       writeFileSync(join(tree, ".env.local"), "TEMPLATE=1\n");
+      writeFileSync(join(tree, ".scratchrc"), "syntax=plain\n");
+      writeFileSync(join(tree, ".scratchpad"), "release notes\n");
 
       const outcome = await salvageWip(tree, 1111, 1, "the turns cap");
 
       expect(outcome).toMatchObject({ kind: "salvaged", pushed: true });
       if (outcome.kind !== "salvaged") throw new Error("unreachable");
       expect(git(["show", "--name-only", "--format=", outcome.sha], tree).split("\n").sort()).toEqual(
-        [".env.local", "bootstrap.local.sh"],
+        [".env.local", ".scratchpad", ".scratchrc", "bootstrap.local.sh"],
       );
     },
     TIMEOUT_MS,
   );
 
   it(
-    "reports nothing only when the tree holds nothing but real scratch",
+    "salvages when the only change is a plausible scratch-like file",
     async () => {
       const { mirrorRoot, workspaceRoot } = sandbox("salvage-only-lookalike");
 
@@ -339,9 +341,10 @@ describe("salvageWip", () => {
       const before = git(["rev-parse", "HEAD"], tree);
 
       // The dangerous shape: the ONLY change is a plausible deliverable. Under
-      // the old ignore this staged nothing, returned `nothing`, and the next
-      // attempt destroyed the tree — a total loss reported as a clean no-op.
-      writeFileSync(join(tree, "deploy.local.sh"), "#!/bin/sh\necho deploy\n");
+      // the unqualified `.scratch*` ignore this staged nothing, returned
+      // `nothing`, and the next attempt destroyed the tree — a total loss
+      // reported as a clean no-op.
+      writeFileSync(join(tree, ".scratchrc"), "syntax=plain\n");
 
       const outcome = await salvageWip(tree, 1212, 1, "the turns cap");
 
@@ -474,6 +477,7 @@ describe("mergeExclude", () => {
     expect(merged).toContain(".scratch*/");
     expect(merged).not.toContain(".env.local");
     expect(merged).not.toContain("*.local.sh");
+    expect(merged).not.toContain("\n.scratch*\n");
   });
 
   it("does not glue its block onto a file with no trailing newline", () => {

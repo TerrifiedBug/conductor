@@ -106,22 +106,23 @@ const EXCLUDE_END = "# <<< omp-conductor";
  * keeping it out of `git status` keeps it out of the worker's own `git add -A`
  * as well as out of salvage.
  *
- * **Only `.scratch*`, and that narrowness is the whole design.** An ignore here
- * applies to every repo this fleet touches, and an ignored *new* file is
+ * **Only the directory form of `.scratch*`; the slash is the design.** An ignore
+ * here applies to every repo this fleet touches, and an ignored *new* file is
  * invisible to salvage — `git add -A` skips it, and a tree holding only such
  * files reports `nothing`. So a name that could plausibly be a deliverable must
  * never appear in this list. The first version also carried `.env.local` and
- * `*.local.sh`, which is exactly that mistake: plenty of repos legitimately
- * ship a `bootstrap.local.sh` or an `.env.local` template, and a worker asked
- * to add one would have watched it vanish.
+ * `*.local.sh`; its first correction still carried an unqualified `.scratch*`.
+ * All three make the same mistake: repos can legitimately ship an `.env.local`
+ * template, `bootstrap.local.sh`, `.scratchrc`, or `.scratchpad`, and a worker
+ * asked to add one would watch it vanish.
  *
- * `.scratch*` survives the test because nothing ships under that name — it was
- * the 2026-08-07 incident's shape (`.scratch82/env.sh`) and reads as scaffolding
- * to any human. Broader conventions belong in a repo's own `.gitignore`, where
- * its operator chooses them, rather than being imposed by whatever dispatcher
- * happens to be driving.
+ * The directory-only pattern survives because its trailing slash limits it to a
+ * directory whose name announces that its contents are disposable. That was
+ * the 2026-08-07 incident's exact shape (`.scratch82/env.sh`). Broader
+ * conventions belong in a repo's own `.gitignore`, where its operator chooses
+ * them, rather than being imposed by whatever dispatcher happens to be driving.
  */
-const LOCAL_EXCLUDE = [".scratch*/", ".scratch*"];
+const LOCAL_EXCLUDE = [".scratch*/"];
 
 /**
  * Adds the managed block to an `info/exclude`, preserving everything else.
