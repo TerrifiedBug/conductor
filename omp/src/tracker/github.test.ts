@@ -12,7 +12,7 @@
 
 import { expect, test } from "bun:test";
 import { DEFAULT_AUTHORITY } from "../types.ts";
-import { firstOpenCloser, makeTracker, prStateFrom } from "./github.ts";
+import { firstOpenCloser, makeTracker, parentNumberFrom, prStateFrom } from "./github.ts";
 
 /** The `gh api graphql` envelope, with whatever references the test needs. */
 function reply(nodes: unknown[] | null): string {
@@ -158,4 +158,29 @@ test("a prUrl that is not a pull request URL is never handed to gh", async () =>
   }
 
   expect(spawned).toBe(0);
+});
+
+test("a linked sub-issue reports its parent number", () => {
+  // Shape verified live on gh 2.97.0 via `gh issue view --json parent` after
+  // `--add-sub-issue` (conductor #60 briefly under #47 for this measurement).
+  const raw = JSON.stringify({
+    parent: {
+      id: "I_kwDOExample",
+      number: 47,
+      state: "OPEN",
+      title: "Epic",
+      url: "https://github.com/acme/planning/issues/47",
+    },
+  });
+  expect(parentNumberFrom(raw)).toBe(47);
+});
+
+test("an issue with no parent is not epic-serialized", () => {
+  expect(parentNumberFrom(JSON.stringify({ parent: null }))).toBeUndefined();
+});
+
+test("a parent payload without a usable number fails closed", () => {
+  expect(() => parentNumberFrom(JSON.stringify({ parent: { title: "Epic" } }))).toThrow(
+    /unexpected parent number/,
+  );
 });

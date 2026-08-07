@@ -826,7 +826,8 @@ export interface Admission {
  *
  * Exported so the admission rules can be pinned without spawning a worker.
  * Every one of them exists because of a live incident, and each guards a
- * different way the same issue gets worked twice.
+ * different way the same issue gets worked twice — including epic siblings
+ * racing onto the same files (#48).
  *
  * Takes the slice of `Deps` it actually reads rather than the whole thing: what
  * admission is allowed to consult is the point of the function, and a `Deps`
@@ -838,7 +839,34 @@ export async function admitCandidates(
   slots: number,
 ): Promise<Admission[]> {
   const { project, caps, tracker, store } = d;
-  const busy = new Set(store.activeRuns(project.name).map((r) => r.issue));
+  const busyIssues = store.activeRuns(project.name).map((r) => r.issue);
+  const busy = new Set(busyIssues);
+
+  // parent -> blocking issue. Seeded from active runs (including pushed-green),
+  // then extended by candidates admitted earlier in this same pass so two
+  // siblings never both clear the gate in one tick.
+  const occupiedParents = new Map<number, number>();
+  const parentCache = new Map<number, number | undefined>();
+
+  const resolveParent = async (issue: number): Promise<number | undefined> => {
+    if (parentCache.has(issue)) return parentCache.get(issue);
+    const parent = await tracker.parentOf(issue);
+    parentCache.set(issue, parent);
+    return parent;
+  };
+
+  // Bounded by concurrent workers, not queue depth. A failed lookup here cannot
+  // mark an epic occupied; candidates still fail closed on their own parentOf.
+  for (const issue of busyIssues) {
+    try {
+      const parent = await resolveParent(issue);
+      if (parent !== undefined && !occupiedParents.has(parent)) {
+        occupiedParents.set(parent, issue);
+      }
+    } catch (err) {
+      log(`#${issue} parent lookup failed while seeding epic occupancy (${errText(err)})`);
+    }
+  }
 
   const admitted: Admission[] = [];
   for (const r of routed) {
@@ -860,6 +888,27 @@ export async function admitCandidates(
         ].join("\n"),
       });
       continue;
+    }
+
+    // Soft concurrency per epic: at most one in-flight child of a given parent.
+    // No parent means today's concurrent admission. Cheap local filters already
+    // ran; this sits before the open-PR API call so a held sibling frees the
+    // slot for unrelated work without spending a closers query.
+    let parent: number | undefined;
+    try {
+      parent = await resolveParent(r.issue.number);
+    } catch (err) {
+      log(`#${r.issue.number} held: parent check failed (${errText(err)}) — retrying next tick`);
+      continue;
+    }
+    if (parent !== undefined) {
+      const blocker = occupiedParents.get(parent);
+      if (blocker !== undefined) {
+        log(
+          `#${r.issue.number} skipped: sibling #${blocker} in flight under epic #${parent}`,
+        );
+        continue;
+      }
     }
 
     // The busy set is built from run rows, so it can only speak for work this
@@ -889,6 +938,7 @@ export async function admitCandidates(
     }
 
     admitted.push({ r, attempt: prior + 1 });
+    if (parent !== undefined) occupiedParents.set(parent, r.issue.number);
   }
 
   return admitted;
