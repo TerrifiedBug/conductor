@@ -21,12 +21,21 @@ import {
   writeMergedBrief,
 } from "./brief-upgrade.ts";
 import { findProject, loadConfig, resolveCaps, stateDir } from "./config.ts";
-import { dbPath, formatStatus, runDaemon, setPaused, statusSnapshot } from "./daemon.ts";
+import { dbPath, runDaemon, setPaused } from "./daemon.ts";
+import {
+  armTicks,
+  clearPaneHalt,
+  disarmTicks,
+  halt,
+  haltWithPane,
+  hold,
+  releaseHold,
+  renderStatus,
+} from "./fleet.ts";
 import { formatGraphSetup, graphRepos, writeGraphSetup, type GraphSetupWrite } from "./graph.ts";
 import {
   clearRecord,
   DEFAULT_PORT,
-  healthCheck,
   livingDaemon,
   restartDaemon,
   startDaemon,
@@ -53,6 +62,11 @@ usage:
   omp-conductor stop
   omp-conductor restart [--port N] [--project NAME]
   omp-conductor status [--project NAME]
+  omp-conductor hold [--project NAME]
+  omp-conductor halt [--pane] [--project NAME]
+  omp-conductor arm [--project NAME]
+  omp-conductor disarm [--project NAME]
+  omp-conductor release-pane [--project NAME]
   omp-conductor tail <issue> [--project NAME]
   omp-conductor unblock <issue> [--project NAME]
   omp-conductor daemon [--once] [--port N] [--project NAME]
@@ -73,8 +87,22 @@ usage:
            dirty live worktrees before orphaning those rows — see README
            "Deploying a new package onto a busy fleet". Goes through systemctl
            when the unit owns the live pid.
-  status   show pause state, caps, active runs, today's usage, and whether a
-           daemon is alive.
+  status   layered fleet report: dispatch (running|paused|stopped), ticks
+           (armed|disarmed|…), pane, herdr, daemon — then caps and active runs.
+  hold     soft stop: pause claiming AND disarm ticks. Daemon and pane stay up.
+           This is "stop the conductor overnight" without killing processes.
+  halt     hold, then stop the dispatch daemon (systemctl-aware). Pane stays up
+           unless --pane is passed.
+  halt --pane
+           halt, then pin herdr-conductor recovery off for the conductor agent
+           only — does NOT stop herdr-fleet.service or any other herdr session.
+           Clear the pin with release-pane when you want recovery again.
+  arm      proof-gated: send a Telegram challenge and write the arm marker only
+           after your reply appears as a user turn in the orchestrator transcript.
+           Never auto-armed by resume/hold.
+  disarm   remove the arm marker so ticks skip. Processes untouched.
+  release-pane
+           clear the halt --pane recovery pin so herdr-conductor may resume again.
   tail     follow the newest run for <issue>: the worker's assistant text and
            the tools it calls, printed as they land. Workers are sessions inside
            the daemon rather than terminals, so this is the only way to watch
@@ -87,8 +115,8 @@ usage:
            cost a worker.
   daemon   run the dispatch loop in the foreground; --once runs a single tick
            and exits. This is what \`start\` launches.
-  pause    stop claiming new work. The running daemon notices on its next tick.
-  resume   allow claiming again.
+  pause    stop claiming new work only (ticks keep firing if armed). Prefer hold.
+  resume   clear pause only — does NOT re-arm. Prefer hold's inverse: resume + arm.
   graph-setup
            print how to set up the code-graph indexes workers query instead of
            grepping: the clone commands for any missing index-only clone, the
@@ -107,10 +135,18 @@ usage:
   help     print this text (also --help, -h).
 
 Pause is a flag file under the state directory, so it applies to every project
-and survives a daemon restart. A running daemon is tracked by a pidfile under
-$OMP_CONDUCTOR_RUNTIME_DIR (default ~/.omp/run/daemons/omp-conductor), written
-whether it was started in the background or in the foreground, and probed for
-liveness on every read — a stale one never blocks a start.`;
+and survives a daemon restart. Hold also removes the arm marker the heartbeat
+reads, so both brains go quiet without killing processes. A running daemon is
+tracked by a pidfile under $OMP_CONDUCTOR_RUNTIME_DIR (default
+~/.omp/run/daemons/omp-conductor), written whether it was started in the
+background or in the foreground, and probed for liveness on every read — a
+stale one never blocks a start.
+
+Stop the conductor:
+  hold              no claims, no tick sends (inspectable)
+  halt              hold + stop dispatch daemon
+  halt --pane       halt + pin conductor-pane recovery off
+  resume && arm     clear pause, then prove inbound Telegram before ticks resume`;
 
 /** Accepts both `--port 9000` and `--port=9000`; returns undefined when absent. */
 function flag(argv: string[], name: string): string | undefined {
@@ -146,26 +182,6 @@ function humanDuration(ms: number): string {
   return `${Math.floor(h / 24)}d ${String(h % 24).padStart(2, "0")}h`;
 }
 
-/**
- * The daemon half of `status`. Kept separate from `formatStatus` because the
- * pidfile and the endpoint are the CLI's business, not the dispatcher's, and
- * because a pid without a `/healthz` answer is a distinct — and interesting —
- * state: the process is up but the loop is not serving.
- */
-async function daemonSection(): Promise<string> {
-  const rec = livingDaemon();
-  if (rec === undefined) return "daemon    not running";
-  const health = await healthCheck(rec.port);
-  return [
-    "daemon",
-    `  pid       ${rec.pid}`,
-    `  uptime    ${humanDuration(Date.now() - rec.startedAt)}`,
-    `  port      ${rec.port}`,
-    ...(rec.project === undefined ? [] : [`  project   ${rec.project}`]),
-    `  healthz   ${health.ok ? `ok  ${health.body ?? ""}`.trimEnd() : "unreachable — the process is up but not serving"}`,
-    `  log       ${rec.logFile}`,
-  ].join("\n");
-}
 
 /**
  * The orchestrator half, and the one thing `status` has ever known about the
@@ -456,9 +472,84 @@ try {
     }
 
     case "status": {
-      const snapshot = formatStatus(statusSnapshot(flag(argv, "project")));
+      const project = flag(argv, "project");
+      const text = await renderStatus(project);
       const stalled = stallLine();
-      process.stdout.write(`${snapshot}\n\n${await daemonSection()}\n${stalled === undefined ? "" : `\n${stalled}\n`}`);
+      process.stdout.write(`${text}${stalled === undefined ? "\n" : `\n\n${stalled}\n`}`);
+      break;
+    }
+
+    case "hold": {
+      const r = hold(flag(argv, "project"));
+      process.stdout.write(
+        `held — claiming paused` +
+          `${r.wasPaused ? " (already paused)" : ""}` +
+          `; ticks disarmed at ${r.disarmed.path}` +
+          `${r.disarmed.wasArmed ? "" : " (was already disarmed)"}\n` +
+          `daemon and pane left running; halt to stop the daemon\n`,
+      );
+      break;
+    }
+
+    case "halt": {
+      const project = flag(argv, "project");
+      const withPane = argv.includes("--pane");
+      if (withPane) {
+        const r = await haltWithPane(project);
+        const stopLine =
+          r.stop.kind === "not-running"
+            ? "daemon was not running"
+            : `daemon stopped — pid ${r.stop.pid}${r.stop.via === "systemctl" ? " (via systemctl)" : ""}`;
+        process.stdout.write(
+          `halted — claiming paused; ticks disarmed at ${r.hold.disarmed.path}\n` +
+            `${stopLine}\n` +
+            `pane recovery pinned at ${r.pane.pinPath}\n` +
+            `pane stop: ${r.pane.stopped} — ${r.pane.detail}\n` +
+            `  (conductor agent "${r.pane.agentName}" only — herdr-fleet.service was NOT stopped;\n` +
+            `   release-pane clears the pin when you want recovery again)\n`,
+        );
+      } else {
+        const r = await halt(project);
+        const stopLine =
+          r.stop.kind === "not-running"
+            ? "daemon was not running"
+            : `daemon stopped — pid ${r.stop.pid}${r.stop.via === "systemctl" ? " (via systemctl)" : ""}`;
+        process.stdout.write(
+          `halted — claiming paused; ticks disarmed at ${r.hold.disarmed.path}\n` +
+            `${stopLine}\n` +
+            `pane left running (pass --pane to stop the conductor agent and pin recovery)\n`,
+        );
+      }
+      break;
+    }
+
+    case "arm": {
+      process.stdout.write("arm: sending inbound Telegram challenge…\n");
+      const r = await armTicks(flag(argv, "project"));
+      process.stdout.write(
+        `ARMED — inbound round-trip proved with owner ${r.owner}; ticks are now live.\n` +
+          `marker ${r.path}${r.alreadyArmed ? " (replaced previous marker)" : ""}\n`,
+      );
+      break;
+    }
+
+    case "disarm": {
+      const r = disarmTicks(flag(argv, "project"));
+      process.stdout.write(
+        `disarmed — ticks will be skipped` +
+          `${r.wasArmed ? "" : " (was already disarmed)"}\n` +
+          `marker ${r.path}\n`,
+      );
+      break;
+    }
+
+    case "release-pane": {
+      const r = clearPaneHalt(flag(argv, "project"));
+      process.stdout.write(
+        r.wasHalted
+          ? `pane recovery pin cleared — ${r.path}\nherdr-conductor may resume the fleet agent again\n`
+          : `no pane recovery pin at ${r.path}\n`,
+      );
       break;
     }
 
@@ -484,12 +575,18 @@ try {
 
     case "pause":
       setPaused(true);
-      process.stdout.write("paused — no new work will be claimed\n");
+      process.stdout.write(
+        "paused — no new work will be claimed\n" +
+          "note: ticks keep firing if armed; use hold to silence both\n",
+      );
       break;
 
     case "resume":
-      setPaused(false);
-      process.stdout.write("resumed — work will be claimed on the next tick\n");
+      releaseHold();
+      process.stdout.write(
+        "resumed — claiming allowed on the next tick\n" +
+          "note: did NOT re-arm; run arm after an inbound Telegram proof to resume ticks\n",
+      );
       break;
 
     case "graph-setup": {

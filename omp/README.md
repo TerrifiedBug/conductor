@@ -348,6 +348,23 @@ the current tick rather than mid-run. When the live process is the MainPID of
 `Restart=on-failure` cannot bring it straight back; otherwise it is a raw
 `SIGTERM` (then `SIGKILL` after 10 seconds).
 
+
+### Stop the conductor (hold / halt)
+
+Four control planes used to answer "stop" differently. The package verbs:
+
+| Verb | Claiming | Tick sends | Dispatch daemon | Conductor pane |
+| --- | --- | --- | --- | --- |
+| `hold` | paused | disarmed | left running | left running |
+| `halt` | paused | disarmed | stopped (systemctl-aware) | left running |
+| `halt --pane` | paused | disarmed | stopped | stopped + recovery pinned off |
+| `pause` | paused | **still armed** | left running | left running |
+
+`resume` clears pause only and **never re-arms**. `arm` is proof-gated: it sends a Telegram challenge and writes the arm marker only after your reply appears as a *user* turn in the orchestrator transcript. `halt --pane` targets the configured conductor agent only — it does **not** run `systemctl stop herdr-fleet`.
+
+`status` prints a layered header (`dispatch` / `ticks` / `pane` / `recovery` / `herdr` / `daemon`) so a paused fleet cannot hide an armed orchestrator still spending turns.
+
+
 ## How one tick works
 
 Per tick, for the daemon's project:

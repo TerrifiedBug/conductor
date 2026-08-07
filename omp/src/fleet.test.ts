@@ -1,0 +1,344 @@
+/**
+ * Fleet operator surface (#61): hold/halt/arm/disarm + layered status.
+ * Arm is proof-gated — tests inject the challenge deps so no real Telegram.
+ */
+
+import { afterEach, beforeEach, expect, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  armTicks,
+  clearPaneHalt,
+  disarmTicks,
+  fleetLayers,
+  formatFleetStatus,
+  halt,
+  haltWithPane,
+  hold,
+  ompPidsFromProcessInfo,
+  PANE_HALT_FILE,
+  paneHaltPath,
+  pinPaneHalt,
+  releaseHold,
+  sessionDirForCwd,
+  transcriptHasUserCode,
+} from "./fleet.ts";
+import { setSystemctlForTest } from "./lifecycle.ts";
+import { TICK_CONFIG_FILE } from "./orchestrator-tick.ts";
+import { statusSnapshot } from "./daemon.ts";
+
+const HOME_KEY = "HOME";
+const COND_KEY = "OMP_CONDUCTOR_HOME";
+const TG_KEY = "OMP_TELEGRAM_STATE_DIR";
+const RUNTIME_KEY = "OMP_CONDUCTOR_RUNTIME_DIR";
+
+let home = "";
+let previous: Record<string, string | undefined> = {};
+
+beforeEach(() => {
+  home = mkdtempSync(join(tmpdir(), "omp-fleet-"));
+  previous = {
+    HOME: process.env[HOME_KEY],
+    COND: process.env[COND_KEY],
+    TG: process.env[TG_KEY],
+    RUNTIME: process.env[RUNTIME_KEY],
+  };
+  process.env[HOME_KEY] = home;
+  process.env[COND_KEY] = join(home, ".omp", "conductor");
+  process.env[TG_KEY] = join(home, ".omp", "agent", "telegram");
+  process.env[RUNTIME_KEY] = join(home, ".omp", "run", "daemons", "omp-conductor");
+  mkdirSync(process.env[COND_KEY]!, { recursive: true });
+  mkdirSync(process.env[TG_KEY]!, { recursive: true });
+  setSystemctlForTest(() => ({ ok: false, stdout: "", stderr: "not found", missing: true }));
+});
+
+afterEach(() => {
+  setSystemctlForTest(undefined);
+  if (previous.HOME === undefined) delete process.env[HOME_KEY];
+  else process.env[HOME_KEY] = previous.HOME;
+  if (previous.COND === undefined) delete process.env[COND_KEY];
+  else process.env[COND_KEY] = previous.COND;
+  if (previous.TG === undefined) delete process.env[TG_KEY];
+  else process.env[TG_KEY] = previous.TG;
+  if (previous.RUNTIME === undefined) delete process.env[RUNTIME_KEY];
+  else process.env[RUNTIME_KEY] = previous.RUNTIME;
+  rmSync(home, { recursive: true, force: true });
+});
+
+function writeMinimalConfig(): void {
+  const cfg = {
+    version: 2,
+    defaults: {
+      maxConcurrentWorkers: 2,
+      dailySpendUsd: 25,
+      workerMaxTurns: 120,
+      workerWallClockMs: 5_400_000,
+      maxAttemptsPerIssue: 2,
+    },
+    projects: [
+      {
+        name: "demo",
+        tracker: { kind: "github", repo: "acme/demo" },
+        queueLabel: "ready-for-agent",
+        routing: {
+          labelPrefix: "repo:",
+          repos: {
+            api: {
+              name: "api",
+              cloneUrl: "https://example.com/api.git",
+              defaultBranch: "main",
+              gates: [{ cmd: "true", cwd: "." }],
+            },
+          },
+        },
+        caps: {},
+        escalation: { fallbackToIssueComment: true, orchestrator: "external" },
+        authority: { merge: "human", release: "human" },
+        workspaceRoot: join(home, ".omp", "conductor", "worktrees"),
+        mirrorRoot: join(home, ".omp", "conductor", "mirrors"),
+      },
+    ],
+  };
+  writeFileSync(join(process.env[COND_KEY]!, "config.json"), JSON.stringify(cfg, null, 2));
+}
+
+function writeTick(armedFile = "armed"): string {
+  const cwd = process.env[COND_KEY]!;
+  writeFileSync(
+    join(cwd, TICK_CONFIG_FILE),
+    JSON.stringify({
+      intervalSeconds: 600,
+      armedFile,
+      accessFile: join(process.env[TG_KEY]!, "access.json"),
+    }),
+  );
+  return cwd;
+}
+
+function writeChannel(): void {
+  writeFileSync(
+    join(process.env[TG_KEY]!, "access.json"),
+    JSON.stringify({ enabled: true, allowFrom: ["8236653927"] }),
+  );
+  writeFileSync(join(process.env[TG_KEY]!, ".env"), "TELEGRAM_BOT_TOKEN=test-token\n");
+}
+
+function writeTranscript(cwd: string, userText: string): string {
+  const dir = sessionDirForCwd(cwd);
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, "session.jsonl");
+  writeFileSync(
+    path,
+    [
+      JSON.stringify({
+        type: "message",
+        message: { role: "assistant", content: [{ type: "text", text: "hello" }] },
+      }),
+      JSON.stringify({
+        type: "message",
+        message: { role: "user", content: [{ type: "text", text: userText }] },
+      }),
+    ].join("\n") + "\n",
+  );
+  return path;
+}
+
+test("hold pauses claiming and removes the arm marker", () => {
+  writeMinimalConfig();
+  const cwd = writeTick();
+  const armed = join(cwd, "armed");
+  writeFileSync(armed, "armed previously\n");
+  const r = hold();
+  expect(r.wasPaused).toBe(false);
+  expect(r.disarmed.wasArmed).toBe(true);
+  expect(existsSync(armed)).toBe(false);
+  expect(existsSync(join(process.env[COND_KEY]!, "paused"))).toBe(true);
+  const r2 = hold();
+  expect(r2.wasPaused).toBe(true);
+  expect(r2.disarmed.wasArmed).toBe(false);
+});
+
+test("releaseHold clears pause but never re-arms", () => {
+  writeMinimalConfig();
+  writeTick();
+  hold();
+  releaseHold();
+  expect(existsSync(join(process.env[COND_KEY]!, "paused"))).toBe(false);
+  expect(existsSync(join(process.env[COND_KEY]!, "armed"))).toBe(false);
+});
+
+test("halt holds and stops the daemon", async () => {
+  writeMinimalConfig();
+  writeTick();
+  writeFileSync(join(process.env[COND_KEY]!, "armed"), "x\n");
+  const r = await halt();
+  expect(r.hold.disarmed.wasArmed).toBe(true);
+  expect(r.stop).toEqual({ kind: "not-running" });
+  expect(existsSync(join(process.env[COND_KEY]!, "paused"))).toBe(true);
+  expect(existsSync(join(process.env[COND_KEY]!, "armed"))).toBe(false);
+});
+
+test("halt --pane pins recovery first then stops the conductor agent", async () => {
+  writeMinimalConfig();
+  const cwd = writeTick();
+  const signals: Array<{ pid: number; sig: string }> = [];
+  const living = new Set<number>([5150]);
+  const r = await haltWithPane(undefined, {
+    listAgents: async () => [{ name: "fleet", paneId: "w1:p1", agent: "omp" }],
+    panePids: async () => [5150],
+    isAlive: (pid) => living.has(pid),
+    signalPid: (pid, sig) => {
+      signals.push({ pid, sig });
+      if (sig === "SIGTERM" || sig === "SIGKILL") living.delete(pid);
+      return true;
+    },
+    sleep: async () => {},
+  });
+  expect(existsSync(r.pane.pinPath)).toBe(true);
+  expect(r.pane.pinPath).toBe(join(cwd, PANE_HALT_FILE));
+  expect(r.pane.stopped).toBe("herdr-agent");
+  expect(r.pane.agentName).toBe("fleet");
+  expect(signals.some((s) => s.pid === 5150 && s.sig === "SIGTERM")).toBe(true);
+  const cleared = clearPaneHalt();
+  expect(cleared.wasHalted).toBe(true);
+});
+
+test("halt --pane pin is written even when agent already gone", async () => {
+  writeMinimalConfig();
+  writeTick();
+  const r = await haltWithPane(undefined, {
+    listAgents: async () => [],
+    sleep: async () => {},
+  });
+  expect(existsSync(r.pane.pinPath)).toBe(true);
+  expect(r.pane.stopped).toBe("already-gone");
+});
+
+test("halt --pane refuses without unique live omp claim", async () => {
+  writeMinimalConfig();
+  writeTick();
+  const r = await haltWithPane(undefined, {
+    listAgents: async () => [
+      { name: "fleet", paneId: "w1:p1", agent: "omp" },
+      { name: "fleet", paneId: "w1:p2", agent: "omp" },
+    ],
+    sleep: async () => {},
+  });
+  expect(r.pane.stopped).toBe("unavailable");
+  expect(existsSync(r.pane.pinPath)).toBe(true);
+});
+
+test("disarm removes marker; arm requires inbound user-turn proof", async () => {
+  writeMinimalConfig();
+  const cwd = writeTick();
+  writeChannel();
+  writeTranscript(cwd, "not yet");
+  expect(disarmTicks().wasArmed).toBe(false);
+  await expect(
+    armTicks(undefined, {
+      sendChallenge: async () => {},
+      waitForUserTurn: async () => false,
+      timeoutMs: 10,
+      sleep: async () => {},
+    }),
+  ).rejects.toThrow(/NOT armed/);
+  expect(existsSync(join(cwd, "armed"))).toBe(false);
+  let sent = "";
+  const r = await armTicks(undefined, {
+    sendChallenge: async (_t, _o, text) => {
+      sent = text;
+    },
+    waitForUserTurn: async (_path, code) => {
+      expect(sent).toContain(code);
+      return true;
+    },
+    timeoutMs: 10,
+    sleep: async () => {},
+  });
+  expect(r.owner).toBe("8236653927");
+  expect(existsSync(r.path)).toBe(true);
+});
+
+test("arm refuses when channel is down — no force path", async () => {
+  writeMinimalConfig();
+  writeTick();
+  writeFileSync(
+    join(process.env[TG_KEY]!, "access.json"),
+    JSON.stringify({ enabled: false, allowFrom: ["1"] }),
+  );
+  await expect(armTicks()).rejects.toThrow(/channel is not up/);
+});
+
+test("arm refuses when there is no tick config", async () => {
+  writeMinimalConfig();
+  await expect(armTicks()).rejects.toThrow(/no \.conductor-tick\.json/);
+});
+
+test("transcriptHasUserCode only counts user turns", async () => {
+  const path = join(home, "t.jsonl");
+  writeFileSync(
+    path,
+    [
+      JSON.stringify({
+        type: "message",
+        message: { role: "assistant", content: [{ type: "text", text: "FLEET-DEADBEEF" }] },
+      }),
+      JSON.stringify({
+        type: "message",
+        message: { role: "user", content: [{ type: "text", text: "ok FLEET-CAFEBABE here" }] },
+      }),
+    ].join("\n") + "\n",
+  );
+  expect(await transcriptHasUserCode(path, "FLEET-DEADBEEF")).toBe(false);
+  expect(await transcriptHasUserCode(path, "FLEET-CAFEBABE")).toBe(true);
+});
+
+test("ompPidsFromProcessInfo selects only omp foreground pids", () => {
+  const pids = ompPidsFromProcessInfo({
+    shell_pid: 4242,
+    foreground_processes: [
+      { pid: 4242, name: "bash", argv0: "-bash" },
+      { pid: 5150, name: "bun", argv0: "bun", argv: ["bun", "omp", "--resume=/tmp/x"] },
+      { pid: 5151, name: "omp" },
+      { pid: 9999, name: "claude", argv: ["claude"] },
+    ],
+  });
+  expect(pids.sort()).toEqual([5150, 5151]);
+});
+
+test("fleetLayers reports dispatch stopped + ticks disarmed after hold", () => {
+  writeMinimalConfig();
+  writeTick();
+  writeFileSync(join(process.env[COND_KEY]!, "armed"), "x\n");
+  hold();
+  const layers = fleetLayers();
+  expect(layers.dispatch).toBe("stopped");
+  expect(layers.ticks).toBe("disarmed");
+  expect(layers.paused).toBe(true);
+});
+
+test("fleetLayers separates pane liveness from recovery pin", () => {
+  writeMinimalConfig();
+  writeTick();
+  pinPaneHalt();
+  const layers = fleetLayers();
+  expect(layers.recovery).toBe("pinned");
+  expect(layers.recoveryDetail).toBe(paneHaltPath());
+  expect(["live", "missing", "unknown"]).toContain(layers.pane);
+});
+
+test("formatFleetStatus stacks dispatch/ticks/pane/recovery/herdr/daemon", () => {
+  writeMinimalConfig();
+  writeTick();
+  hold();
+  const s = statusSnapshot();
+  const text = formatFleetStatus(s, fleetLayers());
+  expect(text).toContain("dispatch  stopped");
+  expect(text).toContain("ticks     disarmed");
+  expect(text).toMatch(/pane\s+/);
+  expect(text).toMatch(/recovery\s+/);
+  expect(text).toMatch(/herdr\s+/);
+  expect(text).toContain("daemon    not running");
+  expect(text).toContain("project   demo  (PAUSED)");
+});

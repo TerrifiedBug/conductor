@@ -1021,6 +1021,24 @@ else
   fail 'an unreachable API pages with the CLI error text' "${reported//$'\n'/ | }"
 fi
 
+
+# --------------------------------------------------------------------------
+# case 14 — omp-conductor halt --pane pins recovery off; recover no-ops without
+# paging or starting the agent (conductor agent only — not a herdr unit stop)
+# --------------------------------------------------------------------------
+
+d=$(newcase pane-halted)
+saved_session_json fleet "$REF" >"$d/session/session.json"
+# A live agent would normally short-circuit; the pin must win even then.
+live_agent_list fleet 'w1:p1' "$REF" >"$d/agent-list.json"
+process_info_omp 'w1:p1' >"$d/process-info-w1:p1.json"
+mkdir -p "$d/fleet-cwd"
+sed -i.bak "s|^FLEET_CWD=.*|FLEET_CWD=$d/fleet-cwd|" "$d/config/config.env"
+printf '# halted by test\n' >"$d/fleet-cwd/.conductor-pane-halted"
+out=$(run_recover "$d")
+check 'halt --pane pin skips recovery' "skip: pane recovery pinned off" "$out"
+assert_inert 'halt --pane pin skips recovery' "$d"
+
 # --------------------------------------------------------------------------
 
 if (( failures > 0 )); then

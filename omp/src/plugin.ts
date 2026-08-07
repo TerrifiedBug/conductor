@@ -24,13 +24,22 @@ import {
 import { configPath, expandHome, findProject, loadConfig, saveConfig } from "./config.ts";
 import {
   armConductor,
-  formatStatus,
   isPaused,
   previewQueue,
   setPaused,
-  statusSnapshot,
   type QueuePreview,
 } from "./daemon.ts";
+import {
+  armTicks,
+  clearPaneHalt,
+  disarmTicks,
+  halt,
+  haltWithPane,
+  hold,
+  releaseHold,
+  renderStatus,
+} from "./fleet.ts";
+
 import { defaultGraphRoot } from "./graph.ts";
 import {
   AMEND_AREAS,
@@ -124,9 +133,14 @@ const SUBCOMMANDS: Completion[] = [
     label: "setup",
     description: "wizard: config, labels, dry run, then arm — or amend one area of a configured project",
   },
-  { value: "status", label: "status", description: "pause state, caps, active runs, today's usage" },
-  { value: "pause", label: "pause", description: "stop claiming new work" },
-  { value: "resume", label: "resume", description: "allow claiming again" },
+  { value: "status", label: "status", description: "layered fleet report: dispatch, ticks, pane, herdr, daemon" },
+  { value: "hold", label: "hold", description: "soft stop: pause claiming AND disarm ticks" },
+  { value: "halt", label: "halt", description: "hold + stop dispatch daemon; pass --pane to pin recovery off" },
+  { value: "arm", label: "arm", description: "proof-gated: inbound Telegram round-trip, then write arm marker" },
+  { value: "disarm", label: "disarm", description: "remove arm marker so ticks skip" },
+  { value: "release-pane", label: "release-pane", description: "clear halt --pane recovery pin" },
+  { value: "pause", label: "pause", description: "stop claiming only (ticks keep firing if armed); prefer hold" },
+  { value: "resume", label: "resume", description: "clear pause only — does not re-arm" },
   {
     value: "brief-upgrade",
     label: "brief-upgrade",
@@ -136,9 +150,14 @@ const SUBCOMMANDS: Completion[] = [
 
 const USAGE = [
   "/conductor setup [project]         create a project, or amend one area of one you already have",
-  "/conductor status [project]        pause state, caps, active runs, today's usage",
-  "/conductor pause                   stop claiming new work",
-  "/conductor resume                  allow claiming again",
+  "/conductor status [project]        layered fleet report (dispatch, ticks, pane, herdr, daemon)",
+  "/conductor hold [project]          soft stop: pause claiming AND disarm ticks",
+  "/conductor halt [--pane] [project] hold + stop daemon; --pane pins conductor recovery off only",
+  "/conductor arm [project]           proof-gated inbound Telegram round-trip, then arm ticks",
+  "/conductor disarm [project]        remove arm marker (ticks skip)",
+  "/conductor release-pane [project]  clear halt --pane recovery pin",
+  "/conductor pause                   stop claiming only (prefer hold)",
+  "/conductor resume                  clear pause only — does not re-arm",
   "/conductor brief-upgrade [project] check ORCHESTRATOR.md against the shipped brief",
 ].join("\n");
 
@@ -915,7 +934,10 @@ export default function conductorPlugin(pi: PluginApi): void {
     handler: async (args, ctx) => {
       // findProject() throws when the config holds several projects and none is
       // named, so the project name rides along as an optional second word.
-      const [sub, project] = args.trim().split(/\s+/);
+      const tokens = args.trim().split(/\s+/).filter(Boolean);
+      const sub = tokens[0];
+      const withPane = tokens.includes("--pane");
+      const project = tokens.find((t, i) => i > 0 && t !== "--pane");
 
       try {
         switch (sub) {
@@ -924,17 +946,70 @@ export default function conductorPlugin(pi: PluginApi): void {
             break;
 
           case "status":
-            ctx.ui.notify(formatStatus(statusSnapshot(project)), "info");
+            ctx.ui.notify(await renderStatus(project), "info");
             break;
+
+          case "hold": {
+            const r = hold(project);
+            ctx.ui.notify(
+              `Held — claiming paused; ticks disarmed at ${r.disarmed.path}. Daemon and pane left running.`,
+              "info",
+            );
+            break;
+          }
+
+          case "halt": {
+            if (withPane) {
+              const r = await haltWithPane(project);
+              const stop =
+                r.stop.kind === "not-running"
+                  ? "daemon was not running"
+                  : `daemon stopped (pid ${r.stop.pid})`;
+              ctx.ui.notify(
+                `Halted — ${stop}. Pane: ${r.pane.stopped} (${r.pane.detail}); recovery pinned at ${r.pane.pinPath}.`,
+                "info",
+              );
+            } else {
+              const r = await halt(project);
+              const stop =
+                r.stop.kind === "not-running"
+                  ? "daemon was not running"
+                  : `daemon stopped (pid ${r.stop.pid})`;
+              ctx.ui.notify(`Halted — ${stop}. Pane left running.`, "info");
+            }
+            break;
+          }
+
+          case "arm": {
+            ctx.ui.notify("Arm: sending inbound Telegram challenge — reply in the bot DM…", "info");
+            const r = await armTicks(project);
+            ctx.ui.notify(`ARMED — owner ${r.owner}; marker ${r.path}`, "info");
+            break;
+          }
+
+          case "disarm": {
+            const r = disarmTicks(project);
+            ctx.ui.notify(`Disarmed — ${r.path}`, "info");
+            break;
+          }
+
+          case "release-pane": {
+            const r = clearPaneHalt(project);
+            ctx.ui.notify(
+              r.wasHalted ? `Pane recovery pin cleared (${r.path}).` : `No pane recovery pin at ${r.path}.`,
+              "info",
+            );
+            break;
+          }
 
           case "pause":
             setPaused(true);
-            ctx.ui.notify("Conductor paused — no new work will be claimed.", "info");
+            ctx.ui.notify("Paused claiming only — ticks keep firing if armed. Prefer /conductor hold.", "info");
             break;
 
           case "resume":
-            setPaused(false);
-            ctx.ui.notify("Conductor resumed — work will be claimed on the next tick.", "info");
+            releaseHold();
+            ctx.ui.notify("Resumed claiming — did NOT re-arm. Run /conductor arm for ticks.", "info");
             break;
 
           case "brief-upgrade": {
