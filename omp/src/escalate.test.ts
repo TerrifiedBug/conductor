@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { createEscalator, formatEscalation } from "./escalate.ts";
+import { createEscalator, escalationIssueRef, formatEscalation } from "./escalate.ts";
 import type { OrchestratorHandle } from "./orchestrator.ts";
 import { DEFAULT_AUTHORITY } from "./types.ts";
 import type { Escalation, OrchestratorMode, ProjectConfig, Store, Tracker } from "./types.ts";
@@ -264,6 +264,32 @@ test("formatEscalation names the tier, issue number and summary", () => {
   expect(text).toContain(tier2.summary);
   expect(text).toContain("demo");
   expect(text).toContain("run_def");
+});
+
+test("fleet-scoped pages render as 'fleet', never as '#0'", () => {
+  expect(escalationIssueRef(0)).toBe("fleet");
+  expect(escalationIssueRef(82)).toBe("#82");
+  const text = formatEscalation({ ...tier2, issue: 0, summary: "integrity tripwire" }, "demo");
+  expect(text).toContain("issue: fleet");
+  expect(text).not.toContain("#0");
+});
+
+test("fleet-scoped pages cannot fall back to commenting on issue #0", async () => {
+  const { tracker, comments } = makeTracker();
+  const { store, marked } = makeStore();
+  const p = makeProject({ fallbackToIssueComment: true });
+  const fleetPage = {
+    tier: 2 as const,
+    project: "demo",
+    issue: 0,
+    summary: "Installed conductor changed under a running daemon — demo is paused",
+  };
+
+  await expect(createEscalator(p, tracker, store).escalate(fleetPage)).rejects.toThrow(
+    /fleet-scoped|no issue to comment on/,
+  );
+  expect(comments.length).toBe(0);
+  expect(marked.length).toBe(0);
 });
 
 test("a Telegram failure never leaks the bot token", async () => {
