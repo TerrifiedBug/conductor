@@ -454,19 +454,48 @@ A `claimed` or `running` row is a promise that a worker process exists, and a
 daemon that just started knows that promise is broken: its workers died with the
 previous process. At startup — unless another daemon is alive, so a foreground
 `daemon --once` cannot orphan a running daemon's real workers — every such row is
-moved to `orphaned`, with a log line naming the issue, the attempt and the
-worktree. That frees the slots immediately; a fleet must never resume as
-deadlocked as it crashed.
+**salvaged first** (dirty tree → `wip(#N): attempt N killed by a daemon restart —
+auto-salvaged` on the run's branch, same path as a turns-cap kill), then moved to
+`orphaned`, with a log line naming the issue, the attempt and the worktree. That
+frees the slots immediately; a fleet must never resume as deadlocked as it
+crashed, and uncommitted edits must not wait for a human with `bun -e`.
 
-Only the rows change. The issue keeps `agent:in-progress` — the label is the
-crash guard against double-dispatch — and deciding what the dead worker's remains
-are worth is the orchestrator's drain-duty judgement, spelled out in its brief:
-an open green PR goes to the merge path, a dirty tree is reported before anything
-destroys it (uncommitted edits have no other copy; unpushed *commits* are safe on
-the run's branch in the mirror, which a retry deliberately reattaches), and a
-clean orphan has its label released so the next tick re-claims it. Orphaned
-attempts still count toward `maxAttemptsPerIssue`, so a crash loop escalates
-instead of redispatching forever.
+Only the rows change after salvage. The issue keeps `agent:in-progress` — the
+label is the crash guard against double-dispatch — and deciding what the dead
+worker's remains are worth is the orchestrator's drain-duty judgement, spelled
+out in its brief: an open green PR goes to the merge path, a salvaged sha is a
+continuation hand-off, and a clean orphan has its label released so the next
+tick re-claims it. Orphaned attempts still count toward `maxAttemptsPerIssue`,
+so a crash loop escalates instead of redispatching forever.
+
+### Deploying a new package onto a busy fleet
+
+`systemctl restart` / `omp-conductor restart` is safe for **work product** once
+this version is installed: startup salvage commits dirty trees before orphaning
+rows, and salvage rewrites the mirror's managed `info/exclude` to the package's
+current list before `git add` so a narrowed ignore cannot hide deliverables.
+
+It is still disruptive for **in-flight sessions** (the worker process dies; the
+attempt is spent). Prefer draining when you can wait:
+
+1. `omp-conductor pause` — stop new claims; live workers finish.
+2. Wait until `omp-conductor status` shows `workers 0 / N` (no `deploy` hint line).
+3. Install the new package (`bun add -g omp-conductor@…`, `omp plugin install …`).
+4. `systemctl restart omp-conductor` (or `omp-conductor restart`).
+5. `omp-conductor resume` if you left it paused.
+
+If you cannot wait:
+
+1. `omp-conductor pause` (optional but keeps new claims off during the swap).
+2. Install.
+3. Restart — salvage runs on boot for every live worktree, then rows go `orphaned`.
+4. Resume; the pane orchestrator triages `agent:in-progress` orphans (continuation
+   / merge / release label). Status prints a `deploy` line while live workers > 0
+   so you can see the risk before you restart.
+
+Do **not** edit files under the running install and expect the daemon to keep
+dispatching — the integrity tripwire pauses and pages. Install, then restart, so
+the new process records a fresh baseline.
 
 ### What settles a green PR
 
@@ -1066,8 +1095,8 @@ omp-conductor help
 | --- | --- |
 | `start` | Spawn the loop in the background, detached, and wait until it answers `GET /healthz` on `:8787`. Refuses if one is already live, naming its pid. If the process dies or never serves, `start` cleans up after it and quotes the tail of `daemon.log`. |
 | `stop` | `SIGTERM`, then `SIGKILL` after a 10-second grace period. Prints `not running` when there is nothing to stop. |
-| `restart` | `stop` then `start`, inheriting the running daemon's port and project unless a flag overrides them — a restart that quietly moved to the default port would leave every existing health check pointing at nothing. |
-| `status [--project NAME]` | Pause state, config and state paths, resolved caps, active runs and today's usage, plus a `daemon` block: pid, uptime, port, project, `/healthz` result and log path. A `.conductor-stalled` marker in the state directory adds an `orchestrator   STALLED since …` line — see [the stall marker](#a-wedged-session-and-the-marker-that-notices). Reads while a daemon in another process writes. |
+| `restart` | `stop` then `start`, inheriting the running daemon's port and project unless a flag overrides them. The new process **salvages dirty live worktrees before orphaning** those rows — see [Deploying a new package onto a busy fleet](#deploying-a-new-package-onto-a-busy-fleet). |
+| `status [--project NAME]` | Pause state, config and state paths, resolved caps, active runs and today's usage, plus a `daemon` block: pid, uptime, port, project, `/healthz` result and log path. While live workers > 0, prints a `deploy` line naming the count so a busy restart is visible before you take it. A `.conductor-stalled` marker in the state directory adds an `orchestrator   STALLED since …` line — see [the stall marker](#a-wedged-session-and-the-marker-that-notices). Reads while a daemon in another process writes. |
 | `tail <issue>` | Follow the newest run for that issue: the worker's assistant text as `assistant: …` and each tool it calls as `tool: <name>`, printed as they land. Workers are omp sessions inside the daemon rather than terminals, so this is the only way to watch one live — a herdr pane running it becomes an observation window. Starts from the top of the transcript, not the end, so attaching to a run that is already ten turns in shows those ten turns. Exits `1` with `no run recorded for #N` when the issue has never been dispatched, or `no transcript yet (state: …)` when the attempt has not opened one. Otherwise it runs until `Ctrl-C`, or until the run has finished and its transcript has been silent for five seconds, and prints `run ended: <state>`. |
 | `unblock <issue>` | Remove that issue's `blocked` and `failed` state labels through the tracker, so the next tick can claim it again. This is the supported way back for an escalation you answered: eligibility disqualifies any issue carrying a state label, so an answered issue that keeps one is never re-claimed and the answer is inert. Removing a label the issue does not carry is a no-op, so both are always cleared and neither has to be looked up first. `agent:in-progress` is deliberately not touched — it means a worker process exists, which is not something an answer changes. The run history is left exactly as it is: an answered block still spent a worker, so it still counts toward `maxAttemptsPerIssue`, and the output says how many attempts remain — or warns that the next tick will escalate instead of dispatching, when none do. Exits `2` with `unblock needs an issue number` on a missing or malformed positional. |
 | `daemon` | Run the loop in the **foreground**, ticking every 5 minutes and serving `/healthz`. This is what `start` launches, and what a systemd unit should call. Writes the pidfile itself, and refuses with `another daemon is alive (pid N); stop it first` rather than becoming a second dispatcher. |

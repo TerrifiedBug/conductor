@@ -89,11 +89,11 @@ describe("reconcileOrphanedRuns", () => {
     store.close();
   });
 
-  it("settles claimed and running rows from a dead process and frees their slots", () => {
+  it("settles claimed and running rows from a dead process and frees their slots", async () => {
     const running = store.createRun(draft({ issue: 1, state: "running" }));
     const claimed = store.createRun(draft({ issue: 2, state: "claimed", startedAt: 2_000 }));
 
-    const orphaned = reconcileOrphanedRuns(store, PROJECT);
+    const orphaned = await reconcileOrphanedRuns(store, PROJECT);
 
     // The function reports what it settled, pre-transition, so the caller can
     // log each one with the state it died in.
@@ -107,10 +107,10 @@ describe("reconcileOrphanedRuns", () => {
     expect(store.activeRuns(PROJECT)).toEqual([]);
   });
 
-  it("leaves a green PR awaiting merge exactly as it was", () => {
+  it("leaves a green PR awaiting merge exactly as it was", async () => {
     const pushed = store.createRun(draft({ issue: 3, state: "pushed-green" }));
 
-    expect(reconcileOrphanedRuns(store, PROJECT)).toEqual([]);
+    expect(await reconcileOrphanedRuns(store, PROJECT)).toEqual([]);
 
     // pushed-green holds no process, so a process dying cannot orphan it — and
     // its issue must stay occupied or a second attempt lands on the live PR.
@@ -119,26 +119,78 @@ describe("reconcileOrphanedRuns", () => {
     expect(store.activeRuns(PROJECT).map((r) => r.id)).toEqual([pushed.id]);
   });
 
-  it("never touches another project's runs", () => {
+  it("never touches another project's runs", async () => {
     const other = store.createRun(draft({ project: "neighbour", state: "running" }));
 
-    reconcileOrphanedRuns(store, PROJECT);
+    await reconcileOrphanedRuns(store, PROJECT);
 
     // One daemon serves one project; reconciling a neighbour's live workers
     // would be the --once-beside-a-daemon hazard in another costume.
     expect(store.getRun(other.id)?.state).toBe("running");
   });
 
-  it("orphaned attempts still count toward the attempt cap", () => {
+  it("orphaned attempts still count toward the attempt cap", async () => {
     store.createRun(draft({ issue: 9, attempt: 1, state: "running" }));
-    reconcileOrphanedRuns(store, PROJECT);
+    await reconcileOrphanedRuns(store, PROJECT);
     store.createRun(draft({ issue: 9, attempt: 2, state: "running", startedAt: 2_000 }));
-    reconcileOrphanedRuns(store, PROJECT);
+    await reconcileOrphanedRuns(store, PROJECT);
 
     // A worker that keeps dying on one issue is indistinguishable from a worker
     // that keeps failing on it: the cap must escalate it to a human rather than
     // let a crash loop redispatch forever.
     expect(store.attemptsFor(PROJECT, 9)).toBe(2);
+  });
+
+  it("salvages a dirty worktree before marking the row orphaned", async () => {
+    // #35: restart used to flip the row and leave dirty edits for the next
+    // attempt's `worktree remove --force`. The path must commit first.
+    const { mkdtempSync, writeFileSync, rmSync, mkdirSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const root = mkdtempSync(join(tmpdir(), "orphan-salvage-"));
+    try {
+      const origin = join(root, "origin.git");
+      const tree = join(root, "tree");
+      const run = (args: string[], cwd: string) => {
+        const res = Bun.spawnSync(
+          [
+            "git",
+            "-c",
+            "user.email=t@t.invalid",
+            "-c",
+            "user.name=t",
+            "-c",
+            "commit.gpgsign=false",
+            ...args,
+          ],
+          { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe", env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } },
+        );
+        if (res.exitCode !== 0) {
+          throw new Error(res.stderr.toString() || res.stdout.toString());
+        }
+        return res.stdout.toString().trim();
+      };
+      run(["init", "--bare", "--initial-branch=main", origin], root);
+      run(["clone", origin, tree], root);
+      writeFileSync(join(tree, "README.md"), "seed\n");
+      run(["add", "README.md"], tree);
+      run(["commit", "-m", "seed"], tree);
+      run(["checkout", "-b", "feat/orphan-wip"], tree);
+      run(["push", "-u", "origin", "feat/orphan-wip"], tree);
+      writeFileSync(join(tree, "wip.py"), "print(1)\n");
+
+      const row = store.createRun(
+        draft({ issue: 35, state: "running", worktree: tree, branch: "feat/orphan-wip" }),
+      );
+      await reconcileOrphanedRuns(store, PROJECT);
+
+      expect(store.getRun(row.id)?.state).toBe("orphaned");
+      expect(run(["status", "--porcelain"], tree)).toBe("");
+      expect(run(["log", "-1", "--format=%s"], tree)).toContain("daemon restart");
+      expect(run(["show", "--name-only", "--format=", "HEAD"], tree)).toContain("wip.py");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

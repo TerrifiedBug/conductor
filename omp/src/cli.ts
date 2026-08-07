@@ -48,7 +48,9 @@ usage:
            already running.
   stop     signal the running daemon and wait for it to exit.
   restart  stop then start, keeping the running daemon's port and project
-           unless a flag overrides them.
+           unless a flag overrides them. On boot the new process salvages any
+           dirty live worktrees before orphaning those rows — see README
+           "Deploying a new package onto a busy fleet".
   status   show pause state, caps, active runs, today's usage, and whether a
            daemon is alive.
   tail     follow the newest run for <issue>: the worker's assistant text and

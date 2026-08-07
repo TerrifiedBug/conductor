@@ -195,6 +195,40 @@ async function configureMirror(mirrorPath: string): Promise<void> {
 }
 
 /**
+ * Rewrites this worktree's common `info/exclude` managed block to the package's
+ * current list. Salvage must do this itself: it is the path that runs after a
+ * package swap, when the mirror may still carry a previous release's patterns,
+ * and `git add -A` would otherwise silently skip legitimate new files the old
+ * list happened to name (dogfood 2026-08-07 / #44).
+ *
+ * Failures are swallowed — a missing common dir is "no exclude to heal", and
+ * the salvage dirty check still runs. Never throws into the salvage outcome.
+ */
+function refreshManagedExclude(worktree: string): void {
+  try {
+    // `--git-common-dir` is relative for linked worktrees; resolve against the
+    // tree so bare-mirror layouts and plain clones both land on info/exclude.
+    const common = Bun.spawnSync(["git", "rev-parse", "--git-common-dir"], {
+      cwd: worktree,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    });
+    if (common.exitCode !== 0) return;
+    const raw = common.stdout.toString().trim();
+    if (raw === "") return;
+    const commonDir = raw.startsWith("/") ? raw : join(worktree, raw);
+    const exclude = join(commonDir, "info", "exclude");
+    mkdirSync(dirname(exclude), { recursive: true });
+    writeFileSync(exclude, mergeExclude(existsSync(exclude) ? readFileSync(exclude, "utf8") : ""));
+  } catch {
+    // ponytail: exclude heal is best-effort; salvage still prefers a commit of
+    // whatever git can see over failing the whole orphan path.
+  }
+}
+
+/**
  * Returns the path of the bare mirror for `repo`, cloning it on first use and
  * refreshing it otherwise.
  *
@@ -405,6 +439,12 @@ export async function salvageWip(
     // git, because a missing cwd fails at spawn time rather than as an exit
     // code, and "no tree" is not a salvage failure worth alarming anyone with.
     if (!existsSync(worktree)) return { kind: "nothing" };
+
+    // Heal the managed ignore *before* status/add. A mirror left by an older
+    // build may still list patterns this release dropped; without this, an
+    // untracked deliverable matching the stale list is invisible to salvage
+    // and dies with the next `worktree remove --force` (#44).
+    refreshManagedExclude(worktree);
 
     if ((await git(["status", "--porcelain"], worktree)) === "") return { kind: "nothing" };
 
