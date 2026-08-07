@@ -102,15 +102,26 @@ const EXCLUDE_END = "# <<< omp-conductor";
 
 /**
  * Appended to every mirror's `info/exclude`, and so in force in every worktree
- * cut from it. Deliberately the same shapes salvage therefore skips, and
- * for the same reason — a worker's own scaffolding is not the repo's business.
+ * cut from it: a worker's own scaffolding is not the repo's business, and
+ * keeping it out of `git status` keeps it out of the worker's own `git add -A`
+ * as well as out of salvage.
  *
- * Two layers because they catch different moments: this one keeps scratch out
- * of a worker's own `git add -A` and out of its `git status`, which salvage
- * never observes; the salvage list catches whatever a worker created before
- * this landed, or wrote past an ignore with `add -f`.
+ * **Only `.scratch*`, and that narrowness is the whole design.** An ignore here
+ * applies to every repo this fleet touches, and an ignored *new* file is
+ * invisible to salvage — `git add -A` skips it, and a tree holding only such
+ * files reports `nothing`. So a name that could plausibly be a deliverable must
+ * never appear in this list. The first version also carried `.env.local` and
+ * `*.local.sh`, which is exactly that mistake: plenty of repos legitimately
+ * ship a `bootstrap.local.sh` or an `.env.local` template, and a worker asked
+ * to add one would have watched it vanish.
+ *
+ * `.scratch*` survives the test because nothing ships under that name — it was
+ * the 2026-08-07 incident's shape (`.scratch82/env.sh`) and reads as scaffolding
+ * to any human. Broader conventions belong in a repo's own `.gitignore`, where
+ * its operator chooses them, rather than being imposed by whatever dispatcher
+ * happens to be driving.
  */
-const LOCAL_EXCLUDE = [".scratch*/", ".scratch*", ".env.local", "*.local.sh"];
+const LOCAL_EXCLUDE = [".scratch*/", ".scratch*"];
 
 /**
  * Adds the managed block to an `info/exclude`, preserving everything else.
