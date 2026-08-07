@@ -13,6 +13,8 @@
  * site on purpose: a non-literal specifier stops `tsc` from trying to resolve
  * the module, which is the whole reason this shim exists.
  */
+import { worktreeConfinement } from "./confinement.ts";
+
 const OMP_PACKAGE = "@oh-my-pi/pi-coding-agent";
 
 /**
@@ -114,6 +116,12 @@ export async function createSession(opts: {
   sessionDir?: string;
   model?: string;
   resume?: boolean;
+  /**
+   * Install the worktree `tool_call` gate so structured file tools cannot
+   * leave `cwd`. Workers pass true; the orchestrator leaves this off — it has
+   * to read the state directory and briefs.
+   */
+  confineToCwd?: boolean;
 }): Promise<AgentSessionLike> {
   let loaded: unknown;
   try {
@@ -167,6 +175,10 @@ export async function createSession(opts: {
     // agentDir (~/.omp/agent/mcp.json) — without this, workers grep-only and
     // burn the turns cap on discovery (#29).
     enableMCP: true,
+    // Mechanical worktree gate (#24): structured write/edit/read/grep/glob
+    // whose path resolves outside cwd are blocked before execution. Inline
+    // extension — the harness has no separate fs-policy field.
+    ...(opts.confineToCwd ? { extensions: [worktreeConfinement(opts.cwd)] } : {}),
   });
   const raw = asRawSession(created);
   // Surfaced rather than swallowed: this is how a quiet downgrade to a weaker

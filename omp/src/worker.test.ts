@@ -28,7 +28,7 @@ function fakeHarness(opts?: {
   sessionFile?: string;
   gated?: boolean;
 }) {
-  const received: { cwd?: string; sessionDir?: string; model?: string }[] = [];
+  const received: { cwd?: string; sessionDir?: string; model?: string; confineToCwd?: boolean }[] = [];
   const handlers = new Map<string, ((e: unknown) => void)[]>();
   const entered = Promise.withResolvers<void>();
   const gate = Promise.withResolvers<void>();
@@ -60,7 +60,7 @@ function fakeHarness(opts?: {
     started: entered.promise,
     release: () => gate.resolve(),
     deps: {
-      createSession: async (o: { cwd: string; sessionDir?: string; model?: string }) => {
+      createSession: async (o: { cwd: string; sessionDir?: string; model?: string; confineToCwd?: boolean }) => {
         received.push(o);
         return session;
       },
@@ -95,6 +95,16 @@ describe("runWorker session options", () => {
     // Absent, not empty-string: the harness reads its own default only when the
     // key is missing.
     expect(harness.received[0]).not.toHaveProperty("model");
+  });
+
+  test("asks createSession to confine structured tools to the worktree", async () => {
+    const harness = fakeHarness();
+
+    await runWorker(workerOpts(), harness.deps);
+
+    // Prevention half of #24: without this flag the harness extension is never
+    // installed and write/edit/read can leave the checkout.
+    expect(harness.received[0]?.confineToCwd).toBe(true);
   });
 
   test("carries a model downgrade out on the result so the daemon can log it", async () => {

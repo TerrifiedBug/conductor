@@ -1259,23 +1259,30 @@ The worker ends with a six-line evidence report (issue, pr, state, gates, change
 next). `pushed-green` means it watched the checks go green rather than expecting
 them to.
 
-### The boundary is prompt text — and one tripwire
+### Worker confinement and the integrity tripwire
 
-A worker session gets a `cwd` and nothing else: the harness applies no filesystem
-or network restriction, so "touch any path outside its worktree" is a rule the
-session is asked to keep, not one the process cannot break. Target selection *is*
-mechanical — only a repo in `routing.repos` is ever checked out — and so are the
-caps, but between them they bound where work starts and how much of it happens,
-not how far a wandering or prompt-injected session can reach.
+A worker session is rooted at its worktree `cwd`. **Structured file tools are
+gated mechanically:** `runWorker` asks `createSession({ confineToCwd: true })`,
+which installs an inline harness extension that blocks `write` / `edit` /
+`read` / `grep` / `glob` when the tool's path resolves outside that worktree
+(symlink-aware). Target selection was already mechanical — only a repo in
+`routing.repos` is ever checked out — and the caps still bound *how much* work
+happens.
 
-The one path that is checked mechanically is the conductor itself. At startup the
-daemon sha256s every `.ts` and `.md` file of its own installed `src/` — the
-dispatcher and the briefs both, since rewriting a brief buys more than rewriting
-the loop — and re-walks that tree on every tick (about 0.6 ms). Any difference at
-all, changed or added or removed, is read as the package having been modified
-underneath a running daemon: the tick claims nothing, the fleet is paused, and a
-tier-2 escalation naming the first few differing paths pages you **once**, not
-every five minutes.
+**`bash` is not gated.** Its argument is an opaque shell string; pretending to
+parse it would be a false sense of security. The brief still forbids escaping
+via the shell, and the deploy-level answer is a least-privilege worker uid
+(below).
+
+#### Integrity tripwire (package self-hash)
+
+Separately, the conductor watches *itself*. At startup the daemon sha256s every
+`.ts` and `.md` file of its own installed `src/` — the dispatcher and the briefs
+both, since rewriting a brief buys more than rewriting the loop — and re-walks
+that tree on every tick (about 0.6 ms). Any difference at all, changed or added
+or removed, is read as the package having been modified underneath a running
+daemon: the tick claims nothing, the fleet is paused, and a tier-2 escalation
+naming the first few differing paths pages you **once**, not every five minutes.
 
 **A normal deploy never trips it.** The baseline is recorded per daemon process,
 so installing a new build and restarting the unit re-records it from the new
@@ -1284,9 +1291,32 @@ diverge from it. That also means `omp-conductor resume` on its own will not hold
 — the next tick re-walks, still differs, and pauses again. Put the files back, or
 restart onto the build you meant to be running.
 
-This is detection, not prevention. It catches the worker that wandered, and it
-catches the human who edited the live install "just to test something", which in
-practice is the commoner of the two.
+This catches a worker (or human) that still managed to edit the live install —
+including via `bash` — after the fact. It is detection for the package boundary,
+not a substitute for the worktree gate or a dedicated uid.
+
+#### Least-privilege worker uid (deploy)
+
+The largest remaining win is OS-level: run the daemon (or at least worker
+sessions, when the harness supports a uid switch) as a user that can write only
+its worktrees and mirrors. A sketch that matches the reference single-host
+deploy:
+
+1. Create a system user, e.g. `conductor-worker`, with home under
+   `/var/lib/conductor-worker` (or similar).
+2. `chown` the project's `workspaceRoot` and `mirrorRoot` to that user; leave
+   `~/.omp/conductor/config.json` readable only by the operator/daemon account
+   (`0600` as shipped).
+3. Do **not** put the worker uid in `docker` / `sudoers`, and do not give it the
+   operator's `gh` auth if a narrower deploy token can open PRs in the routed
+   repos alone.
+4. Point the [example systemd unit](systemd/omp-conductor.service.example)
+   `User=` / `Group=` at that account once the daemon itself should run
+   unprivileged end-to-end.
+
+Until that uid exists, a root-or-operator daemon still has a mechanical
+worktree gate on structured tools and an integrity tripwire on its own package —
+but `bash` plus host credentials remain a prompt-and-deploy problem.
 
 ## Limitations
 
@@ -1340,13 +1370,13 @@ Known and deliberate in this version:
   status`, which lists every occupied issue, or follow `daemon.log`.
 - **Merges, releases and deploys are human-only, by design.** The conductor
   produces green PRs and stops.
-- **Worker confinement is behavioural.** `runWorker` hands the session a `cwd` and
-  a brief; nothing stops it reading or writing elsewhere on the host, and on a
-  single-user deploy that includes the state directory and the host's `gh`
-  credentials. The [integrity tripwire](#the-boundary-is-prompt-text--and-one-tripwire)
-  turns one case of this into a paused, paged fleet after the fact; the prevention
-  half is a deployment concern — run workers as a least-privileged uid whose write
-  access ends at its worktree and mirror.
+- **Worker confinement is partial.** Structured `write` / `edit` / `read` /
+  `grep` / `glob` calls are blocked outside the worktree by an inline harness
+  extension (`confineToCwd`). `bash` is not: a shell one-liner can still leave
+  the tree. Prefer a [least-privilege worker uid](#least-privilege-worker-uid-deploy);
+  the [integrity tripwire](#integrity-tripwire-package-self-hash) still pages if
+  the installed package itself changes under a live daemon.
+
 
 ## License
 

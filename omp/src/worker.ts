@@ -152,6 +152,8 @@ export async function runWorker(
     cwd: o.cwd,
     ...(o.sessionDir === undefined ? {} : { sessionDir: o.sessionDir }),
     ...(o.model === undefined ? {} : { model: o.model }),
+    // Prevention half of #24: structured file tools cannot leave this worktree.
+    confineToCwd: true,
   });
 
   // Before the first turn, not after the last: a caller that only learns the
