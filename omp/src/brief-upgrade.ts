@@ -57,7 +57,8 @@ export function isHtmlCommentLine(line: string): boolean {
 }
 
 /**
- * Substrings that identify **package** banner chrome, never operator notes.
+ * Substrings that identify **package** banner chrome phrases, never operator
+ * notes and never a bare decorative separator.
  *
  * Matched case-insensitively inside an HTML comment. Keep this list tight: a
  * false positive would delete fleet-owned POLICY prose.
@@ -70,37 +71,71 @@ const BANNER_CHROME_MARKERS = [
   "hand-edits above or below",
 ] as const;
 
-/** `<!-- ====...==== -->` / dash separators that frame the banner. */
+/** `<!-- ====...==== -->` / dash separators that *frame* the banner. */
 const BANNER_SEPARATOR = /^<!--\s*[=-]{3,}\s*-->$/;
 
+/** True when a line is a decorative `<!-- === -->` / `<!-- --- -->` separator. */
+export function isBannerSeparatorLine(line: string): boolean {
+  return BANNER_SEPARATOR.test(line.trim());
+}
+
 /**
- * True when a line is known package banner chrome (footer / separator / YOURS
- * TO EDIT line), not an arbitrary operator HTML comment.
+ * True when a line is a package banner **phrase** comment (YOURS TO EDIT /
+ * never-reads footer / compose-banner wording) — not a bare separator.
  */
-export function isKnownBannerChromeLine(line: string): boolean {
+export function isPhraseChromeLine(line: string): boolean {
   const trimmed = line.trim();
   if (!isHtmlCommentLine(trimmed)) return false;
-  if (BANNER_SEPARATOR.test(trimmed)) return true;
+  if (isBannerSeparatorLine(trimmed)) return false;
   const lower = trimmed.toLowerCase();
   return BANNER_CHROME_MARKERS.some((marker) => lower.includes(marker.toLowerCase()));
 }
 
 /**
- * Drop leading **known banner chrome** (and blanks among it) from an owned half.
+ * @deprecated Prefer {@link isPhraseChromeLine}. Separators alone are not chrome.
+ */
+export function isKnownBannerChromeLine(line: string): boolean {
+  return isPhraseChromeLine(line);
+}
+
+/**
+ * Drop a leading **known package footer fragment** from an owned half / POLICY.md.
  *
- * Defends POLICY.md against a stale split that left banner footers in `owned`.
- * Stops at the first non-blank line that is not recognized package chrome, so a
- * legitimate operator note like `<!-- do not squash on fridays -->` survives —
- * the package must not overwrite fleet-owned POLICY content.
+ * Only strips when the leading blank+comment prefix contains at least one
+ * package phrase marker (e.g. "never reads this file back"). Separators like
+ * `<!-- ==== -->` strip only as companions to that phrase — a POLICY that
+ * legitimately starts with a decorative separator alone is left untouched.
+ * Stops at the first non-blank line that is neither a phrase nor a separator,
+ * so `<!-- operator notes -->` survive.
  */
 export function stripLeadingBannerCrumbs(text: string): string {
   const lines = text.split("\n");
+
+  // Peek: does the leading blank/comment prefix carry a package phrase?
+  let j = 0;
+  let phraseInPrefix = false;
+  while (j < lines.length) {
+    const line = lines[j];
+    if (line === undefined) break;
+    const trimmed = line.trim();
+    if (trimmed === "") {
+      j += 1;
+      continue;
+    }
+    if (!isHtmlCommentLine(line)) break;
+    if (isPhraseChromeLine(line)) phraseInPrefix = true;
+    j += 1;
+  }
+  // Separator-only (or operator-comment-only) prefixes are fleet-owned — keep.
+  if (!phraseInPrefix) return text;
+
+  // Strip blanks, phrase chrome, and separators that framed that phrase.
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
     if (line === undefined) break;
     const trimmed = line.trim();
-    if (trimmed === "" || isKnownBannerChromeLine(line)) {
+    if (trimmed === "" || isPhraseChromeLine(line) || isBannerSeparatorLine(line)) {
       i += 1;
       continue;
     }
