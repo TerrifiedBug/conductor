@@ -369,11 +369,17 @@ Four control planes used to answer "stop" differently. The package verbs:
 undone by `herdr-conductor` respawning the agent, and then refuses (nonzero exit,
 message on stderr) on every uncertainty:
 
-- `herdr agent list` unreachable, or the configured agent name is not unique
-- the claimed pane runs some other agent
+- the tick config does not parse — the agent name would be a guess
+- `herdr agent list` is unreachable, prints nothing, or prints output with no
+  explicit `agents` array; only a real `agents: []` means "no agents"
+- the configured agent name is not unique, or the claimed pane runs some other agent
 - `pane process-info` fails, or the claim is live `omp` but names no recognizable
   omp foreground PID — "cannot see it" is never reported as "it is stopped"
 - the process is still alive after `SIGTERM` then `SIGKILL`
+
+The pin is written to the pane's own directory (the one holding
+`.conductor-tick.json`, which is `FLEET_CWD` — the only place `recover.sh` looks),
+including when that tick config is the thing that failed to parse.
 
 Clear the pin with `omp-conductor release-pane` when you want recovery again.
 

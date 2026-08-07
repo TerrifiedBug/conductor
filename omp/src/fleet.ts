@@ -45,6 +45,14 @@ import {
 
 export const PANE_HALT_FILE = ".conductor-pane-halted";
 export const DEFAULT_HERDR_UNIT = "herdr-fleet.service";
+
+/**
+ * Agent name assumed when no tick config names one. Mirrors
+ * `herdr-conductor`'s own `AGENT_NAME=${AGENT_NAME:-fleet}` default — a
+ * documented default, not a guess. An *invalid* config is a different thing
+ * and makes {@link stopConductorPane} refuse.
+ */
+export const DEFAULT_FLEET_AGENT_NAME = "fleet";
 export const ARM_CHALLENGE_TIMEOUT_MS = 300_000;
 
 export function telegramStateDir(): string {
@@ -68,14 +76,14 @@ export function tickConfigSearchRoots(projectName?: string): string[] {
 
 export type ResolvedTick =
   | { kind: "absent" }
-  | { kind: "invalid"; path: string; problem: string }
+  | { kind: "invalid"; path: string; cwd: string; problem: string }
   | { kind: "ok"; path: string; cwd: string; config: TickConfig };
 
 export function resolveTickConfig(projectName?: string): ResolvedTick {
   for (const cwd of tickConfigSearchRoots(projectName)) {
     const r: TickConfigResult = readTickConfig(cwd);
     if (r.kind === "ok") return { kind: "ok", path: r.path, cwd, config: r.config };
-    if (r.kind === "invalid") return { kind: "invalid", path: r.path, problem: r.problem };
+    if (r.kind === "invalid") return { kind: "invalid", path: r.path, cwd, problem: r.problem };
   }
   return { kind: "absent" };
 }
@@ -223,9 +231,19 @@ export async function halt(projectName?: string): Promise<HaltResult> {
   return { hold: held, stop };
 }
 
+/**
+ * Where `halt --pane` pins recovery off. This must be the pane's own cwd —
+ * `herdr-conductor`'s `recover.sh` only reads `$FLEET_CWD/.conductor-pane-halted`,
+ * and the tick config lives in that same directory by construction (the
+ * heartbeat extension activates on `.conductor-tick.json` in the session cwd).
+ *
+ * An *invalid* tick config still names the right directory, so pin beside it
+ * rather than in the state dir: the pin has to land somewhere recovery reads
+ * before {@link stopConductorPane} refuses over that same invalid config.
+ */
 export function paneHaltPath(projectName?: string): string {
   const tick = resolveTickConfig(projectName);
-  if (tick.kind === "ok") return join(tick.cwd, PANE_HALT_FILE);
+  if (tick.kind === "ok" || tick.kind === "invalid") return join(tick.cwd, PANE_HALT_FILE);
   return join(stateDir(), PANE_HALT_FILE);
 }
 
@@ -295,17 +313,30 @@ export async function haltWithPane(
  * Stop the configured conductor agent only. Recovery must already be pinned.
  *
  * Success returns only when the pane is confirmed gone (`herdr-agent` or
- * `already-gone`). Any uncertainty — herdr down, ambiguous identity, live omp
- * claim with no recognized PID, process that survives SIGKILL — **throws**.
- * Callers must not treat a thrown error as "maybe stopped".
+ * `already-gone`). Any uncertainty **throws**: an unparseable tick config (the
+ * agent name is then a guess), herdr unreachable, output we cannot read as an
+ * explicit agent list, ambiguous identity, a live omp claim with no recognized
+ * PID, or a process that survives SIGKILL. Callers must not treat a thrown
+ * error as "maybe stopped".
  */
 export async function stopConductorPane(
   projectName?: string,
   deps: PaneStopDeps = {},
 ): Promise<Omit<PaneStopResult, "pinPath">> {
   const tick = resolveTickConfig(projectName);
+  if (tick.kind === "invalid") {
+    // The file that names the agent does not parse, so the identity we would
+    // stop is a guess. Stopping the wrong pane is worse than refusing.
+    throw new Error(
+      `halt --pane: tick config invalid at ${tick.path} (${tick.problem}) — ` +
+        `the conductor agent name cannot be read, so refusing to stop a guessed identity. ` +
+        `Recovery pin was written; fix the config and re-run.`,
+    );
+  }
   const agentName =
-    tick.kind === "ok" && tick.config.agentName !== undefined ? tick.config.agentName : "fleet";
+    tick.kind === "ok" && tick.config.agentName !== undefined
+      ? tick.config.agentName
+      : DEFAULT_FLEET_AGENT_NAME;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const now = deps.now ?? Date.now;
   const signalPid =
@@ -434,18 +465,40 @@ async function herdrAgentList(deps: PaneStopDeps): Promise<HerdrAgent[]> {
   if (res.status !== 0) {
     throw new Error((res.stderr ?? res.stdout ?? `herdr exit ${String(res.status)}`).trim());
   }
+  // Everything below is fail-closed: only an explicit `agents: []` means "no
+  // agents". Empty output, unparseable JSON, a missing `agents` key or a row
+  // we cannot read is uncertainty — collapsing any of it to `[]` would report
+  // a live conductor pane as `already-gone`.
   const raw = (res.stdout ?? "").trim();
-  if (raw.length === 0) return [];
-  const parsed = JSON.parse(raw) as { result?: { agents?: unknown }; agents?: unknown };
+  if (raw.length === 0) {
+    throw new Error("herdr agent list printed nothing — cannot tell whether the pane is running");
+  }
+  let parsed: { result?: { agents?: unknown }; agents?: unknown };
+  try {
+    parsed = JSON.parse(raw) as { result?: { agents?: unknown }; agents?: unknown };
+  } catch (err) {
+    throw new Error(
+      `herdr agent list output is not JSON (${err instanceof Error ? err.message : String(err)})`,
+    );
+  }
   const list = parsed.result?.agents ?? parsed.agents;
-  if (!Array.isArray(list)) return [];
+  if (!Array.isArray(list)) {
+    throw new Error("herdr agent list output has no `agents` array — unrecognized schema");
+  }
   const out: HerdrAgent[] = [];
   for (const row of list) {
-    if (row === null || typeof row !== "object") continue;
+    if (row === null || typeof row !== "object") {
+      throw new Error("herdr agent list contains a non-object agent row — unrecognized schema");
+    }
     const a = row as { readonly [key: string]: unknown };
     const name = a["name"];
     const paneId = a["pane_id"];
-    if (typeof name !== "string" || typeof paneId !== "string") continue;
+    if (typeof name !== "string" || typeof paneId !== "string") {
+      throw new Error(
+        "herdr agent list row is missing a string `name`/`pane_id` — " +
+          "cannot tell whether it is the conductor pane",
+      );
+    }
     const agent = typeof a["agent"] === "string" ? a["agent"] : undefined;
     let sessionPath: string | undefined;
     const sess = a["agent_session"];
@@ -476,13 +529,21 @@ async function herdrOmpForegroundPids(paneId: string, deps: PaneStopDeps): Promi
     throw new Error((res.stderr ?? res.stdout ?? `process-info exit ${String(res.status)}`).trim());
   }
   const raw = (res.stdout ?? "").trim();
-  if (raw.length === 0) return [];
-  const parsed = JSON.parse(raw) as {
-    result?: { process_info?: ProcessInfo };
-    process_info?: ProcessInfo;
-  };
+  if (raw.length === 0) {
+    throw new Error(`herdr pane process-info printed nothing for ${paneId}`);
+  }
+  let parsed: { result?: { process_info?: ProcessInfo }; process_info?: ProcessInfo };
+  try {
+    parsed = JSON.parse(raw) as { result?: { process_info?: ProcessInfo }; process_info?: ProcessInfo };
+  } catch (err) {
+    throw new Error(
+      `herdr pane process-info output is not JSON (${err instanceof Error ? err.message : String(err)})`,
+    );
+  }
   const info = parsed.result?.process_info ?? parsed.process_info;
-  if (info === undefined) return [];
+  if (info === undefined) {
+    throw new Error(`herdr pane process-info has no process_info for ${paneId} — unrecognized schema`);
+  }
   return ompPidsFromProcessInfo(info);
 }
 

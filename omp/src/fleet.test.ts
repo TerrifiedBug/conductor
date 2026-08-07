@@ -22,6 +22,7 @@ import {
   pinPaneHalt,
   releaseHold,
   sessionDirForCwd,
+  stopConductorPane,
   transcriptHasUserCode,
 } from "./fleet.ts";
 import { setSystemctlForTest } from "./lifecycle.ts";
@@ -66,7 +67,7 @@ afterEach(() => {
   rmSync(home, { recursive: true, force: true });
 });
 
-function writeMinimalConfig(): void {
+function writeMinimalConfig(workspaceRoot?: string): void {
   const cfg = {
     version: 2,
     defaults: {
@@ -95,7 +96,7 @@ function writeMinimalConfig(): void {
         caps: {},
         escalation: { fallbackToIssueComment: true, orchestrator: "external" },
         authority: { merge: "human", release: "human" },
-        workspaceRoot: join(home, ".omp", "conductor", "worktrees"),
+        workspaceRoot: workspaceRoot ?? join(home, ".omp", "conductor", "worktrees"),
         mirrorRoot: join(home, ".omp", "conductor", "mirrors"),
       },
     ],
@@ -278,6 +279,72 @@ test("halt --pane throws when herdr is down", async () => {
     }),
   ).rejects.toThrow(/herdr agent list failed/);
   expect(existsSync(paneHaltPath())).toBe(true);
+});
+
+function writeHerdrStub(body: string): string {
+  const bin = join(home, "stub-bin");
+  mkdirSync(bin, { recursive: true });
+  const path = join(bin, `herdr-${Math.random().toString(36).slice(2)}`);
+  writeFileSync(path, `#!/bin/sh\n${body}\n`);
+  chmodSync(path, 0o755);
+  return path;
+}
+
+test("halt --pane throws on an invalid tick config — pin lands beside the bad file", async () => {
+  // The pane's cwd must differ from the state dir, otherwise a state-dir
+  // fallback would look correct by accident.
+  const fleetCwd = join(home, "fleet");
+  mkdirSync(join(fleetCwd, "worktrees"), { recursive: true });
+  writeMinimalConfig(join(fleetCwd, "worktrees"));
+  writeFileSync(join(fleetCwd, TICK_CONFIG_FILE), "{ not json");
+  expect(fleetCwd).not.toBe(process.env[COND_KEY]!);
+
+  // The bad file still names the pane's own directory, which is the only place
+  // herdr-conductor's recover.sh reads the pin from.
+  expect(paneHaltPath()).toBe(join(fleetCwd, PANE_HALT_FILE));
+  await expect(
+    haltWithPane(undefined, {
+      listAgents: async () => [{ name: "fleet", paneId: "w1:p1", agent: "omp" }],
+      sleep: async () => {},
+    }),
+  ).rejects.toThrow(/tick config invalid/);
+  expect(existsSync(join(fleetCwd, PANE_HALT_FILE))).toBe(true);
+  expect(existsSync(join(process.env[COND_KEY]!, PANE_HALT_FILE))).toBe(false);
+});
+
+test("herdr agent list output that is not an explicit agent array throws", async () => {
+  writeMinimalConfig();
+  writeTick();
+
+  const cases: Array<{ label: string; body: string; expected: RegExp }> = [
+    { label: "empty output", body: "exit 0", expected: /printed nothing/ },
+    { label: "not JSON", body: "printf 'herdr: server not running\\n'", expected: /not JSON/ },
+    {
+      label: "no agents key",
+      body: `printf '%s\\n' '{"result":{"type":"agent_list"}}'`,
+      expected: /no .agents. array/,
+    },
+    {
+      label: "malformed row",
+      body: `printf '%s\\n' '{"result":{"agents":[{"pane_id":"w1:p1"}]}}'`,
+      expected: /missing a string/,
+    },
+  ];
+
+  for (const c of cases) {
+    const bin = writeHerdrStub(c.body);
+    await expect(stopConductorPane(undefined, { herdrBin: bin, sleep: async () => {} })).rejects.toThrow(
+      c.expected,
+    );
+  }
+});
+
+test("an explicit empty agent array is the only 'no agents' answer", async () => {
+  writeMinimalConfig();
+  writeTick();
+  const bin = writeHerdrStub(`printf '%s\\n' '{"result":{"agents":[]}}'`);
+  const r = await stopConductorPane(undefined, { herdrBin: bin, sleep: async () => {} });
+  expect(r.stopped).toBe("already-gone");
 });
 
 test("CLI halt --pane exits nonzero while a live claimed agent cannot be stopped", async () => {
