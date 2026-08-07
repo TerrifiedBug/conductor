@@ -67,9 +67,10 @@ Per-half configuration and limitations live in each half's own README:
 Both halves are pointed at the same 24/7 session — on your always-on host, an omp
 session with `/root/fleet` as its cwd, `ORCHESTRATOR.md` as its standing brief
 (symlinked as `AGENTS.md`), and `state/armed` as the marker that decides whether a
-heartbeat does anything. `omp-conductor`'s pause flag is the same flag both the
-dispatch loop and the heartbeat read, so pausing the fleet pauses everything the
-conductor would otherwise start.
+heartbeat does anything. Pause only stops the dispatch loop from claiming new work;
+an armed heartbeat still fires. Soft-stop both brains with `omp-conductor hold`
+(pause + disarm). Harder stops are `halt` / `halt --pane` — see
+[`omp/README.md`](omp/README.md#stop-the-conductor-hold--halt).
 
 The Herdr half never edits that session's state. It only answers one question —
 is the fleet session running in its pane? — and either resumes it by exact
