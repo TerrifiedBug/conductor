@@ -454,6 +454,28 @@ describe("mergeExclude", () => {
     expect(twice.split("*.swp")).toHaveLength(2);
   });
 
+  it("removes retired patterns from an existing managed block", () => {
+    const old = [
+      "# operator pattern",
+      "*.swp",
+      "",
+      "# >>> omp-conductor (managed; edit outside this block)",
+      ".scratch*/",
+      ".scratch*",
+      ".env.local",
+      "*.local.sh",
+      "# <<< omp-conductor",
+      "",
+    ].join("\n");
+
+    const merged = mergeExclude(old);
+
+    expect(merged).toContain("# operator pattern\n*.swp");
+    expect(merged).toContain(".scratch*/");
+    expect(merged).not.toContain(".env.local");
+    expect(merged).not.toContain("*.local.sh");
+  });
+
   it("does not glue its block onto a file with no trailing newline", () => {
     // Hand-edited files routinely lack one. Without the guard the first managed
     // pattern would be appended to their last one and match nothing at all.
