@@ -315,23 +315,34 @@ export function resolveTickScope(): {
   policyPath?: string;
   projectName?: string;
   fallback?: string;
-  refreshed?: boolean;
 } {
   try {
     const project = findProject(loadConfig());
-    // Recompose ORCHESTRATOR.md from the installed package floor + live POLICY.md
-    // so protocol updates apply on the next tick after npm install, without
-    // brief-upgrade --apply. No-op when POLICY.md is not there yet (legacy).
-    const refreshed = refreshComposedBriefForProject(project);
     return {
       scope: project.reporting?.scope ?? DEFAULT_REPORT_SCOPE,
       briefPath: briefPathForProject(project),
       policyPath: policyPathForProject(project),
       projectName: project.name,
-      refreshed,
     };
   } catch (err) {
     return { scope: DEFAULT_REPORT_SCOPE, fallback: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Best-effort recompose of `ORCHESTRATOR.md` from the installed package floor +
+ * live `POLICY.md`.
+ *
+ * Runs on **every** successful send — including ticks that use a custom
+ * `message` — so protocol updates land after `npm install` without waiting for
+ * the default prompt path. Failures (no config, no `POLICY.md`, unreadable
+ * overlay) are silent: the tick still goes out.
+ */
+export function refreshComposedBriefBestEffort(): boolean {
+  try {
+    return refreshComposedBriefForProject(findProject(loadConfig()));
+  } catch {
+    return false;
   }
 }
 
@@ -929,6 +940,10 @@ function tick(pi: TickApi, ctx: TickContext, config: TickConfig, session: TickSe
     }
     return;
   }
+
+  // Floor refresh is independent of which prompt we send: a custom message still
+  // expects ORCHESTRATOR.md / AGENTS.md to track the installed package.
+  refreshComposedBriefBestEffort();
 
   // A configured message owns the whole contract, reporting and delivery clauses
   // included: an operator who wrote their own prompt did not ask for ours

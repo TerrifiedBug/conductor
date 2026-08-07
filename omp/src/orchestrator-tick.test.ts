@@ -410,6 +410,30 @@ test("a configured message is sent verbatim in place of the default", () => {
   expect(pi.sent[0]?.message.content).not.toContain(TICK_DELIVERY_RULE);
 });
 
+test("a custom message tick still recomposes ORCHESTRATOR.md from POLICY.md", () => {
+  // Refresh used to live only inside resolveTickScope(), which custom-message
+  // ticks never call. Package-floor updates would stay stale forever on a
+  // supported custom heartbeat config.
+  writeConductorConfig({ name: "fleet", scope: "escalations" });
+  const worktrees = join(home, "worktrees");
+  mkdirSync(worktrees, { recursive: true });
+  writeFileSync(join(worktrees, "POLICY.md"), "## Releases\nCUSTOM POLICY MARKER.\n");
+  writeFileSync(join(worktrees, "ORCHESTRATOR.md"), "STALE BRIEF — must be replaced\n");
+  writeTickConfig({ intervalSeconds: 600, message: "loop now" });
+
+  const pi = fakeHost();
+  orchestratorTickExtension(pi);
+  pi.start();
+  pi.fire();
+
+  expect(pi.sent[0]?.message.content).toBe("loop now");
+  const composed = readFileSync(join(worktrees, "ORCHESTRATOR.md"), "utf8");
+  expect(composed).not.toContain("STALE BRIEF");
+  expect(composed).toContain("CUSTOM POLICY MARKER.");
+  expect(composed).toContain("YOURS TO EDIT");
+  expect(composed).toContain("package floor");
+});
+
 test("a configured message is re-read every tick, so an edit binds the next heartbeat", () => {
   writeTickConfig({ intervalSeconds: 600, message: "loop now" });
   const pi = fakeHost();
