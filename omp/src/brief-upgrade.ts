@@ -57,19 +57,50 @@ export function isHtmlCommentLine(line: string): boolean {
 }
 
 /**
- * Drop leading HTML-comment / blank lines from an owned half.
+ * Substrings that identify **package** banner chrome, never operator notes.
  *
- * Defends POLICY.md against a stale split that left banner footers in `owned`,
- * and against re-migrating a compose that still carried those crumbs.
+ * Matched case-insensitively inside an HTML comment. Keep this list tight: a
+ * false positive would delete fleet-owned POLICY prose.
  */
-export function stripLeadingHtmlComments(text: string): string {
+const BANNER_CHROME_MARKERS = [
+  EDIT_BANNER,
+  "never reads this file back",
+  "live copy of POLICY.md",
+  "regenerated from package floor",
+  "hand-edits above or below",
+] as const;
+
+/** `<!-- ====...==== -->` / dash separators that frame the banner. */
+const BANNER_SEPARATOR = /^<!--\s*[=-]{3,}\s*-->$/;
+
+/**
+ * True when a line is known package banner chrome (footer / separator / YOURS
+ * TO EDIT line), not an arbitrary operator HTML comment.
+ */
+export function isKnownBannerChromeLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (!isHtmlCommentLine(trimmed)) return false;
+  if (BANNER_SEPARATOR.test(trimmed)) return true;
+  const lower = trimmed.toLowerCase();
+  return BANNER_CHROME_MARKERS.some((marker) => lower.includes(marker.toLowerCase()));
+}
+
+/**
+ * Drop leading **known banner chrome** (and blanks among it) from an owned half.
+ *
+ * Defends POLICY.md against a stale split that left banner footers in `owned`.
+ * Stops at the first non-blank line that is not recognized package chrome, so a
+ * legitimate operator note like `<!-- do not squash on fridays -->` survives —
+ * the package must not overwrite fleet-owned POLICY content.
+ */
+export function stripLeadingBannerCrumbs(text: string): string {
   const lines = text.split("\n");
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
     if (line === undefined) break;
     const trimmed = line.trim();
-    if (trimmed === "" || isHtmlCommentLine(line)) {
+    if (trimmed === "" || isKnownBannerChromeLine(line)) {
       i += 1;
       continue;
     }
@@ -77,6 +108,9 @@ export function stripLeadingHtmlComments(text: string): string {
   }
   return lines.slice(i).join("\n");
 }
+
+/** @deprecated Use {@link stripLeadingBannerCrumbs}. Kept for call-site stability. */
+export const stripLeadingHtmlComments = stripLeadingBannerCrumbs;
 
 /**
  * Splits on the banner, or returns `undefined` when there is none.
@@ -338,7 +372,7 @@ export function migrateToPolicy(opts: {
   }
   // Strip banner footers that an older split may have left in owned — never let
   // package chrome become fleet policy.
-  const policyBody = stripLeadingHtmlComments(owned).replace(/^\s+/, "");
+  const policyBody = stripLeadingBannerCrumbs(owned).replace(/^\s+/, "");
   const policyBackup = writeWithBackup(opts.policyPath, policyBody.endsWith("\n") ? policyBody : `${policyBody}\n`);
   const composed = composeOrchestrator(opts.floor, readFileSync(opts.policyPath, "utf8"));
   const orchestratorBackup = writeWithBackup(opts.orchestratorPath, composed);
@@ -364,7 +398,7 @@ export function repairPolicyBannerCrumbs(opts: {
 }): MigrateResult | undefined {
   if (!existsSync(opts.policyPath)) return undefined;
   const before = readFileSync(opts.policyPath, "utf8");
-  const cleaned = stripLeadingHtmlComments(before);
+  const cleaned = stripLeadingBannerCrumbs(before);
   if (cleaned === before) {
     // Still recompose so the floor matches this package even when POLICY was clean.
     writeFileSync(opts.orchestratorPath, composeOrchestrator(opts.floor, before));

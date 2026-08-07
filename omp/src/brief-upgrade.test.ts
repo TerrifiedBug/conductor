@@ -22,11 +22,12 @@ import {
   missingSections,
   proposeRetrofit,
   refreshComposedBrief,
+  isKnownBannerChromeLine,
   repairPolicyBannerCrumbs,
   sectionText,
   shippedDiff,
   splitBrief,
-  stripLeadingHtmlComments,
+  stripLeadingBannerCrumbs,
   writeMergedBrief,
 } from "./brief-upgrade.ts";
 
@@ -155,6 +156,90 @@ test("repairPolicyBannerCrumbs cleans an already-migrated POLICY.md", () => {
     expect(policy.trimStart()).toMatch(/^## Releases/);
     expect(policy).not.toContain("<!--");
     expect(readFileSync(orchestratorPath, "utf8")).toContain("live policy.");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("stripLeadingBannerCrumbs preserves an unrelated leading operator comment", () => {
+  // Sol: a broad "strip every leading HTML comment" would delete fleet-owned
+  // POLICY notes and break the "package never overwrites POLICY.md" contract.
+  const note = "<!-- fleet note: never squash vectorflow releases on Fridays -->";
+  const owned = [
+    note,
+    "",
+    "## Releases",
+    "humans release.",
+    "",
+  ].join("\n");
+  expect(isKnownBannerChromeLine(note)).toBe(false);
+  expect(stripLeadingBannerCrumbs(owned)).toBe(owned);
+  expect(stripLeadingBannerCrumbs(owned)).toContain("never squash vectorflow");
+});
+
+test("migrateToPolicy keeps an unrelated leading operator comment", () => {
+  const dir = mkdtempSync(join(tmpdir(), "brief-keep-note-"));
+  try {
+    const orchestratorPath = join(dir, "ORCHESTRATOR.md");
+    const policyPath = join(dir, "POLICY.md");
+    const note = "<!-- operator: pin releases to wednesday cutover -->";
+    const owned = [
+      // Known chrome first — must strip —
+      "<!-- The conductor never reads this file back, so edit freely.             -->",
+      "<!-- ==================================================================== -->",
+      "",
+      // — then stop: operator note is not package chrome.
+      note,
+      "",
+      "## Releases",
+      "MY POLICY.",
+      "",
+    ].join("\n");
+    writeFileSync(orchestratorPath, `# Floor\n\n${COMPOSE_BANNER}\n\n${owned}`);
+    migrateToPolicy({
+      orchestratorPath,
+      policyPath,
+      floor: "# Floor\n\n## Duty 1\nnew.\n",
+      owned,
+    });
+    const policy = readFileSync(policyPath, "utf8");
+    expect(policy).toContain("operator: pin releases to wednesday cutover");
+    expect(policy.trimStart()).toMatch(/^<!-- operator:/);
+    expect(policy).toContain("MY POLICY.");
+    expect(policy).not.toContain("never reads this file back");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("repairPolicyBannerCrumbs does not delete an unrelated leading operator comment", () => {
+  const dir = mkdtempSync(join(tmpdir(), "brief-repair-keep-"));
+  try {
+    const orchestratorPath = join(dir, "ORCHESTRATOR.md");
+    const policyPath = join(dir, "POLICY.md");
+    const note = "<!-- hidden instruction: escalate flaky CI to #ops -->";
+    writeFileSync(
+      policyPath,
+      [
+        "<!-- The conductor never reads this file back, so edit freely.             -->",
+        note,
+        "",
+        "## Releases",
+        "live policy.",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(orchestratorPath, "stale\n");
+    const result = repairPolicyBannerCrumbs({
+      orchestratorPath,
+      policyPath,
+      floor: "# Floor\n\n## Duty 1\nx.\n",
+    });
+    expect(result).toBeDefined();
+    const policy = readFileSync(policyPath, "utf8");
+    expect(policy).toContain("hidden instruction: escalate flaky CI");
+    expect(policy.trimStart()).toMatch(/^<!-- hidden instruction:/);
+    expect(policy).not.toContain("never reads this file back");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
