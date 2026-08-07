@@ -40,13 +40,42 @@ export const COMPOSE_BANNER = [
 /**
  * A brief split into the package's half and the operator's half.
  *
- * `shipped` runs to the end of the banner line; `owned` is everything after it.
- * Concatenating them reproduces the input byte for byte, which is what makes a
- * merge safe to write back.
+ * `shipped` runs through the full contiguous HTML-comment banner that contains
+ * {@link EDIT_BANNER}; `owned` is everything after that block. Concatenating
+ * them reproduces the input byte for byte, which is what makes a merge safe to
+ * write back.
  */
 export interface BriefHalves {
   shipped: string;
   owned: string;
+}
+
+/** True when a line is a single HTML comment (the banner's only vocabulary). */
+export function isHtmlCommentLine(line: string): boolean {
+  const trimmed = line.trim();
+  return trimmed.startsWith("<!--") && trimmed.endsWith("-->");
+}
+
+/**
+ * Drop leading HTML-comment / blank lines from an owned half.
+ *
+ * Defends POLICY.md against a stale split that left banner footers in `owned`,
+ * and against re-migrating a compose that still carried those crumbs.
+ */
+export function stripLeadingHtmlComments(text: string): string {
+  const lines = text.split("\n");
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line === undefined) break;
+    const trimmed = line.trim();
+    if (trimmed === "" || isHtmlCommentLine(line)) {
+      i += 1;
+      continue;
+    }
+    break;
+  }
+  return lines.slice(i).join("\n");
 }
 
 /**
@@ -55,14 +84,25 @@ export interface BriefHalves {
  * `undefined` is a real answer, not a failure: it means this brief cannot be
  * merged mechanically, and every caller is expected to degrade to reporting
  * rather than to assume a boundary.
+ *
+ * The cut is the end of the **whole contiguous HTML-comment block** that
+ * contains `YOURS TO EDIT`, not merely the line with that substring. Legacy and
+ * compose banners both trail the marker with more `<!-- … -->` lines; leaving
+ * those in `owned` would write package chrome into POLICY.md.
  */
 export function splitBrief(text: string): BriefHalves | undefined {
   const at = text.indexOf(EDIT_BANNER);
   if (at < 0) return undefined;
-  // Keep the whole banner line on the shipped side: the operator's half starts
-  // at the first line they own, so a merge never has to reconstruct the banner.
+  // End of the line that carries YOURS TO EDIT…
   const lineEnd = text.indexOf("\n", at);
-  const cut = lineEnd < 0 ? text.length : lineEnd + 1;
+  let cut = lineEnd < 0 ? text.length : lineEnd + 1;
+  // …then every contiguous HTML-comment line after it (footer / closer).
+  while (cut < text.length) {
+    const nextNl = text.indexOf("\n", cut);
+    const nextLine = nextNl < 0 ? text.slice(cut) : text.slice(cut, nextNl);
+    if (!isHtmlCommentLine(nextLine)) break;
+    cut = nextNl < 0 ? text.length : nextNl + 1;
+  }
   return { shipped: text.slice(0, cut), owned: text.slice(cut) };
 }
 
@@ -296,7 +336,9 @@ export function migrateToPolicy(opts: {
   if (owned === undefined) {
     throw new Error(`cannot migrate ${opts.orchestratorPath}: no ${EDIT_BANNER} banner`);
   }
-  const policyBody = owned.replace(/^\s+/, "");
+  // Strip banner footers that an older split may have left in owned — never let
+  // package chrome become fleet policy.
+  const policyBody = stripLeadingHtmlComments(owned).replace(/^\s+/, "");
   const policyBackup = writeWithBackup(opts.policyPath, policyBody.endsWith("\n") ? policyBody : `${policyBody}\n`);
   const composed = composeOrchestrator(opts.floor, readFileSync(opts.policyPath, "utf8"));
   const orchestratorBackup = writeWithBackup(opts.orchestratorPath, composed);
@@ -306,6 +348,37 @@ export function migrateToPolicy(opts: {
     policyBackup,
     orchestratorBackup,
     ownedBytes: policyBody.length,
+  };
+}
+
+/**
+ * Strip leading banner-comment crumbs from an existing POLICY.md and recompose.
+ *
+ * For fleets that already migrated under the line-only split: `--migrate --apply`
+ * on an active overlay repairs POLICY.md in place rather than no-opping.
+ */
+export function repairPolicyBannerCrumbs(opts: {
+  orchestratorPath: string;
+  policyPath: string;
+  floor: string;
+}): MigrateResult | undefined {
+  if (!existsSync(opts.policyPath)) return undefined;
+  const before = readFileSync(opts.policyPath, "utf8");
+  const cleaned = stripLeadingHtmlComments(before);
+  if (cleaned === before) {
+    // Still recompose so the floor matches this package even when POLICY was clean.
+    writeFileSync(opts.orchestratorPath, composeOrchestrator(opts.floor, before));
+    return undefined;
+  }
+  const policyBackup = writeWithBackup(opts.policyPath, cleaned.endsWith("\n") ? cleaned : `${cleaned}\n`);
+  const composed = composeOrchestrator(opts.floor, readFileSync(opts.policyPath, "utf8"));
+  const orchestratorBackup = writeWithBackup(opts.orchestratorPath, composed);
+  return {
+    policyPath: opts.policyPath,
+    orchestratorPath: opts.orchestratorPath,
+    policyBackup,
+    orchestratorBackup,
+    ownedBytes: cleaned.length,
   };
 }
 

@@ -18,6 +18,7 @@ import {
   formatMigrateResult,
   inspectBriefLayout,
   migrateToPolicy,
+  repairPolicyBannerCrumbs,
   writeMergedBrief,
 } from "./brief-upgrade.ts";
 import { configPath, expandHome, findProject, loadConfig, saveConfig } from "./config.ts";
@@ -957,6 +958,23 @@ export default function conductorPlugin(pi: PluginApi): void {
                 }),
                 "info",
               );
+              const repair = await ctx.ui.confirm(
+                "Repair POLICY.md banner crumbs and recompose?",
+                "Strips any leading HTML-comment leftovers from a pre-fix migrate, then recomposes ORCHESTRATOR.md from the package floor + POLICY.md.",
+              );
+              if (repair) {
+                const repaired = repairPolicyBannerCrumbs({
+                  orchestratorPath: layout.orchestratorPath,
+                  policyPath: layout.policyPath,
+                  floor: renderFloorForProject(p),
+                });
+                ctx.ui.notify(
+                  repaired === undefined
+                    ? "Recomposed ORCHESTRATOR.md — POLICY.md needed no crumb strip."
+                    : formatMigrateResult(repaired),
+                  "info",
+                );
+              }
               break;
             }
             if (layout.kind === "legacy-bannered") {
