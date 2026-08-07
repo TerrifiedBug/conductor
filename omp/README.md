@@ -348,7 +348,9 @@ The loop ticks every 5 minutes. `omp-conductor stop` shuts the loop down after
 the current tick rather than mid-run. When the live process is the MainPID of
 `omp-conductor.service`, stop goes through `systemctl stop` so a unit with
 `Restart=on-failure` cannot bring it straight back; otherwise it is a raw
-`SIGTERM` (then `SIGKILL` after 10 seconds).
+`SIGTERM` (then `SIGKILL` after 10 seconds). An example unit (with
+`SuccessExitStatus=0 143` and `MemoryMax=5G`) ships as
+[`systemd/omp-conductor.service.example`](systemd/omp-conductor.service.example).
 
 
 ### Stop the conductor (hold / halt)
@@ -609,6 +611,40 @@ multi-repo request is a human decision about contracts; it is not something to
 infer from a label. Sending the issue back costs a label edit; guessing costs a
 bad merge.
 
+## Host sizing and memory
+
+Workers are **in-process** omp sessions inside the daemon's single PID (plus one
+long-lived orchestrator session). systemd's Memory peak for `omp-conductor.service`
+is therefore daemon + every live worker + the orchestrator + any MCP stdio
+children those sessions mount — not a separate worker process list.
+
+On the reference deploy that produced [issue #51](https://github.com/TerrifiedBug/conductor/issues/51):
+
+| Shape | Observed |
+| --- | --- |
+| Idle / workers restarting | ~430 MB RSS for the daemon alone |
+| Two workers + orchestrator, busy | **3.2–4.2 GB** Memory peak for the unit; up to ~800 MB swap |
+
+That peak is **expected for concurrent SDK sessions**, not evidence of a
+conductor-side leak: the SQLite store is disk-backed, admission state is
+per-tick, and worker sessions are disposed when a run ends. What grows is the
+session heap (conversation + tool output); a single graph-assisted run has been
+measured in the hundreds of thousands of characters of tool output.
+
+**Practical guidance**
+
+- Prefer **≥16 GiB RAM** for the default `maxConcurrentWorkers: 2`, and do **not**
+  co-locate ClickHouse / other multi-GB services beside that fleet on an ≤8 GiB
+  box.
+- On hosts under ~16 GiB, set `maxConcurrentWorkers` to **1**. `/conductor setup`
+  does this automatically when it can read host RAM.
+- Supervise the daemon with a unit that sets `SuccessExitStatus=0 143` and a
+  `MemoryMax=` just above your expected peak. A ready-to-edit example ships as
+  [`systemd/omp-conductor.service.example`](systemd/omp-conductor.service.example)
+  (`MemoryMax=5G` for the two-worker shape).
+- `omp-conductor status` prints daemon `rss` from `/healthz` when the process is
+  up, so you can see pressure without scraping journald.
+
 ## Caps
 
 Caps resolve per project: the global `defaults` block, then the project's own
@@ -617,7 +653,7 @@ rest. `0` is a real value (a hard stop), not "unset".
 
 | Cap | Default | What it protects |
 | --- | --- | --- |
-| `maxConcurrentWorkers` | `2` | Parallel omp sessions. Two, because **CI runner slots, not model tokens, are the usual throughput ceiling** — a third worker would starve its own PR checks on a small self-hosted runner pool. Raise it only if you actually have the runners. |
+| `maxConcurrentWorkers` | `2` (setup may write `1` on &lt;16 GiB hosts) | Parallel in-process omp sessions inside the daemon PID. Two, because **CI runner slots, not model tokens, are the usual throughput ceiling** — a third worker would starve its own PR checks on a small self-hosted runner pool. On hosts under ~16 GiB RAM, prefer `1` so the unit stays out of swap ([host sizing](#host-sizing-and-memory)). Raise it only if you actually have the runners *and* the RAM. |
 | `dailySpendUsd` | `25` | Rolling-day spend ceiling in USD, or `null` for no spend gate. `0` is a hard stop. Metered from assistant `usage.cost.total`. |
 | `workerMaxTurns` | `120` | Turn ceiling for one worker. Catches a session looping without converging. |
 | `workerWallClockMs` | `5400000` (90 minutes) | Wall-clock ceiling for one worker. A session that is merely stuck spends no turns, so turns alone cannot detect it. |
@@ -1151,7 +1187,7 @@ omp-conductor help
 | `start` | Spawn the loop in the background, detached, and wait until it answers `GET /healthz` on `:8787`. Refuses if one is already live, naming its pid. If the process dies or never serves, `start` cleans up after it and quotes the tail of `daemon.log`. |
 | `stop` | Prefer `systemctl stop omp-conductor.service` when that unit's MainPID is the live daemon — systemd then owns the stop and will not schedule a restart for the exit it just requested. Otherwise `SIGTERM`, then `SIGKILL` after a 10-second grace period. Prints `not running` when there is nothing to stop, and tags the confirmation with `(via systemctl)` when the unit path was used. |
 | `restart` | Prefer `systemctl restart` when the unit owns the live pid so the replacement stays supervised; otherwise `stop` then `start`, inheriting the running daemon's port and project unless a flag overrides them. The new process **salvages dirty live worktrees before orphaning** those rows — see [Deploying a new package onto a busy fleet](#deploying-a-new-package-onto-a-busy-fleet). |
-| `status [--project NAME]` | Layered fleet report first: `dispatch` / `ticks` / `pane` / `recovery` / `herdr` / `daemon`, then the project body (caps, active runs, today's usage). While live workers > 0, prints a `deploy` line naming the count so a busy restart is visible before you take it. A `.conductor-stalled` marker in the state directory adds an `orchestrator   STALLED since …` line — see [the stall marker](#a-wedged-session-and-the-marker-that-notices). Reads while a daemon in another process writes. |
+| `status [--project NAME]` | Layered fleet report first: `dispatch` / `ticks` / `pane` / `recovery` / `herdr` / `daemon`, then the project body (caps, active runs, today's usage). The `daemon` block includes `rss` from `/healthz` when the process is up (workers share that PID — see [host sizing](#host-sizing-and-memory)). While live workers > 0, prints a `deploy` line naming the count so a busy restart is visible before you take it. A `.conductor-stalled` marker in the state directory adds an `orchestrator   STALLED since …` line — see [the stall marker](#a-wedged-session-and-the-marker-that-notices). Reads while a daemon in another process writes. |
 | `hold [--project NAME]` | Soft stop: pause claiming **and** disarm ticks. Daemon and pane stay up. Prefer this over `pause` when the intent is "stop the conductor" without killing processes. See [Stop the conductor](#stop-the-conductor-hold--halt). |
 | `halt [--pane] [--project NAME]` | `hold`, then stop the dispatch daemon (systemctl-aware). Pane stays up unless `--pane` is passed. `halt --pane` also pins herdr-conductor recovery off for the conductor agent only — it does **not** stop `herdr-fleet.service` or any other herdr session. Fail-closed: exits nonzero unless the agent is proven gone. |
 | `arm [--project NAME]` | Proof-gated: send a Telegram challenge and write the arm marker only after your reply appears as a user turn in the orchestrator transcript. Never auto-armed by `resume` / `hold`. |

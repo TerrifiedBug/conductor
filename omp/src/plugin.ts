@@ -22,6 +22,7 @@ import {
   writeMergedBrief,
 } from "./brief-upgrade.ts";
 import { configPath, expandHome, findProject, loadConfig, saveConfig } from "./config.ts";
+import { hostRamBytes, recommendedMaxWorkers } from "./host.ts";
 import {
   armConductor,
   isPaused,
@@ -556,21 +557,38 @@ const askCaps: AreaAsker = async (ctx, a) => {
   const caps: Partial<Caps> = { ...a.caps };
   const spendLabel =
     DEFAULT_CAPS.dailySpendUsd === null ? "no spend cap" : `$${DEFAULT_CAPS.dailySpendUsd}/day`;
+  // Workers are in-process omp sessions inside the daemon PID. On a host under
+  // 16 GiB the measured shape (2 workers + orchestrator) peaks at 3–4 GB and
+  // swaps on a 7.6 GB shared VPS (#51) — setup therefore defaults to 1 there.
+  const workersDefault =
+    caps.maxConcurrentWorkers ?? recommendedMaxWorkers(hostRamBytes());
+  const smallHostNote =
+    workersDefault < DEFAULT_CAPS.maxConcurrentWorkers
+      ? ` This host looks under 16 GiB RAM, so the worker default is ${workersDefault} instead of ${DEFAULT_CAPS.maxConcurrentWorkers}.`
+      : "";
   const tuneCaps = await ctx.ui.confirm(
     "Caps",
-    `Defaults: ${DEFAULT_CAPS.maxConcurrentWorkers} workers, ` +
+    `Defaults: ${workersDefault} workers, ` +
       `${spendLabel}, ${DEFAULT_CAPS.workerMaxTurns} turns and ` +
       `${Math.round(DEFAULT_CAPS.workerWallClockMs / 60000)} min per worker, ` +
-      `${DEFAULT_CAPS.maxAttemptsPerIssue} attempts per issue. Change them?`,
+      `${DEFAULT_CAPS.maxAttemptsPerIssue} attempts per issue.${smallHostNote} Change them?`,
   );
-  if (!tuneCaps) return { ...a, caps };
+  if (!tuneCaps) {
+    if (
+      caps.maxConcurrentWorkers === undefined &&
+      workersDefault !== DEFAULT_CAPS.maxConcurrentWorkers
+    ) {
+      caps.maxConcurrentWorkers = workersDefault;
+    }
+    return { ...a, caps };
+  }
 
   // Spelled out rather than looped: adding a cap should fail to compile here,
   // not silently go unasked.
   caps.maxConcurrentWorkers = await askNumber(
     ctx,
     "Max concurrent workers",
-    caps.maxConcurrentWorkers ?? DEFAULT_CAPS.maxConcurrentWorkers,
+    workersDefault,
   );
   caps.dailySpendUsd = await askSpendCap(
     ctx,
