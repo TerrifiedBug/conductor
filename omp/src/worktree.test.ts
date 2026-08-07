@@ -124,7 +124,7 @@ describe("addWorktree", () => {
       const { mirrorRoot, workspaceRoot } = sandbox("first-attempt");
       const branch = "conductor/issue-101";
 
-      const tree = await addWorktree(repo, mirrorRoot, workspaceRoot, 101, branch);
+      const tree = (await addWorktree(repo, mirrorRoot, workspaceRoot, 101, branch)).path;
 
       expect(tree).toBe(worktreePathFor(workspaceRoot, 101));
       expect(git(["rev-parse", "--abbrev-ref", "HEAD"], tree)).toBe(branch);
@@ -140,7 +140,7 @@ describe("addWorktree", () => {
       const branch = "conductor/issue-202";
       const mirrorPath = mirrorPathFor(repo, mirrorRoot);
 
-      const first = await addWorktree(repo, mirrorRoot, workspaceRoot, 202, branch);
+      const first = (await addWorktree(repo, mirrorRoot, workspaceRoot, 202, branch)).path;
       writeFileSync(join(first, "attempt-1.txt"), "never pushed anywhere\n");
       git(["add", "attempt-1.txt"], first);
       git(["commit", "-m", "attempt 1 work"], first);
@@ -152,8 +152,10 @@ describe("addWorktree", () => {
       // Same issue, same deterministic branch name: this is exactly what the
       // dispatcher does on a retry, and what used to die with "a branch named
       // '<branch>' already exists".
-      const second = await addWorktree(repo, mirrorRoot, workspaceRoot, 202, branch);
+      const secondResult = await addWorktree(repo, mirrorRoot, workspaceRoot, 202, branch);
+      const second = secondResult.path;
 
+      expect(secondResult.reattached).toBe(true);
       expect(second).toBe(first);
       expect(git(["rev-parse", "--abbrev-ref", "HEAD"], second)).toBe(branch);
       expect(existsSync(join(second, "attempt-1.txt"))).toBe(true);
@@ -168,12 +170,12 @@ describe("addWorktree", () => {
       const { mirrorRoot, workspaceRoot } = sandbox("stale-registration");
       const branch = "conductor/issue-303";
 
-      const tree = await addWorktree(repo, mirrorRoot, workspaceRoot, 303, branch);
+      const tree = (await addWorktree(repo, mirrorRoot, workspaceRoot, 303, branch)).path;
       // A hard crash, or a tmpdir reaper: the directory is gone but the mirror
       // still believes `branch` is checked out there.
       rmSync(tree, { recursive: true, force: true });
 
-      const again = await addWorktree(repo, mirrorRoot, workspaceRoot, 303, branch);
+      const again = (await addWorktree(repo, mirrorRoot, workspaceRoot, 303, branch)).path;
 
       expect(again).toBe(tree);
       expect(git(["rev-parse", "--abbrev-ref", "HEAD"], again)).toBe(branch);
@@ -187,7 +189,7 @@ describe("addWorktree", () => {
       const { mirrorRoot, workspaceRoot } = sandbox("existing-path");
       const branch = "conductor/issue-404";
 
-      const tree = await addWorktree(repo, mirrorRoot, workspaceRoot, 404, branch);
+      const tree = (await addWorktree(repo, mirrorRoot, workspaceRoot, 404, branch)).path;
 
       await expect(
         addWorktree(repo, mirrorRoot, workspaceRoot, 404, branch),
@@ -205,13 +207,13 @@ describe("removeWorktree", () => {
       const { mirrorRoot, workspaceRoot } = sandbox("remove-idempotent");
       const mirrorPath = mirrorPathFor(repo, mirrorRoot);
 
-      const tree = await addWorktree(
+      const tree = (await addWorktree(
         repo,
         mirrorRoot,
         workspaceRoot,
         505,
         "conductor/issue-505",
-      );
+      )).path;
 
       await removeWorktree(mirrorPath, tree);
       await removeWorktree(mirrorPath, tree);
@@ -229,7 +231,7 @@ describe("salvageWip", () => {
       const { mirrorRoot, workspaceRoot } = sandbox("salvage-dirty");
       const branch = "conductor/issue-606";
 
-      const tree = await addWorktree(repo, mirrorRoot, workspaceRoot, 606, branch);
+      const tree = (await addWorktree(repo, mirrorRoot, workspaceRoot, 606, branch)).path;
       // Exactly the shape of the losses this exists for: a large new file git
       // has never seen, plus an edit on top of a tracked one.
       writeFileSync(join(tree, "detection_pipeline.py"), "# 696 lines of it\n");
@@ -264,7 +266,7 @@ describe("salvageWip", () => {
       const { mirrorRoot, workspaceRoot } = sandbox("salvage-clean");
       const branch = "conductor/issue-707";
 
-      const tree = await addWorktree(repo, mirrorRoot, workspaceRoot, 707, branch);
+      const tree = (await addWorktree(repo, mirrorRoot, workspaceRoot, 707, branch)).path;
       const before = git(["rev-parse", "HEAD"], tree);
 
       expect(await salvageWip(tree, 707, 1, "the wall-clock cap")).toEqual({ kind: "nothing" });
@@ -279,7 +281,7 @@ describe("salvageWip", () => {
       const { mirrorRoot, workspaceRoot } = sandbox("salvage-scratch");
       const branch = "conductor/issue-808";
 
-      const tree = await addWorktree(repo, mirrorRoot, workspaceRoot, 808, branch);
+      const tree = (await addWorktree(repo, mirrorRoot, workspaceRoot, 808, branch)).path;
       writeFileSync(join(tree, "detection_gates.py"), "# the actual work\n");
       // The 2026-08-07 shape: a loopback env helper a worker wrote to run the
       // test suite. Harmless, and still expensive — it read enough like a
@@ -308,7 +310,7 @@ describe("salvageWip", () => {
       const { mirrorRoot, workspaceRoot } = sandbox("salvage-new-lookalike");
       const branch = "conductor/issue-1111";
 
-      const tree = await addWorktree(repo, mirrorRoot, workspaceRoot, 1111, branch);
+      const tree = (await addWorktree(repo, mirrorRoot, workspaceRoot, 1111, branch)).path;
 
       // A worker asked to add local bootstrap/configuration files — the
       // deliverables themselves, untracked because they did not exist before.
@@ -337,7 +339,7 @@ describe("salvageWip", () => {
     async () => {
       const { mirrorRoot, workspaceRoot } = sandbox("salvage-only-lookalike");
 
-      const tree = await addWorktree(repo, mirrorRoot, workspaceRoot, 1212, "conductor/issue-1212");
+      const tree = (await addWorktree(repo, mirrorRoot, workspaceRoot, 1212, "conductor/issue-1212")).path;
       const before = git(["rev-parse", "HEAD"], tree);
 
       // The dangerous shape: the ONLY change is a plausible deliverable. Under
@@ -360,7 +362,7 @@ describe("salvageWip", () => {
       const { mirrorRoot, workspaceRoot } = sandbox("salvage-tracked-collision");
       const branch = "conductor/issue-1010";
 
-      const tree = await addWorktree(repo, mirrorRoot, workspaceRoot, 1010, branch);
+      const tree = (await addWorktree(repo, mirrorRoot, workspaceRoot, 1010, branch)).path;
 
       // A repo that legitimately versions a file matching an ignore pattern —
       // a committed bootstrap helper, an env template. Plenty of repos do, and
@@ -395,7 +397,7 @@ describe("salvageWip", () => {
     async () => {
       const { mirrorRoot, workspaceRoot } = sandbox("salvage-only-scratch");
 
-      const tree = await addWorktree(repo, mirrorRoot, workspaceRoot, 909, "conductor/issue-909");
+      const tree = (await addWorktree(repo, mirrorRoot, workspaceRoot, 909, "conductor/issue-909")).path;
       const before = git(["rev-parse", "HEAD"], tree);
       mkdirSync(join(tree, ".scratch909"), { recursive: true });
       writeFileSync(join(tree, ".scratch909/env.sh"), "export DEBUG=true\n");
@@ -439,7 +441,7 @@ describe("salvageWip", () => {
       const { mirrorRoot, workspaceRoot } = sandbox("salvage-stale-exclude");
       const branch = "conductor/issue-44";
 
-      const tree = await addWorktree(repo, mirrorRoot, workspaceRoot, 44, branch);
+      const tree = (await addWorktree(repo, mirrorRoot, workspaceRoot, 44, branch)).path;
 
       // Plant the broad 0.3.6 managed block the live mirrors still carried after
       // 0.3.7 narrowed the list. Without a heal inside salvage, `.env.local`

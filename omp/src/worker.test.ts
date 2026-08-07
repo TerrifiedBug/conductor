@@ -9,7 +9,7 @@
 
 import { describe, expect, test } from "bun:test";
 import type { AgentSessionLike } from "./omp.ts";
-import { deriveResult, renderBrief, runWorker, shouldComplete, type WorkerOpts } from "./worker.ts";
+import { costUsdFromMessage, deriveResult, renderBrief, runWorker, shouldComplete, type WorkerOpts } from "./worker.ts";
 import { DEFAULT_CAPS } from "./types.ts";
 
 /**
@@ -232,5 +232,70 @@ describe("shouldComplete", () => {
     // field as non-terminal would hang every run on a harness that never sets
     // it, until the wall-clock cap killed a session that had already finished.
     expect(shouldComplete({})).toBe(true);
+  });
+});
+
+
+describe("costUsdFromMessage", () => {
+  test("reads usage.cost.total from a live-shaped assistant message", () => {
+    expect(
+      costUsdFromMessage({
+        role: "assistant",
+        usage: {
+          cost: { input: 0.01, output: 0.02, cacheRead: 0.03, cacheWrite: 0.04, total: 0.1 },
+        },
+      }),
+    ).toBe(0.1);
+  });
+
+  test("sums components when total is absent", () => {
+    expect(
+      costUsdFromMessage({
+        role: "assistant",
+        usage: { cost: { input: 0.01, output: 0.02, cacheRead: 0, cacheWrite: 0 } },
+      }),
+    ).toBeCloseTo(0.03);
+  });
+
+  test("returns undefined without a cost block", () => {
+    expect(costUsdFromMessage({ role: "assistant", content: "hi" })).toBeUndefined();
+  });
+});
+
+describe("runWorker spend metering", () => {
+  test("accumulates message.usage.cost.total across assistant messages", async () => {
+    const handlers = new Map<string, ((e: unknown) => void)[]>();
+    const session = {
+      prompt: async () => {
+        for (const cb of handlers.get("message_end") ?? []) {
+          cb({
+            message: {
+              role: "assistant",
+              content: "working",
+              usage: { cost: { total: 0.12 } },
+            },
+          });
+          cb({
+            message: {
+              role: "assistant",
+              content: "state: pushed-green",
+              usage: { cost: { total: 0.08 } },
+            },
+          });
+        }
+        for (const cb of handlers.get("agent_end") ?? []) cb({ isTerminal: true });
+      },
+      on: (event: string, cb: (e: unknown) => void) => {
+        const list = handlers.get(event) ?? [];
+        list.push(cb);
+        handlers.set(event, list);
+      },
+      abort: () => {},
+    };
+    const result = await runWorker(workerOpts(), {
+      createSession: async () => session as never,
+    });
+    expect(result.spendUsd).toBeCloseTo(0.2);
+    expect(result.state).toBe("pushed-green");
   });
 });

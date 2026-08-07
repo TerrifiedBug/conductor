@@ -16,8 +16,11 @@ export interface Caps {
   /** Parallel omp sessions. Two by default: on a small self-hosted runner pool
    *  a third worker would starve its own PR checks. */
   maxConcurrentWorkers: number;
-  /** Rolling-day spend ceiling; the loop stops claiming work once it is hit. */
-  dailySpendUsd: number;
+  /**
+   * Rolling-day spend ceiling. `null` means no spend gate (turns + wall-clock
+   * still apply). `0` is a hard stop — deliberate, not "unset".
+   */
+  dailySpendUsd: number | null;
   /** Turn ceiling for one worker — catches loops that are burning tokens
    *  without converging. */
   workerMaxTurns: number;

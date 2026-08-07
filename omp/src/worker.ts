@@ -216,15 +216,22 @@ export async function runWorker(
     // is its report, whether it finished cleanly or was cut off.
     const text = reportText(field(message, "content"));
     if (text !== "") report = text;
+
+    // Real cost lives on assistant messages as `usage.cost.total` (live hermes
+    // transcripts, 2026-08-07). The earlier agent_end.telemetry path never
+    // fired, so every run recorded $0 and the daily cap was theater (#46).
+    const cost = costUsdFromMessage(message);
+    if (cost !== undefined) spendUsd += cost;
   });
 
   session.on("agent_end", (event) => {
-    // ponytail: cost only arrives when the harness run carries telemetry, so
-    // spend can legitimately read 0 and the daily-spend cap then leans on the
-    // turn and wall-clock ceilings. Upgrade path: pass a telemetry config
-    // through `createSession` once the harness exposes it on the SDK options.
+    // Fallback for harnesses that only attach cost on the terminal event.
     const estimated = field(field(field(event, "telemetry"), "cost"), "estimatedUsd");
-    if (typeof estimated === "number" && Number.isFinite(estimated)) spendUsd += estimated;
+    if (typeof estimated === "number" && Number.isFinite(estimated) && estimated > 0) {
+      // Prefer message totals when both exist — do not double-count a run that
+      // already accumulated per-message costs.
+      if (spendUsd === 0) spendUsd += estimated;
+    }
 
     // Anything that is not literally `false` — including garbage or nothing at
     // all — is a finished run.
@@ -280,6 +287,31 @@ export async function runWorker(
       ? { state, turns, spendUsd, report }
       : { state, prUrl, turns, spendUsd, report },
   );
+}
+
+/**
+ * USD cost from one assistant message's `usage.cost` block.
+ *
+ * Prefer `total` when present; otherwise sum the component fields the live
+ * harness emits (input/output/cacheRead/cacheWrite). Exported so a unit test
+ * can pin the shape without standing up a session.
+ */
+export function costUsdFromMessage(message: unknown): number | undefined {
+  const usage = field(message, "usage");
+  const cost = field(usage, "cost");
+  if (cost === null || typeof cost !== "object") return undefined;
+  const total = field(cost, "total");
+  if (typeof total === "number" && Number.isFinite(total) && total >= 0) return total;
+  let sum = 0;
+  let any = false;
+  for (const key of ["input", "output", "cacheRead", "cacheWrite"] as const) {
+    const v = field(cost, key);
+    if (typeof v === "number" && Number.isFinite(v) && v >= 0) {
+      sum += v;
+      any = true;
+    }
+  }
+  return any ? sum : undefined;
 }
 
 /**

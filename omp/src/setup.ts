@@ -954,9 +954,11 @@ export const AMEND_AREAS: {
     describe: (p) => {
       const c = resolveCaps(p, DEFAULT_CAPS);
       const answered = Object.keys(p.caps).length > 0;
+      const spend =
+        c.dailySpendUsd === null ? "no spend cap" : `$${c.dailySpendUsd}/day`;
       return (
         `${c.maxConcurrentWorkers} workers, ${c.workerMaxTurns} turns, ` +
-        `${Math.round(c.workerWallClockMs / 60000)}m, $${c.dailySpendUsd}/day, ` +
+        `${Math.round(c.workerWallClockMs / 60000)}m, ${spend}, ` +
         `${c.maxAttemptsPerIssue} attempts${answered ? "" : " (all defaults)"} — ` +
         `${p.workerModel === undefined ? "harness default model" : `model ${p.workerModel}`}`
       );

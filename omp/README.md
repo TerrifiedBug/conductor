@@ -528,6 +528,17 @@ merged and whose issues were all closed, through two daemon restarts — and bec
 the active set *is* the busy set, those three issues were permanently unclaimable.
 A status page that has stopped being evidence is worse than no status page.
 
+### Continuation runs
+
+When a worktree is provisioned onto a branch that already exists in the mirror
+(reattach after a prior attempt, orphan, or turns-cap auto-requeue), the worker
+brief includes a **Continuation** section: read `git log` / `git diff` against
+the default branch first, and do not recreate work already on the branch.
+
+A **turns-cap kill with attempts remaining** salvages the tree, puts the queue
+label back on, and skips the failed label so the next tick reclaims as a
+continuation automatically.
+
 ### Branch names
 
 `<type>/<slug>`, where the type is `fix` when any label's last segment (after `:`
@@ -571,14 +582,14 @@ rest. `0` is a real value (a hard stop), not "unset".
 | Cap | Default | What it protects |
 | --- | --- | --- |
 | `maxConcurrentWorkers` | `2` | Parallel omp sessions. Two, because **CI runner slots, not model tokens, are the usual throughput ceiling** — a third worker would starve its own PR checks on a small self-hosted runner pool. Raise it only if you actually have the runners. |
-| `dailySpendUsd` | `25` | Rolling-day spend ceiling. The one cap that stops the fleet rather than deferring work. |
+| `dailySpendUsd` | `25` | Rolling-day spend ceiling in USD, or `null` for no spend gate. `0` is a hard stop. Metered from assistant `usage.cost.total`. |
 | `workerMaxTurns` | `120` | Turn ceiling for one worker. Catches a session looping without converging. |
 | `workerWallClockMs` | `5400000` (90 minutes) | Wall-clock ceiling for one worker. A session that is merely stuck spends no turns, so turns alone cannot detect it. |
 | `maxAttemptsPerIssue` | `2` | Retries per issue before it escalates. One clean retry recovers from flaky CI; a third attempt almost always means the issue itself is underspecified. |
 
 Days are counted from **local midnight**, matching how a human reads "today".
 
-Hitting `dailySpendUsd` is not the same as hitting the other caps. A concurrency
+Set `dailySpendUsd` to `null` (wizard: blank) for no money gate — turns and wall-clock still apply. Hitting a numeric `dailySpendUsd` is not the same as hitting the other caps. A concurrency
 limit simply defers work to a later tick. The spend cap **pauses the daemon and
 pages at Tier 2**: a loop that is burning money has to halt itself, because
 waiting for someone to notice tomorrow is how a runaway becomes expensive.

@@ -100,8 +100,11 @@ checked in this order:
 - **Commits — pushed or not — or a PR that is not green.** Safe either way:
   pushed work lives on the remote, and unpushed commits live on the run's branch
   in the mirror, which a re-claim deliberately reattaches so the next worker
-  starts from them. Note what exists and release the label; the attempt counter
-  still bounds a loop of deaths.
+  starts from them with a **continuation brief** (read the log/diff first; do
+  not recreate existing work). Note what exists and release the label; the
+  attempt counter still bounds a loop of deaths. A turns-cap kill with attempts
+  left is re-queued automatically by the daemon — you should still notice it on
+  drain, but you do not have to invent the continuation prompt.
 - **Genuinely nothing** (clean tree, no commits, no PR). Release the label and let
   the next tick re-claim it clean.
 
