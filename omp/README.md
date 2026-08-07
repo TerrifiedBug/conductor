@@ -576,14 +576,22 @@ edits — orient with it, then read the real file before changing it.
 
 ```bash
 omp-conductor graph-setup            # print the plan: clones, index commands, units
-sudo omp-conductor graph-setup --write   # write the script and the two units
+omp-conductor graph-setup --write        # stage the script and the two units (no root)
 ```
 
 `graph-setup` prints a `git clone` for every clone that does not exist yet, the
 one-shot index command per repo, and a `cbm-reindex.service` + `cbm-reindex.timer`
-pair built from the project's own repos and branches. `--write` writes them and
-then prints the `systemctl` line for you to run — it never runs `systemctl`, never
-enables anything, and is the only part of this package that wants root.
+pair built from the project's own repos and branches. `--write` stages all three
+in the state directory and prints the two `sudo` lines that install and enable
+them; it never runs `systemctl`.
+
+**Run it as the account the fleet runs as, never under `sudo`** — it refuses if
+you try. Everything it derives resolves per-account: the config it loads, the
+state directory it stages into, and the `HOME`/`User=` it bakes into the unit.
+Under root you get a timer that goes green while writing indexes into
+`/root/.cache`, where no worker session looks — silent, and indistinguishable
+from the feature simply not helping. Only installing the units needs root, which
+is why that is two separate printed commands.
 
 Two properties of the generated unit are deliberate:
 

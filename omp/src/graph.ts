@@ -25,7 +25,7 @@
  */
 
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import { expandHome, stateDir } from "./config.ts";
 import type { ProjectConfig, RepoTarget } from "./types.ts";
@@ -249,6 +249,7 @@ export function reindexScript(p: ProjectConfig): string {
  */
 export function reindexService(p: ProjectConfig, scriptPath = reindexScriptPath()): string {
   const home = homedir();
+  const user = userInfo().username;
   return [
     "[Unit]",
     `Description=Reindex the code graphs omp-conductor project "${p.name}" hands its workers`,
@@ -258,6 +259,14 @@ export function reindexService(p: ProjectConfig, scriptPath = reindexScriptPath(
     "[Service]",
     "Type=oneshot",
     `ExecStart=/bin/bash ${scriptPath}`,
+    "# Pinned to the account that generated this, and it has to be the account the",
+    "# fleet runs as. A systemd service defaults to root, and root is wrong three",
+    "# ways at once here: the indexer would write its store under /root/.cache",
+    "# where no worker session ever looks, a private clone would fetch with root's",
+    "# SSH credentials rather than the fleet's, and every path below points into a",
+    "# different account's home. All three fail silently — the timer goes green",
+    "# and the graph a worker queries is simply never the graph this built.",
+    `User=${user}`,
     "# Both of these are spelled out because systemd supplies neither usefully.",
     `# The indexer resolves its store from HOME (${join(home, ".cache", "codebase-memory-mcp")}),`,
     "# so an unset HOME would build a second index nobody queries; and systemd's",
@@ -314,10 +323,23 @@ export function reindexTimer(p: ProjectConfig): string {
   ].join("\n");
 }
 
-/** The exact line an operator runs after the units exist. Never run by this
- *  package: it needs root, and root-level side effects are the operator's. */
-export function enableCommand(): string {
-  return `systemctl daemon-reload && systemctl enable --now ${REINDEX_UNIT}.timer`;
+/**
+ * The privileged tail, and the only part of this feature that needs root.
+ *
+ * Split out deliberately. Running the whole CLI under `sudo` looks convenient
+ * and is wrong: `loadConfig`, `stateDir`, `homedir` and `userInfo` would all
+ * resolve as root, so the config would be missed or the wrong one, the script
+ * would land in root's state directory, and the generated unit would bake
+ * root's HOME with no `User=` — indexes written where no worker reads them.
+ * So generation runs unprivileged as the fleet user, and only the copy into
+ * the unit directory is elevated.
+ */
+export function installCommands(unitDir = SYSTEMD_UNIT_DIR, from = stateDir()): string[] {
+  const { service, timer } = unitPaths(from);
+  return [
+    `sudo install -m 0644 ${service} ${timer} ${unitDir}/`,
+    `sudo systemctl daemon-reload && sudo systemctl enable --now ${REINDEX_UNIT}.timer`,
+  ];
 }
 
 function block(title: string, body: string): string[] {
@@ -413,21 +435,19 @@ export function formatGraphSetup(
   );
 
   const script = reindexScriptPath();
-  const { service, timer } = unitPaths(unitDir);
+  const { service, timer } = unitPaths(stateDir());
   lines.push(
-    `   \`graph-setup --write\` writes these three files for you (${script},`,
-    `   and the two units in ${unitDir}); it never runs systemctl.`,
+    `   \`graph-setup --write\` writes these three files for you, all under`,
+    `   ${stateDir()}. Run it as the account the fleet runs as — never under`,
+    "   sudo, which would resolve the config, the state directory and the unit's",
+    "   own User= as root and quietly build indexes no worker can read.",
     "",
     ...block(script, reindexScript(p)),
     ...block(service, reindexService(p, script)),
     ...block(timer, reindexTimer(p)),
-    "   then, as root:",
+    `   then install them, which is the only step that needs root:`,
     "",
-    `   ${enableCommand()}`,
-    "",
-    `   HOME and PATH in the service are this command's own user (${homedir()}), and`,
-    "   the unit sets no User= so it runs as root. If those are different accounts,",
-    "   fix both Environment= lines before enabling.",
+    ...installCommands(unitDir).map((c) => `   ${c}`),
   );
 
   return lines.join("\n");
@@ -448,30 +468,31 @@ export interface GraphSetupWrite {
  */
 export function writeGraphSetup(p: ProjectConfig, unitDir = SYSTEMD_UNIT_DIR): GraphSetupWrite {
   const script = reindexScriptPath();
-  const { service, timer } = unitPaths(unitDir);
+  // All three land in the state directory, which this account owns — so the
+  // whole command runs unprivileged and there is no sudo path that could
+  // resolve HOME, the config or the unit's User= as the wrong account.
+  const { service, timer } = unitPaths(stateDir());
 
   mkdirSync(dirname(script), { recursive: true });
   writeFileSync(script, reindexScript(p));
   // Executable so an operator can run the refresh by hand before trusting a
   // timer with it; the unit calls bash explicitly either way.
   chmodSync(script, 0o755);
-  // The unit directory is never created: a host without `/etc/systemd/system`
-  // has no systemd, and a package that answers that by making the directory has
-  // written two files nothing will ever read.
   writeFileSync(service, reindexService(p, script));
   writeFileSync(timer, reindexTimer(p));
 
   const missing = graphRepos(p).filter((r) => !existsSync(r.graphProject));
   const next = [
-    "nothing has been enabled or started — this command never runs systemctl.",
+    "nothing has been installed, enabled or started — this command needs no root",
+    `and takes none. The units are staged in ${stateDir()}.`,
     "",
-    "next, as root:",
+    "to install them, which is the only privileged step:",
     "",
-    `  ${enableCommand()}`,
+    ...installCommands(unitDir).map((c) => `  ${c}`),
     "",
     "then watch one real run before trusting the schedule (it takes minutes per repo):",
     "",
-    `  systemctl start ${REINDEX_UNIT}.service && systemctl status ${REINDEX_UNIT}.service`,
+    `  sudo systemctl start ${REINDEX_UNIT}.service && systemctl status ${REINDEX_UNIT}.service`,
     ...(missing.length === 0
       ? []
       : [

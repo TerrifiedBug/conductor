@@ -461,6 +461,22 @@ try {
       break;
 
     case "graph-setup": {
+      // Refused rather than accommodated. Under sudo every path this command
+      // derives — the config it loads, the state directory it writes to, the
+      // HOME and User= it bakes into the unit — resolves as root instead of the
+      // fleet's account, and the result is a timer that goes green while
+      // building indexes in a store no worker session ever reads. Nothing about
+      // that announces itself, so the only safe answer is to stop.
+      if (process.env["SUDO_USER"] !== undefined) {
+        process.stderr.write(
+          "omp-conductor: run graph-setup as the account the fleet runs as, not under sudo.\n" +
+            `Under sudo the config, ~/.cache and the unit's User= all resolve as root, and the\n` +
+            `indexes land where no worker can read them. Only installing the units needs root,\n` +
+            "and this command prints those two lines for you at the end.\n",
+        );
+        process.exit(1);
+      }
+
       const project = findProject(loadConfig(), flag(argv, "project"));
       if (graphRepos(project).length === 0) {
         // Not a warning: with nothing configured there is nothing to print, and
@@ -481,14 +497,13 @@ try {
       try {
         result = writeGraphSetup(project);
       } catch (err) {
-        // Overwhelmingly likely EACCES on /etc/systemd/system, occasionally a
-        // host with no systemd at all. "Permission denied" on its own tells an
-        // operator neither that this one command is the part that needs root,
-        // nor that the printed plan is a complete substitute for it.
+        // No longer the permissions case — all three files go to this account's
+        // own state directory — so this is a full disk, a read-only mount or a
+        // state directory someone else owns. Say what failed and offer the
+        // printed plan, which is a complete substitute for the write.
         process.stderr.write(
-          `omp-conductor: could not write the units (${err instanceof Error ? err.message : String(err)}).\n` +
-            "System units live under /etc/systemd/system, so this needs root on a systemd host:\n" +
-            "re-run with sudo, or drop --write and copy the printed text yourself.\n",
+          `omp-conductor: could not stage the files (${err instanceof Error ? err.message : String(err)}).\n` +
+            "Drop --write and copy the printed text yourself — it is the same content.\n",
         );
         process.exit(1);
       }

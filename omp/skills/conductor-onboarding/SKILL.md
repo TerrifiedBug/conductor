@@ -666,15 +666,22 @@ queries an empty graph), and a `cbm-reindex.service` + `cbm-reindex.timer` pair
 derived from their own repos and branches. Then:
 
 ```bash
-sudo omp-conductor graph-setup --write    # writes the script and the two units
+omp-conductor graph-setup --write         # stages the script and the two units (no root)
 ```
 
-`--write` needs root because system units live in `/etc/systemd/system`, and it
-deliberately stops there: it prints the `systemctl daemon-reload && systemctl
-enable --now cbm-reindex.timer` for them to run and never runs `systemctl` itself.
-Have them start the service once by hand (`systemctl start cbm-reindex.service`)
-and read the result — a first real run is where a wrong branch or a missing clone
-shows up, and the unit is written to fail loudly rather than index a stale tree.
+**Have them run this as the account the fleet runs as, not under `sudo`.** The
+command refuses sudo outright, and that refusal is the whole point: config path,
+state directory, `~/.cache` and the unit's own `User=` all resolve per-account,
+so a root run stages a timer that goes green while writing indexes into
+`/root/.cache` where no worker session looks. It is silent, and it looks exactly
+like the feature not helping.
+
+`--write` stages all three files in the state directory and prints the two `sudo`
+lines that install and enable them — installing units is the only privileged
+step, and it never runs `systemctl` itself. Have them start the service once by
+hand and read the result: a first real run is where a wrong branch or a missing
+clone shows up, and the unit is written to fail loudly rather than index a stale
+tree.
 
 Two things to leave them with:
 

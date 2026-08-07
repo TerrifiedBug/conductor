@@ -8,8 +8,8 @@
  * for the delta.
  */
 
-import { existsSync, mkdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 import type { RepoTarget } from "./types.ts";
 
@@ -96,6 +96,50 @@ async function gitSucceeds(args: string[], cwd?: string): Promise<boolean> {
   return code === 0;
 }
 
+/** Fences the block below so it can be found, replaced, and never duplicated. */
+const EXCLUDE_BEGIN = "# >>> omp-conductor (managed; edit outside this block)";
+const EXCLUDE_END = "# <<< omp-conductor";
+
+/**
+ * Appended to every mirror's `info/exclude`, and so in force in every worktree
+ * cut from it. Deliberately the same shapes salvage therefore skips, and
+ * for the same reason — a worker's own scaffolding is not the repo's business.
+ *
+ * Two layers because they catch different moments: this one keeps scratch out
+ * of a worker's own `git add -A` and out of its `git status`, which salvage
+ * never observes; the salvage list catches whatever a worker created before
+ * this landed, or wrote past an ignore with `add -f`.
+ */
+const LOCAL_EXCLUDE = [".scratch*/", ".scratch*", ".env.local", "*.local.sh"];
+
+/**
+ * Adds the managed block to an `info/exclude`, preserving everything else.
+ *
+ * `info/exclude` is a *local* ignore file, which means it is exactly where an
+ * operator or another tool puts patterns they could not put in the tracked
+ * `.gitignore` — so overwriting it would silently destroy work that has no
+ * other copy. The block is fenced and replaced in place, so re-running this on
+ * every dispatch neither duplicates our lines nor disturbs theirs.
+ */
+export function mergeExclude(existing: string): string {
+  const begin = existing.indexOf(EXCLUDE_BEGIN);
+  const end = existing.indexOf(EXCLUDE_END);
+  const theirs =
+    begin === -1 || end === -1 || end < begin
+      ? existing
+      : existing.slice(0, begin) + existing.slice(end + EXCLUDE_END.length + 1);
+
+  // Normalised before recomposing, so the result is byte-identical on every
+  // call. Trimming the tail matters twice over: a hand-edited file often has no
+  // trailing newline (the first managed line would glue onto their last
+  // pattern and match nothing), and without it the blank separator below would
+  // accumulate one more newline on each of the thousands of dispatches that
+  // call this.
+  const body = theirs.replace(/\n+$/, "");
+  const head = body === "" ? [] : [body, ""];
+  return [...head, EXCLUDE_BEGIN, ...LOCAL_EXCLUDE, EXCLUDE_END, ""].join("\n");
+}
+
 /**
  * Rewrites the two `clone --mirror` defaults that are actively dangerous for a
  * cache we cut worktrees from. Applied on every `ensureMirror` so a mirror left
@@ -122,6 +166,20 @@ async function configureMirror(mirrorPath: string): Promise<void> {
     ["config", "--replace-all", "remote.origin.fetch", TRACKING_REFSPEC],
     mirrorPath,
   );
+
+  // A mirror's `info/exclude` is the common git dir for every worktree cut from
+  // it, so one write here keeps a worker's own scratch out of `git status` in
+  // all of them — without touching the repo's tracked `.gitignore`, which is
+  // the operator's file and not ours to edit.
+  //
+  // Belt and braces with the salvage excludes rather than a replacement for
+  // them: this stops scratch reaching a *worker's* own `git add`, which salvage
+  // never sees. Merged rather than written, because `info/exclude` is precisely
+  // where an operator keeps patterns that cannot go in the tracked file — and
+  // this runs on every dispatch, so overwriting would destroy them repeatedly.
+  const exclude = join(mirrorPath, "info", "exclude");
+  mkdirSync(dirname(exclude), { recursive: true });
+  writeFileSync(exclude, mergeExclude(existsSync(exclude) ? readFileSync(exclude, "utf8") : ""));
 }
 
 /**
@@ -300,34 +358,6 @@ const SALVAGE_COMMIT_CONFIG = [
 ];
 
 /**
- * Shapes a worker creates for itself and no one else ever wants committed: a
- * local env helper, a scratch directory, a debug dump.
- *
- * Excluded from salvage rather than left to each repo's `.gitignore`, because
- * salvage runs against whatever repo the fleet was pointed at and cannot assume
- * the operator has anticipated this. A repo that *does* ignore them loses
- * nothing here — the patterns simply never match.
- *
- * Applied to **untracked files only**, which is what makes matching by name
- * safe. Scratch is untracked by definition; a *tracked* file of the same name
- * is the repo's own, and a worker editing it is doing product work. Matching
- * that on filename would silently drop a real change — salvage destroying
- * tracked work is the precise failure this whole mechanism exists to prevent.
- *
- * Deliberately narrow even so. Anything ambiguous belongs in the commit: the
- * cost of over-keeping is a reviewer deleting a file, and the cost of
- * over-skipping is destroyed work.
- */
-const SALVAGE_EXCLUDES = [
-  ":(exclude).scratch*",
-  ":(exclude)**/.scratch*",
-  ":(exclude).env.local",
-  ":(exclude)**/.env.local",
-  ":(exclude)*.local.sh",
-  ":(exclude)**/*.local.sh",
-];
-
-/**
  * Commits a dead run's uncommitted work to the run's own branch and pushes it,
  * so that the tree the next attempt destroys is no longer the only copy.
  *
@@ -370,25 +400,24 @@ export async function salvageWip(
     // string ends up in an escalation as the place to go looking.
     const branch = await git(["rev-parse", "--abbrev-ref", "HEAD"], worktree);
 
-    // Two steps, and the order encodes the safety argument.
+    // `-A` on purpose: the losses this exists for were mostly *new* files.
     //
-    // Tracked first, unconditionally: `-u` stages every modification and
-    // deletion to a file the repo already owns. No pathspec, no excludes — a
-    // tracked file is the repo's, whatever it is called, and dropping a
-    // worker's edit to one would be salvage destroying the work it exists to
-    // save.
-    await git(["add", "-u"], worktree);
+    // Filtering scratch is git's job, not a pathspec's. The mirror's
+    // `info/exclude` (see {@link mergeExclude}) is the common git dir for this
+    // worktree, and git's own rules then give exactly the semantics needed:
+    // untracked ignored files are skipped, while modifications to *tracked*
+    // files are staged even when the name matches an ignore. That second half
+    // is why an exclude pathspec here was wrong — it matched on filename alone,
+    // so a repo legitimately versioning a `bootstrap.local.sh` would have lost
+    // a worker's edits to it, salvage destroying the work it exists to save.
+    //
+    // A literal `:(exclude)<path>` was also an outright bug: git counts it as
+    // naming the path, so an already-ignored file made `add` exit 1 and every
+    // cap-kill would have reported a salvage *failure*.
+    await git(["add", "-A"], worktree);
 
-    // Then untracked, minus the worker's own scaffolding. `-A` here because the
-    // losses this exists for were mostly *new* files; the excludes because on
-    // 2026-08-07 a salvage swept up a `.scratch82/env.sh` of loopback dev
-    // defaults, which read enough like a leaked secret that the orchestrator
-    // broke its own "never touch a worker's branch" boundary trying to scrub
-    // it. Safe to match on filename only because nothing tracked reaches here.
-    await git(["add", "-A", "--", ".", ...SALVAGE_EXCLUDES], worktree);
-
-    // The dirty check above ran before the excludes, so a tree whose only
-    // changes were scratch had work by that test and has none by this one.
+    // The dirty check above ran before git applied its ignores, so a tree whose
+    // only changes were ignored scratch had work by that test and none by this.
     // Without this, `commit` exits non-zero on an empty index and a tree
     // holding nothing worth keeping gets reported as a salvage *failure*.
     if ((await git(["diff", "--cached", "--name-only"], worktree)) === "") {

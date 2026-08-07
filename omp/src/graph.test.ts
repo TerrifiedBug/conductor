@@ -20,7 +20,7 @@
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import {
   cloneCommand,
@@ -34,11 +34,13 @@ import {
   resolvePrereqs,
   reindexScript,
   reindexScriptPath,
+  installCommands,
   reindexService,
   reindexTimer,
   unitPaths,
   writeGraphSetup,
 } from "./graph.ts";
+import { stateDir } from "./config.ts";
 import { DEFAULT_AUTHORITY } from "./types.ts";
 import type { ProjectConfig, RepoTarget } from "./types.ts";
 
@@ -229,17 +231,22 @@ test("the plan carries the whole refresh, so a host with no root can still be se
 
   expect(text).toContain(reindexScript(p).trimEnd());
   expect(text).toContain(reindexTimer(p).trimEnd());
-  expect(text).toContain("systemctl daemon-reload && systemctl enable --now cbm-reindex.timer");
+  expect(text).toContain("sudo install -m 0644");
+  expect(text).toContain("enable --now cbm-reindex.timer");
+  // The plan has to warn about the account too, since a reader who copies it by
+  // hand under sudo lands in exactly the state --write refuses to create.
+  expect(text).toContain("never under");
 });
 
-test("--write leaves the files and the systemctl step, and runs neither", () => {
-  const unitDir = join(home, "units");
-  mkdirSync(unitDir, { recursive: true });
+test("--write stages every file unprivileged and leaves the install to the operator", () => {
   const p = project(graphed("api"));
 
-  const result = writeGraphSetup(p, unitDir);
+  const result = writeGraphSetup(p, "/etc/systemd/system");
 
-  const { service, timer } = unitPaths(unitDir);
+  // All three under the state directory this account owns — not the unit dir.
+  // Writing units directly would force a sudo run, and a sudo run resolves the
+  // config, HOME and User= as root, indexing into a store no worker reads.
+  const { service, timer } = unitPaths(stateDir());
   expect(result.written).toEqual([reindexScriptPath(), service, timer]);
   expect(readFileSync(service, "utf8")).toBe(reindexService(p, reindexScriptPath()));
   expect(readFileSync(timer, "utf8")).toBe(reindexTimer(p));
@@ -250,8 +257,8 @@ test("--write leaves the files and the systemctl step, and runs neither", () => 
   // The one thing this command must never do: it needs root, and a package that
   // enables system timers behind an operator's back cannot be audited by
   // reading its output.
-  expect(result.next).toContain("never runs systemctl");
-  expect(result.next).toContain("systemctl daemon-reload && systemctl enable --now cbm-reindex.timer");
+  expect(result.next).toContain("installed, enabled or started");
+  expect(result.next).toContain("sudo install -m 0644");
   // The clone does not exist, and the script fails rather than skipping it, so
   // the missing step is named here instead of on the next tick.
   expect(result.next).toContain("do not exist yet");
@@ -307,4 +314,43 @@ test("the pasted entry falls back to a plausible path when the binary is absent"
   expect(JSON.parse(mcpEntry({ indexer: "/opt/cbm", mcpConfig: "x", mounted: false }))).toEqual({
     "codebase-memory-mcp": { type: "stdio", command: "/opt/cbm" },
   });
+});
+
+// ------------------------------------------------------ the account boundary
+
+test("the unit pins itself to the generating account, not systemd's root default", () => {
+  const unit = reindexService(project(graphed("api")), "/x/cbm-reindex.sh");
+
+  // Without `User=`, systemd runs this as root: the indexer writes its store to
+  // /root/.cache, a private fetch uses root's SSH keys, and every worker session
+  // queries a different account's cache and finds nothing. All three are silent,
+  // which is why the assertion is on the unit rather than on documentation.
+  expect(unit).toContain(`User=${userInfo().username}`);
+  expect(unit).toContain(`Environment=HOME=${homedir()}`);
+});
+
+test("units are staged in the state dir, so nothing here ever needs root", () => {
+  const p = project(graphed("api"));
+  const result = writeGraphSetup(p, "/etc/systemd/system");
+
+  // Every written path is under this account's own state directory. A --write
+  // that targeted /etc would only succeed under sudo, and a sudo run resolves
+  // config, HOME and User= as root — the failure this layout removes entirely.
+  for (const f of result.written) expect(f.startsWith(home)).toBe(true);
+  expect(result.written).toHaveLength(3);
+
+  // The privileged step is named, separated, and is the only sudo in the output.
+  expect(result.next).toContain("only privileged step");
+  expect(result.next).toContain("sudo install -m 0644");
+  expect(result.next).toContain("/etc/systemd/system/");
+});
+
+test("install commands copy from the staging dir into the unit dir", () => {
+  const [copy, enable] = installCommands("/etc/systemd/system", "/home/fleet/.omp/conductor");
+
+  expect(copy).toBe(
+    "sudo install -m 0644 /home/fleet/.omp/conductor/cbm-reindex.service " +
+      "/home/fleet/.omp/conductor/cbm-reindex.timer /etc/systemd/system/",
+  );
+  expect(enable).toContain("enable --now cbm-reindex.timer");
 });

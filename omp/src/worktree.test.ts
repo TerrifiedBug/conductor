@@ -7,6 +7,7 @@ import type { RepoTarget } from "./types.ts";
 import {
   addWorktree,
   ensureMirror,
+  mergeExclude,
   mirrorPathFor,
   removeWorktree,
   salvageWip,
@@ -310,11 +311,12 @@ describe("salvageWip", () => {
 
       const tree = await addWorktree(repo, mirrorRoot, workspaceRoot, 1010, branch);
 
-      // A repo that legitimately versions a file matching an exclude pattern —
-      // a committed bootstrap helper, an env template. Plenty of repos do.
+      // A repo that legitimately versions a file matching an ignore pattern —
+      // a committed bootstrap helper, an env template. Plenty of repos do, and
+      // `add -f` is how they got tracked before conductor's ignore existed.
       writeFileSync(join(tree, "bootstrap.local.sh"), "#!/bin/sh\necho v1\n");
       writeFileSync(join(tree, ".env.local"), "TEMPLATE=1\n");
-      git(["add", "bootstrap.local.sh", ".env.local"], tree);
+      git(["add", "-f", "bootstrap.local.sh", ".env.local"], tree);
       git(["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "track them"], tree);
 
       // Now a worker edits both as ordinary product work, and dies.
@@ -378,4 +380,41 @@ describe("salvageWip", () => {
     },
     TIMEOUT_MS,
   );
+});
+
+describe("mergeExclude", () => {
+  it("preserves an operator's own patterns byte for byte", () => {
+    // `info/exclude` is a *local* ignore — precisely where an operator or another
+    // tool puts patterns that cannot go in the tracked `.gitignore`. This runs on
+    // every dispatch, so overwriting would destroy them again and again, and the
+    // patterns have no other copy anywhere.
+    const theirs = "# my local noise\n.idea/\nscratchpad.md\n";
+    const merged = mergeExclude(theirs);
+
+    expect(merged.startsWith(theirs)).toBe(true);
+    expect(merged).toContain(".scratch*/");
+  });
+
+  it("is idempotent, and updates its own block in place", () => {
+    const once = mergeExclude("*.swp\n");
+    const twice = mergeExclude(once);
+
+    expect(twice).toBe(once);
+    // One managed block, not two — this is called on every single dispatch.
+    expect(twice.split(">>> omp-conductor")).toHaveLength(2);
+    expect(twice.split("*.swp")).toHaveLength(2);
+  });
+
+  it("does not glue its block onto a file with no trailing newline", () => {
+    // Hand-edited files routinely lack one. Without the guard the first managed
+    // pattern would be appended to their last one and match nothing at all.
+    const merged = mergeExclude("build/");
+
+    expect(merged).toContain("build/\n");
+    expect(merged).not.toContain("build/#");
+  });
+
+  it("handles an empty file without a leading blank line", () => {
+    expect(mergeExclude("").startsWith("# >>> omp-conductor")).toBe(true);
+  });
 });
