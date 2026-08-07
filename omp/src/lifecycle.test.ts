@@ -19,6 +19,7 @@ import {
   isAlive,
   livingDaemon,
   readRecord,
+  restartDaemon,
   runtimeDir,
   setSystemctlForTest,
   startDaemon,
@@ -257,6 +258,72 @@ test("systemdMainPid returns the MainPID of an active unit", () => {
   setSystemctlForTest(() => ({ ok: true, stdout: "4242\nactive\n", stderr: "" }));
   expect(systemdMainPid()).toBe(4242);
 });
+
+test("stopDaemon throws when the unit owns the pid but systemctl stop refuses", async () => {
+  // The bug this guards: collapsing manager failure to "not ours" and then
+  // SIGTERMing a unit-owned MainPID — Restart=on-failure reads that as a crash
+  // and the unit comes straight back. Ownership is proven; refusal is terminal.
+  const child = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
+  const pid = child.pid;
+  const calls: string[][] = [];
+  try {
+    writeRecord(record({ pid }));
+    setSystemctlForTest((args) => {
+      calls.push(args);
+      if (args[0] === "show") return { ok: true, stdout: `${pid}\nactive\n`, stderr: "" };
+      if (args[0] === "stop") {
+        return { ok: false, stdout: "", stderr: "Access denied\n" };
+      }
+      return { ok: false, stdout: "", stderr: `unexpected ${args.join(" ")}` };
+    });
+
+    await expect(stopDaemon()).rejects.toThrow(/systemctl stop .* failed: Access denied/);
+    // Must not have signalled the child — it is still the unit's MainPID.
+    expect(isAlive(pid)).toBe(true);
+    // Pidfile stays so the next start does not bind a port systemd still holds.
+    expect(readRecord()?.pid).toBe(pid);
+    expect(calls.filter((a) => a[0] === "stop")).toHaveLength(1);
+  } finally {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+    await child.exited;
+  }
+});
+
+test("restartDaemon throws when the unit owns the pid but systemctl restart refuses", async () => {
+  const child = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
+  const pid = child.pid;
+  const calls: string[][] = [];
+  try {
+    writeRecord(record({ pid }));
+    setSystemctlForTest((args) => {
+      calls.push(args);
+      if (args[0] === "show") return { ok: true, stdout: `${pid}\nactive\n`, stderr: "" };
+      if (args[0] === "restart") {
+        return { ok: false, stdout: "", stderr: "Connection timed out\n" };
+      }
+      // A fallthrough that called stop would still be wrong — assert neither.
+      return { ok: false, stdout: "", stderr: `unexpected ${args.join(" ")}` };
+    });
+
+    await expect(restartDaemon()).rejects.toThrow(/systemctl restart .* failed: Connection timed out/);
+    expect(isAlive(pid)).toBe(true);
+    expect(readRecord()?.pid).toBe(pid);
+    expect(calls.some((a) => a[0] === "stop")).toBe(false);
+    expect(calls.filter((a) => a[0] === "restart")).toHaveLength(1);
+  } finally {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+    await child.exited;
+  }
+});
+
 
 test("healthCheck resolves ok:false against a closed port instead of rejecting", async () => {
   // Port 1 is privileged, so nothing in a test run is listening on it and the
