@@ -32,12 +32,14 @@ import { dirname, join } from "node:path";
 import {
   admitCandidates,
   checkIntegrity,
+  checkStall,
   manifestDiff,
+  markPaged,
   packageManifest,
   reconcileOrphanedRuns,
   salvageLines,
 } from "./daemon.ts";
-import type { IntegrityGate } from "./daemon.ts";
+import type { IntegrityGate, StallGate } from "./daemon.ts";
 import type { Routed } from "./routing.ts";
 import { openStore } from "./store.ts";
 import { DEFAULT_AUTHORITY, DEFAULT_CAPS } from "./types.ts";
@@ -215,15 +217,21 @@ describe("checkIntegrity", () => {
     expect(gate.paged).toBe(false);
   });
 
-  it("pauses every divergent tick but pages on only the first", () => {
+  it("pauses every divergent tick, and keeps asking to page until one is delivered", () => {
     const gate: IntegrityGate = { baseline: baseline(), paged: false };
     const tampered = new Map([["daemon.ts", "bbb"]]);
 
     expect(checkIntegrity(gate, tampered)).toEqual({ diff: ["changed daemon.ts"], pause: true, page: true });
 
-    // Pause is idempotent and unconditional — an operator who resumes without
-    // restarting is re-paused, because the files still differ. The page is not:
-    // one every five minutes until someone looks is a page nobody reads.
+    // The gate does NOT latch itself. A page Telegram refused is a page nobody
+    // got, and latching on the attempt would trade one delivery outage for
+    // permanent silence about a boundary that is still broken.
+    markPaged(gate, false);
+    expect(checkIntegrity(gate, tampered).page).toBe(true);
+
+    // Delivered: now it latches. Pause stays true either way — an operator who
+    // resumes without restarting is re-paused, because the files still differ.
+    markPaged(gate, true);
     expect(checkIntegrity(gate, tampered)).toEqual({ diff: ["changed daemon.ts"], pause: true, page: false });
     expect(checkIntegrity(gate, tampered).page).toBe(false);
   });
@@ -489,5 +497,73 @@ describe("salvageLines", () => {
     // and the next attempt removes it.
     expect(lines[1]).toContain(TREE);
     expect(lines[1]).toContain("only copy");
+  });
+});
+
+// --------------------------------------------------------------- checkStall
+
+describe("checkStall", () => {
+  let dir = "";
+  let marker = "";
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "conductor-stall-"));
+    marker = join(dir, ".conductor-stalled");
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("says nothing while the orchestrator is draining its queue", () => {
+    const gate: StallGate = { paged: false };
+    expect(checkStall(gate, marker)).toEqual({ page: false });
+  });
+
+  it("pages once per stall, carrying the marker's own timestamp line", () => {
+    writeFileSync(marker, "2026-08-07T06:27:55.123Z 2 ticks queued unconsumed\nsecond line ignored\n");
+    const gate: StallGate = { paged: false };
+
+    const first = checkStall(gate, marker);
+    expect(first.page).toBe(true);
+    expect(first.since).toBe("2026-08-07T06:27:55.123Z 2 ticks queued unconsumed");
+
+    markPaged(gate, true);
+    expect(checkStall(gate, marker).page).toBe(false);
+  });
+
+  it("keeps asking to page until one is actually delivered", () => {
+    writeFileSync(marker, "2026-08-07T06:27:55.123Z stalled\n");
+    const gate: StallGate = { paged: false };
+
+    // The wedge is the moment the escalation channel matters most, and it is
+    // exactly when a page can fail. Silence after one failed send would leave
+    // the fleet's only supervisor stuck with nobody told.
+    expect(checkStall(gate, marker).page).toBe(true);
+    markPaged(gate, false);
+    expect(checkStall(gate, marker).page).toBe(true);
+    markPaged(gate, false);
+    expect(checkStall(gate, marker).page).toBe(true);
+  });
+
+  it("re-arms once the marker clears, so a second wedge pages again", () => {
+    writeFileSync(marker, "first stall\n");
+    const gate: StallGate = { paged: false };
+    markPaged(gate, checkStall(gate, marker).page);
+    expect(checkStall(gate, marker).page).toBe(false);
+
+    // The orchestrator consumed a tick: the extension deletes its own marker.
+    rmSync(marker);
+    expect(checkStall(gate, marker)).toEqual({ page: false });
+    expect(gate.paged).toBe(false);
+
+    writeFileSync(marker, "second stall, days later\n");
+    expect(checkStall(gate, marker).page).toBe(true);
+  });
+
+  it("still reports a stall whose marker cannot be read", () => {
+    writeFileSync(marker, "");
+    const gate: StallGate = { paged: false };
+
+    const verdict = checkStall(gate, marker);
+    expect(verdict.page).toBe(true);
+    expect(verdict.since).toBeUndefined();
   });
 });

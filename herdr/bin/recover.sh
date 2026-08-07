@@ -376,6 +376,45 @@ saved_fleet_panes() {
   ' "$file" 2>/dev/null
 }
 
+# The stall marker omp-conductor's tick extension writes into the fleet session's
+# cwd after two of its own prompts go unconsumed — an hour at the reference
+# interval.
+#
+# This plugin's liveness test is "the agent is listed AND a non-shell process
+# holds the pane", and a wedged agent loop satisfies both: the process is there,
+# the label is there, and nothing is being read off the queue. Not hypothetical
+# — on 2026-08-07 a fleet session logged `ui.loop-blocked` after an
+# auto-compaction, then sat 23 minutes while a tick and an operator's Telegram
+# message queued behind it, with this plugin, the daemon's /healthz and the
+# tick's own coalescing log all reporting health. The marker is the one signal
+# separating "running" from "working", and it necessarily comes from outside the
+# wedged process.
+#
+# Deliberately a page, not a restart. A wedge lands mid-turn, and this plugin
+# cannot tell a half-applied edit from an idle loop; killing the session could
+# destroy work the operator would rather read. Its whole design refuses to
+# guess, so this refuses too — the value is that a human learns in minutes
+# instead of by noticing a silent phone.
+#
+# The daemon watches the same marker on its own five-minute tick and pages from
+# there, which is what covers a wedge that begins between this plugin's events.
+# This branch is the one that stops a *recovery* run from certifying a wedged
+# session as healthy.
+STALL_MARKER=${STALL_MARKER:-.conductor-stalled}
+
+stalled_marker() {
+  [[ -f "$FLEET_CWD/$STALL_MARKER" ]]
+}
+
+# The marker's first line carries the timestamp the stall crossed the threshold.
+# Bounded and newline-free: this lands in a Telegram page.
+stalled_detail() {
+  local body
+  body=$(head -c 400 "$FLEET_CWD/$STALL_MARKER" 2>/dev/null | tr '\n' ' ')
+  printf 'omp-conductor reported: %s (marker %s). The process and its Herdr label are both healthy, so this plugin will not restart it — a wedge lands mid-turn and the tree may hold work worth reading first. Attach, inspect, then SIGTERM the omp process: recovery resumes it by exact identity, and the first consumed tick clears the marker.' \
+    "${body:-a stalled agent loop}" "$FLEET_CWD/$STALL_MARKER"
+}
+
 # Plugin-owned durable identity: the last pane and session ref this plugin saw
 # the fleet running in. Herdr's snapshot is authoritative but debounced, and the
 # `agent_name` in it disappears the instant omp exits; this file is what keeps a
@@ -721,6 +760,17 @@ assess_claims() {
         if [[ -n $label ]]; then
           # The one moment this plugin knows the fleet's identity first-hand.
           remember_identity "$pane" "${claim_ref:-}"
+          # Alive is not the same as working. A wedged agent loop keeps its
+          # process and its label — both tests above pass — while consuming
+          # nothing from its queue, which is how a fleet sat 23 minutes with an
+          # operator's message unread on 2026-08-07. omp-conductor's tick writes
+          # this marker when two of its own prompts go unconsumed, and it is the
+          # only evidence of that state outside the wedged process.
+          if stalled_marker; then
+            page "agent '$AGENT_NAME' is running in pane $pane but its loop is wedged" \
+              "$(stalled_detail)"
+            return 1
+          fi
           decide "ok: agent '$AGENT_NAME' is live in pane $pane (herdr detects $label) — nothing to do"
           return 1
         fi

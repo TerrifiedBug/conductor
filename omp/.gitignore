@@ -6,3 +6,7 @@ dist/
 
 # bun.lockb is committed on purpose: the dispatcher runs unattended and needs
 # reproducible installs on the homelab runners.
+
+# Build artifacts from `bun pm pack` / `npm pack` — never committed; the
+# published contents come from package.json "files", not from a tarball on disk.
+*.tgz
