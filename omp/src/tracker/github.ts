@@ -10,10 +10,10 @@
  * ~200-400ms) and failure classification by matching human-readable stderr
  * instead of reading a status code. Upgrade path when either bites: replace the
  * body of `gh()` with `fetch("https://api.github.com/...")` using a token from
- * `gh auth token`; the seven Tracker methods above it stay untouched.
+ * `gh auth token`; the eight Tracker methods above it stay untouched.
  */
 
-import type { ProjectConfig, ReadyIssue, Tracker } from "../types.ts";
+import type { PrState, ProjectConfig, ReadyIssue, Tracker } from "../types.ts";
 
 /** The subset of `gh issue list --json` output this adapter reads. Fields the
  *  API can return as null are typed as such so the mapping has to handle it. */
@@ -154,6 +154,41 @@ export function firstOpenCloser(raw: string): string | undefined {
   return nodes.find((n) => n !== null && n.state === "OPEN")?.url;
 }
 
+/**
+ * A pull request URL this adapter is willing to hand to `gh`.
+ *
+ * Load-bearing, not defensive: `gh pr view` also accepts a bare number or a
+ * *branch name*, and resolves those against whatever repository the current
+ * directory belongs to. So a `prUrl` that is not a URL would not fail — it would
+ * be answered, confidently, about some other repository's pull request. A
+ * settle sweep that acted on that answer would mark the wrong run merged.
+ */
+const PR_URL = /^https?:\/\/[^\s/]+\/[^\s/]+\/[^\s/]+\/pull\/\d+/;
+
+/**
+ * GitHub's PR state spelling mapped onto {@link PrState}.
+ *
+ * Split from the call so the mapping is pinned without a network round trip,
+ * and unrecognised text answers undefined rather than being coerced: this
+ * function's caller settles a run row on the answer, and every wrong answer
+ * here rewrites history for work that has no other record. `MERGED`, `CLOSED`
+ * and `OPEN` are the only three `gh pr view --json state` emits (verified on
+ * gh 2.97.0); anything else means the CLI changed under us, which is a reason
+ * to leave the row alone and let a human look.
+ */
+export function prStateFrom(raw: string): PrState | undefined {
+  switch (raw.trim()) {
+    case "MERGED":
+      return "merged";
+    case "CLOSED":
+      return "closed";
+    case "OPEN":
+      return "open";
+    default:
+      return undefined;
+  }
+}
+
 export function makeTracker(p: ProjectConfig): Tracker {
   const repo = p.tracker.repo;
 
@@ -247,6 +282,25 @@ export function makeTracker(p: ProjectConfig): Tracker {
       ]);
 
       return firstOpenCloser(raw);
+    },
+
+    async prState(url: string): Promise<PrState | undefined> {
+      // No `--repo`: a full URL is self-locating, and verified so on gh 2.97.0
+      // from a directory that is not a git repository at all — which is exactly
+      // where the daemon runs (its state directory), while the PR lives in one
+      // of the routed repos. Deriving `--repo` from the URL would only re-state
+      // what the URL already says.
+      if (!PR_URL.test(url)) return undefined;
+      try {
+        return prStateFrom(await gh(["pr", "view", url, "--json", "state", "--jq", ".state"]));
+      } catch {
+        // Never throws, per the port's contract. A deleted PR, a revoked token
+        // and a flaky network all mean "could not tell", and the caller's whole
+        // job is to leave the row alone on that — so classifying them here would
+        // buy nothing but a way to get the classification wrong. The next tick
+        // asks again for free.
+        return undefined;
+      }
     },
   };
 }

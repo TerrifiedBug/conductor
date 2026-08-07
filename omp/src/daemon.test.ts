@@ -18,6 +18,11 @@
  * first: a store that is right about every row it holds and simply has no row
  * for work that already exists on the tracker.
  *
+ * Then settlement, which is the other half of that first failure: a
+ * `pushed-green` row is the one row nothing ever revisited, so on 2026-08-07
+ * three merged-and-closed issues were still being reported as active runs after
+ * two daemon restarts, and their issues were permanently unclaimable.
+ *
  * The last describes what a non-graceful end tells a human. Two turns-cap kills
  * left ~1,600 lines of work as uncommitted edits in trees the next attempt is
  * built to destroy, under an escalation that said only "Worktree kept for
@@ -38,6 +43,7 @@ import {
   packageManifest,
   reconcileOrphanedRuns,
   salvageLines,
+  settlePushedGreen,
 } from "./daemon.ts";
 import type { IntegrityGate, StallGate } from "./daemon.ts";
 import type { Routed } from "./routing.ts";
@@ -287,11 +293,12 @@ function project(): ProjectConfig {
   };
 }
 
-/** Admission consults exactly one tracker method. Every other one throws, so a
- *  claim path that starts reaching for the network fails loudly here first. */
-function fakeTracker(openCloserFor: Tracker["openCloserFor"]): Tracker {
+/** The path under test consults exactly one tracker method. Every other one
+ *  throws, so a claim or a sweep that starts reaching for the network fails
+ *  loudly here first. */
+function fakeTracker(over: Partial<Tracker>): Tracker {
   const off = (name: string) => async (): Promise<never> => {
-    throw new Error(`${name} is not part of admission`);
+    throw new Error(`${name} is not part of the path under test`);
   };
   return {
     listReady: off("listReady"),
@@ -300,7 +307,9 @@ function fakeTracker(openCloserFor: Tracker["openCloserFor"]): Tracker {
     comment: off("comment"),
     close: off("close"),
     linkParent: off("linkParent"),
-    openCloserFor,
+    openCloserFor: off("openCloserFor"),
+    prState: off("prState"),
+    ...over,
   };
 }
 
@@ -350,7 +359,7 @@ describe("admitCandidates", () => {
   it("holds an issue whose work is already pushed, naming the PR", async () => {
     const { d } = deps(
       store,
-      fakeTracker(async () => "https://github.com/acme/api/pull/419"),
+      fakeTracker({ openCloserFor: async () => "https://github.com/acme/api/pull/419" }),
     );
 
     const { value, log } = await captureLog(() => admitCandidates(d, [candidate(288)], 2));
@@ -366,10 +375,7 @@ describe("admitCandidates", () => {
   });
 
   it("admits an issue whose closers are all merged or closed", async () => {
-    const { d } = deps(
-      store,
-      fakeTracker(async () => undefined),
-    );
+    const { d } = deps(store, fakeTracker({ openCloserFor: async () => undefined }));
 
     // A merged reference means the work landed and the issue was reopened for
     // more; a closed-unmerged one means it was abandoned. Either way there is no
@@ -384,9 +390,11 @@ describe("admitCandidates", () => {
   it("holds only the candidate whose check failed, and keeps evaluating the rest", async () => {
     const { d } = deps(
       store,
-      fakeTracker(async (issue) => {
-        if (issue === 288) throw new Error("HTTP 502: Bad gateway");
-        return undefined;
+      fakeTracker({
+        openCloserFor: async (issue) => {
+          if (issue === 288) throw new Error("HTTP 502: Bad gateway");
+          return undefined;
+        },
       }),
     );
 
@@ -408,9 +416,11 @@ describe("admitCandidates", () => {
     const asked: number[] = [];
     const { d } = deps(
       store,
-      fakeTracker(async (issue) => {
-        asked.push(issue);
-        return undefined;
+      fakeTracker({
+        openCloserFor: async (issue) => {
+          asked.push(issue);
+          return undefined;
+        },
       }),
     );
 
@@ -431,9 +441,11 @@ describe("admitCandidates", () => {
     const asked: number[] = [];
     const { d, escalated } = deps(
       store,
-      fakeTracker(async (issue) => {
-        asked.push(issue);
-        return undefined;
+      fakeTracker({
+        openCloserFor: async (issue) => {
+          asked.push(issue);
+          return undefined;
+        },
       }),
     );
 
@@ -445,6 +457,133 @@ describe("admitCandidates", () => {
     expect(admitted).toEqual([]);
     expect(asked).toEqual([]);
     expect(escalated.map((e) => e.issue)).toEqual([600]);
+  });
+});
+
+// --------------------------------------------------------- settlePushedGreen
+
+describe("settlePushedGreen", () => {
+  const PR = "https://github.com/acme/api/pull/293";
+  let store!: Store;
+
+  beforeEach(() => {
+    store = openStore(":memory:");
+  });
+
+  afterEach(() => {
+    store.close();
+  });
+
+  it("settles a merged PR to merged, and frees its issue in the same tick", async () => {
+    const run = store.createRun(draft({ issue: 261, state: "pushed-green", prUrl: PR }));
+    const { d } = deps(store, fakeTracker({ prState: async () => "merged" }));
+
+    const { log } = await captureLog(() => settlePushedGreen(d));
+
+    expect(store.getRun(run.id)?.state).toBe("merged");
+    expect(store.getRun(run.id)?.endedAt).toBeNumber();
+    // The whole of #18: the row leaves the active set, so `status` and
+    // `/healthz` stop reporting merged-and-closed work as active — three such
+    // rows survived two daemon restarts on the reference fleet — and the issue
+    // becomes claimable again if a human ever re-queues it.
+    expect(store.activeRuns(PROJECT)).toEqual([]);
+    expect(log).toContain(`#261 settled: ${PR} merged`);
+  });
+
+  it("settles a PR a human closed to failed, and records why on the row", async () => {
+    const run = store.createRun(draft({ issue: 262, state: "pushed-green", prUrl: PR }));
+    const { d } = deps(store, fakeTracker({ prState: async () => "closed" }));
+
+    const { log } = await captureLog(() => settlePushedGreen(d));
+
+    // Not `merged`: nothing landed on the base branch, and a row claiming
+    // otherwise is a lie about code that does not exist. Not `pushed-green`
+    // either — that strands the issue forever behind a PR nobody will merge.
+    // `failed` is true, and it releases the issue for a re-queue.
+    expect(store.getRun(run.id)?.state).toBe("failed");
+    expect(store.getRun(run.id)?.lastError).toBe(`${PR} closed without merging`);
+    expect(store.activeRuns(PROJECT)).toEqual([]);
+    expect(log).toContain(`#262 settled: ${PR} closed without merging`);
+    // The attempt still counts. It was a real attempt, and forgetting it would
+    // let a rejected issue cycle past `maxAttemptsPerIssue` unnoticed.
+    expect(store.attemptsFor(PROJECT, 262)).toBe(1);
+  });
+
+  it("leaves a row whose PR is still open exactly as it was", async () => {
+    const run = store.createRun(draft({ issue: 263, state: "pushed-green", prUrl: PR }));
+    const { d } = deps(store, fakeTracker({ prState: async () => "open" }));
+
+    await settlePushedGreen(d);
+
+    // An open PR is the normal steady state of a green run, and its issue must
+    // stay occupied or a second attempt lands on the live PR.
+    expect(store.getRun(run.id)?.state).toBe("pushed-green");
+    expect(store.getRun(run.id)?.endedAt).toBeUndefined();
+    expect(store.activeRuns(PROJECT).map((r) => r.id)).toEqual([run.id]);
+  });
+
+  it("leaves a row alone when the tracker cannot tell", async () => {
+    const run = store.createRun(draft({ issue: 264, state: "pushed-green", prUrl: PR }));
+    const { d } = deps(store, fakeTracker({ prState: async () => undefined }));
+
+    await settlePushedGreen(d);
+
+    // Undefined is "could not tell" — a flaky network, a revoked token, a
+    // deleted PR — never "no". Settling on it would record a merge that never
+    // happened, or fail a PR that is sitting there green. The next tick asks
+    // again for free.
+    expect(store.getRun(run.id)?.state).toBe("pushed-green");
+    expect(store.getRun(run.id)?.endedAt).toBeUndefined();
+  });
+
+  it("never asks about a row that has no PR url", async () => {
+    const run = store.createRun(draft({ issue: 265, state: "pushed-green" }));
+    const asked: string[] = [];
+    const { d } = deps(
+      store,
+      fakeTracker({
+        prState: async (url) => {
+          asked.push(url);
+          return "merged";
+        },
+      }),
+    );
+
+    await settlePushedGreen(d);
+
+    // Such a row should not exist — a green push means a PR — but one that does
+    // must not buy a `gh` call every five minutes forever to be told nothing.
+    expect(asked).toEqual([]);
+    expect(store.getRun(run.id)?.state).toBe("pushed-green");
+  });
+
+  it("settles the rest of the sweep when one lookup throws", async () => {
+    const broken = store.createRun(draft({ issue: 266, state: "pushed-green", prUrl: PR }));
+    const good = store.createRun(
+      draft({ issue: 267, state: "pushed-green", prUrl: PR, startedAt: 2_000 }),
+    );
+    // The sweep walks the active set in `startedAt` order, so #266 is first.
+    let calls = 0;
+    const { d } = deps(
+      store,
+      fakeTracker({
+        prState: async () => {
+          calls += 1;
+          if (calls === 1) throw new Error("HTTP 502: Bad gateway");
+          return "merged";
+        },
+      }),
+    );
+
+    const { log } = await captureLog(() => settlePushedGreen(d));
+
+    // One unreachable PR must cost its own row and nothing else. The alternative
+    // — aborting the sweep — lets a single deleted PR keep every later row stale
+    // forever, which is the bug this whole function exists to end.
+    expect(store.getRun(broken.id)?.state).toBe("pushed-green");
+    expect(store.getRun(good.id)?.state).toBe("merged");
+    expect(log).toContain("#266 not settled: PR state lookup failed");
+    expect(log).toContain("retrying next tick");
   });
 });
 

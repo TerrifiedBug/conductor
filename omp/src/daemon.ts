@@ -23,6 +23,7 @@ import { makeTracker } from "./tracker/github.ts";
 import type {
   Caps,
   Escalation,
+  PrState,
   ProjectConfig,
   ReadyIssue,
   RepoTarget,
@@ -629,6 +630,102 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
   }
 }
 
+// ------------------------------------------------------------------- settlement
+
+/** What a resolved PR turns its `pushed-green` row into. */
+export interface Settlement {
+  state: "merged" | "failed";
+  /** The log line after `#<n> settled: `, and — for a rejection — the row's own
+   *  `lastError`, because a `failed` row whose worker succeeded has to say so. */
+  reason: string;
+}
+
+/**
+ * What one `pushed-green` row becomes now its PR has an answer, or undefined to
+ * leave the row exactly as it is.
+ *
+ * A `pushed-green` row is the only one nothing ever revisited: the worker is
+ * finished, `reconcileOrphanedRuns` only settles rows that held a process, and
+ * `merged` went unwritten from day one. So they accumulated — three of them on
+ * the reference fleet on 2026-08-07, every PR merged and every issue closed,
+ * with `/healthz` still reporting three active runs and their issues
+ * permanently unclaimable, because the busy set *is* the active set (#18).
+ *
+ * The mapping, and why each answer is the only honest one:
+ *
+ * - `merged` — the work landed. That is what `merged` was reserved for.
+ * - `closed` — a human read the work and said no. Leaving it `pushed-green`
+ *   strands the issue forever behind a PR nobody will ever merge, and calling it
+ *   `merged` is simply a lie about work that does not exist on the base branch.
+ *   `failed` is true — the attempt did not land — and it releases the busy guard,
+ *   so an issue a human re-queues can be attempted again. The attempt counter is
+ *   untouched either way: this row was a real attempt, and pretending otherwise
+ *   would let a rejected issue cycle past `maxAttemptsPerIssue`.
+ * - `open`, and undefined — nothing changes. Undefined is "could not tell": a
+ *   flaky network, a revoked token, a deleted PR. Settling on it would record a
+ *   merge that never happened, and the next tick asks again for free. An
+ *   ambiguous answer must never settle a row.
+ */
+export function settlementFor(pr: PrState | undefined, prUrl: string): Settlement | undefined {
+  if (pr === "merged") return { state: "merged", reason: `${prUrl} merged` };
+  if (pr === "closed") return { state: "failed", reason: `${prUrl} closed without merging` };
+  return undefined;
+}
+
+/**
+ * Asks the tracker about every `pushed-green` PR and settles the ones that
+ * resolved.
+ *
+ * Effects at the call site, decision in {@link settlementFor} — the same split
+ * as `checkIntegrity`/`watchOrchestrator`. Exported like `admitCandidates`
+ * rather than kept private, because half of what has to hold is about the sweep
+ * and not the mapping: that a row without a PR costs no API call, and that one
+ * unreachable PR does not stop the others from settling.
+ *
+ * Tracker labels are deliberately not touched, exactly as
+ * {@link reconcileOrphanedRuns} does not touch them. A merge normally closes the
+ * issue, and a human who closed a PR is already looking at it; deciding what an
+ * issue's labels should say next is the orchestrator's drain duty, which reads
+ * these very rows through `omp-conductor status`.
+ */
+export async function settlePushedGreen(
+  d: Pick<Deps, "project" | "tracker" | "store">,
+): Promise<void> {
+  const { project, tracker, store } = d;
+  // Filtered from the active set rather than asked for with a new query: active
+  // is live workers plus these, so the list is bounded by the worker cap plus
+  // the number of PRs awaiting a merge — a handful, by construction. A fleet
+  // where that is not a handful has a merge problem, not a dispatch one.
+  const pending = store.activeRuns(project.name).filter((r) => r.state === "pushed-green");
+
+  for (const run of pending) {
+    // Nothing to ask about. A green push means a PR, so this row should not
+    // exist; if one ever does, it must not buy a `gh` call every five minutes
+    // forever to be told nothing.
+    if (run.prUrl === undefined) continue;
+
+    let pr: PrState | undefined;
+    try {
+      pr = await tracker.prState(run.prUrl);
+    } catch (err) {
+      // Per row, like admission's held candidate. The GitHub adapter already
+      // answers undefined instead of throwing, so this catch is the port's
+      // contract rather than that adapter's behaviour — and a tracker that does
+      // throw must cost its own row, not the whole sweep.
+      log(`#${run.issue} not settled: PR state lookup failed (${errText(err)}) — retrying next tick`);
+      continue;
+    }
+
+    const settlement = settlementFor(pr, run.prUrl);
+    if (settlement === undefined) continue;
+
+    const patch: Partial<RunRecord> = { state: settlement.state, endedAt: Date.now() };
+    if (settlement.state === "failed") patch.lastError = settlement.reason;
+    store.updateRun(run.id, patch);
+    log(`#${run.issue} settled: ${settlement.reason}`);
+  }
+}
+
 // -------------------------------------------------------------------- admission
 
 /** A candidate cleared for dispatch, with the attempt number it will run as. */
@@ -777,6 +874,13 @@ async function tick(d: Deps): Promise<void> {
     }
     return;
   }
+
+  // Above admission on purpose: a row settled this tick frees its issue for
+  // this same tick, so a merge and a re-queue no longer cost five minutes each.
+  // Above the spend cap too, which returns early — settling is bookkeeping about
+  // work already paid for, and a fleet that halts itself is exactly when an
+  // operator reads `status` and needs it to be true.
+  await settlePushedGreen(d);
 
   // route() filters the queue through isEligible() itself, so anything already
   // carrying a state label is gone before it gets here.
@@ -985,7 +1089,9 @@ export function armConductor(): void {
  *
  * `pushed-green` rows are deliberately left alone: they hold no process — they
  * are finished work waiting on a human merge, and they must keep occupying the
- * issue so a second attempt cannot land on a live PR.
+ * issue so a second attempt cannot land on a live PR. What eventually settles
+ * them is {@link settlePushedGreen}, on the tick, by asking the tracker what
+ * became of the PR — the one question a restart cannot answer by inference.
  */
 export function reconcileOrphanedRuns(store: Store, project: string): RunRecord[] {
   // Live runs only: `pushed-green` holds no process, so it cannot be orphaned by
