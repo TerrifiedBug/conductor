@@ -20,6 +20,7 @@ import { loadConfig, saveConfig } from "./config.ts";
 import { collectSetup } from "./plugin.ts";
 import {
   ORCHESTRATOR_BRIEF_NAME,
+  POLICY_BRIEF_NAME,
   answersFromProject,
   buildConfig,
   buildProject,
@@ -243,7 +244,7 @@ test("a first run asks no amend question and collects what it always collected",
     "confirm: Escalation fallback",
     "confirm: Orchestrator session",
     "select: What should the orchestrator report unprompted?",
-    `confirm: Write an orchestrator brief template to ${join(home, "worktrees", ORCHESTRATOR_BRIEF_NAME)}?`,
+    `confirm: Write ${ORCHESTRATOR_BRIEF_NAME} + ${POLICY_BRIEF_NAME} under ${join(home, "worktrees")}?`,
   ]);
 
   // Enter accepted every default, so this is the shipped configuration exactly.
@@ -422,7 +423,7 @@ test("only the chosen area's questions are asked, whichever area it is", async (
   ]);
   expect(await asked("reporting scope")).toEqual([]);
   expect(await asked("orchestrator brief")).toEqual([
-    `confirm: Write an orchestrator brief template to ${join(home, "worktrees", ORCHESTRATOR_BRIEF_NAME)}?`,
+    `confirm: Write ${ORCHESTRATOR_BRIEF_NAME} + ${POLICY_BRIEF_NAME} under ${join(home, "worktrees")}?`,
   ]);
 });
 

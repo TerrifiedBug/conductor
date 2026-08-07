@@ -410,6 +410,30 @@ test("a configured message is sent verbatim in place of the default", () => {
   expect(pi.sent[0]?.message.content).not.toContain(TICK_DELIVERY_RULE);
 });
 
+test("a custom message tick still recomposes ORCHESTRATOR.md from POLICY.md", () => {
+  // Refresh used to live only inside resolveTickScope(), which custom-message
+  // ticks never call. Package-floor updates would stay stale forever on a
+  // supported custom heartbeat config.
+  writeConductorConfig({ name: "fleet", scope: "escalations" });
+  const worktrees = join(home, "worktrees");
+  mkdirSync(worktrees, { recursive: true });
+  writeFileSync(join(worktrees, "POLICY.md"), "## Releases\nCUSTOM POLICY MARKER.\n");
+  writeFileSync(join(worktrees, "ORCHESTRATOR.md"), "STALE BRIEF — must be replaced\n");
+  writeTickConfig({ intervalSeconds: 600, message: "loop now" });
+
+  const pi = fakeHost();
+  orchestratorTickExtension(pi);
+  pi.start();
+  pi.fire();
+
+  expect(pi.sent[0]?.message.content).toBe("loop now");
+  const composed = readFileSync(join(worktrees, "ORCHESTRATOR.md"), "utf8");
+  expect(composed).not.toContain("STALE BRIEF");
+  expect(composed).toContain("CUSTOM POLICY MARKER.");
+  expect(composed).toContain("YOURS TO EDIT");
+  expect(composed).toContain("package floor");
+});
+
 test("a configured message is re-read every tick, so an edit binds the next heartbeat", () => {
   writeTickConfig({ intervalSeconds: 600, message: "loop now" });
   const pi = fakeHost();
@@ -473,10 +497,10 @@ test("the default message orders a disk re-read of the resolved brief and carrie
   // lives at <workspaceRoot>/ORCHESTRATOR.md, not in the session cwd; the bare
   // name is only the no-config fallback.
   expect(defaultTickMessage(at)).toBe(
-    "Tick 2026-08-06T12:00:00.000Z: re-read ORCHESTRATOR.md from disk, then run your standing loop from it.",
+    "Tick 2026-08-06T12:00:00.000Z: re-read ORCHESTRATOR.md (composed package floor + policy) and POLICY.md (editable fleet policy) from disk, then run your standing loop from them. Learning-loop amendments edit only POLICY.md — never the package floor.",
   );
-  expect(defaultTickMessage(at, "/data/fleet/worktrees/ORCHESTRATOR.md")).toBe(
-    "Tick 2026-08-06T12:00:00.000Z: re-read /data/fleet/worktrees/ORCHESTRATOR.md from disk, then run your standing loop from it.",
+  expect(defaultTickMessage(at, "/data/fleet/worktrees/ORCHESTRATOR.md", "/data/fleet/worktrees/POLICY.md")).toBe(
+    "Tick 2026-08-06T12:00:00.000Z: re-read /data/fleet/worktrees/ORCHESTRATOR.md (composed package floor + policy) and /data/fleet/worktrees/POLICY.md (editable fleet policy) from disk, then run your standing loop from them. Learning-loop amendments edit only /data/fleet/worktrees/POLICY.md — never the package floor.",
   );
 });
 

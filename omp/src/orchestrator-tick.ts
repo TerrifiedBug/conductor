@@ -1,7 +1,7 @@
 /**
  * Self-tick for the fleet orchestrator session.
  *
- * The orchestrator is a 24/7 omp session with a standing brief (ORCHESTRATOR.md)
+ * The orchestrator is a 24/7 omp session with a standing brief (composed ORCHESTRATOR.md + POLICY.md)
  * and no user typing into it. A session that is never prompted never runs its
  * loop, so this extension is the heartbeat: every `intervalSeconds` it injects
  * one message that starts a turn.
@@ -44,6 +44,11 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { findProject, loadConfig } from "./config.ts";
+import {
+  briefPathForProject,
+  policyPathForProject,
+  refreshComposedBriefForProject,
+} from "./setup.ts";
 import { DEFAULT_REPORT_SCOPE, type ReportScope } from "./types.ts";
 
 /** The activation file. Absent means "this is not an orchestrator session". */
@@ -237,8 +242,16 @@ export type TickConfigResult =
  * A second spelling of it here would contradict the first inside one prompt the
  * moment a fleet chose `escalations`.
  */
-export function defaultTickMessage(now: Date, briefPath = "ORCHESTRATOR.md"): string {
-  return `Tick ${now.toISOString()}: re-read ${briefPath} from disk, then run your standing loop from it.`;
+export function defaultTickMessage(
+  now: Date,
+  briefPath = "ORCHESTRATOR.md",
+  policyPath = "POLICY.md",
+): string {
+  return (
+    `Tick ${now.toISOString()}: re-read ${briefPath} (composed package floor + policy) and ` +
+    `${policyPath} (editable fleet policy) from disk, then run your standing loop from them. ` +
+    `Learning-loop amendments edit only ${policyPath} — never the package floor.`
+  );
 }
 
 /**
@@ -296,15 +309,40 @@ export const TICK_DELIVERY_RULE =
  * `status`. Stopping the heartbeat over either preference would be the worse
  * trade.
  */
-export function resolveTickScope(): { scope: ReportScope; briefPath?: string; fallback?: string } {
+export function resolveTickScope(): {
+  scope: ReportScope;
+  briefPath?: string;
+  policyPath?: string;
+  projectName?: string;
+  fallback?: string;
+} {
   try {
     const project = findProject(loadConfig());
     return {
       scope: project.reporting?.scope ?? DEFAULT_REPORT_SCOPE,
-      briefPath: join(project.workspaceRoot, "ORCHESTRATOR.md"),
+      briefPath: briefPathForProject(project),
+      policyPath: policyPathForProject(project),
+      projectName: project.name,
     };
   } catch (err) {
     return { scope: DEFAULT_REPORT_SCOPE, fallback: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Best-effort recompose of `ORCHESTRATOR.md` from the installed package floor +
+ * live `POLICY.md`.
+ *
+ * Runs on **every** successful send — including ticks that use a custom
+ * `message` — so protocol updates land after `npm install` without waiting for
+ * the default prompt path. Failures (no config, no `POLICY.md`, unreadable
+ * overlay) are silent: the tick still goes out.
+ */
+export function refreshComposedBriefBestEffort(): boolean {
+  try {
+    return refreshComposedBriefForProject(findProject(loadConfig()));
+  } catch {
+    return false;
   }
 }
 
@@ -903,6 +941,10 @@ function tick(pi: TickApi, ctx: TickContext, config: TickConfig, session: TickSe
     return;
   }
 
+  // Floor refresh is independent of which prompt we send: a custom message still
+  // expects ORCHESTRATOR.md / AGENTS.md to track the installed package.
+  refreshComposedBriefBestEffort();
+
   // A configured message owns the whole contract, reporting and delivery clauses
   // included: an operator who wrote their own prompt did not ask for ours
   // appended to it.
@@ -913,7 +955,7 @@ function tick(pi: TickApi, ctx: TickContext, config: TickConfig, session: TickSe
       session.scopeFallbackLogged = true;
       pi.logger.info(`[omp-conductor] tick reporting scope: using ${DEFAULT_REPORT_SCOPE} — ${scope.fallback}`);
     }
-    content = `${defaultTickMessage(new Date(), scope.briefPath)}\n${TICK_SCOPE_CONSTRAINTS[scope.scope]}\n${TICK_DELIVERY_RULE}`;
+    content = `${defaultTickMessage(new Date(), scope.briefPath, scope.policyPath)}\n${TICK_SCOPE_CONSTRAINTS[scope.scope]}\n${TICK_DELIVERY_RULE}`;
   }
 
   pi.sendMessage(
