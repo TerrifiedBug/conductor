@@ -6,7 +6,7 @@
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { configPath, findProject, loadConfig, resolveCaps, saveConfig, stateDir } from "./config.ts";
 import {
@@ -215,6 +215,46 @@ test("escalation.orchestrator defaults to embedded and rejects anything but the 
   expect(() => loadConfig()).toThrow(
     /escalation\.orchestrator must be "embedded" or "external", found "externl"/,
   );
+});
+
+test("a repo without graphProject keeps the key absent, so nothing renders a graph", () => {
+  const original = config(project("demo"));
+  saveConfig(original);
+
+  // Not `undefined`, not `""`: absent. The worker brief's graph paragraph is
+  // rendered from this key's presence, so a project that never answered the
+  // question must produce the brief this package shipped before graphs existed.
+  expect(loadConfig()).toEqual(original);
+  expect(Object.hasOwn(loadConfig().projects[0]?.routing.repos["api"] ?? {}, "graphProject")).toBe(false);
+});
+
+test("a configured graphProject survives a round-trip, with ~ expanded", () => {
+  const p = project("demo");
+  const api = p.routing.repos["api"];
+  if (api === undefined) throw new Error("fixture lost its repo");
+  api.graphProject = "~/.cache/conductor-graph/acme/api";
+  writeRawConfig({ version: CONFIG_VERSION, defaults: { ...DEFAULT_CAPS }, projects: [p] });
+
+  // Expanded on load for the same reason workspaceRoot is: a literal `~`
+  // directory is nobody's intent, and the path is handed to another process.
+  expect(loadConfig().projects[0]?.routing.repos["api"]?.graphProject).toBe(
+    join(homedir(), ".cache", "conductor-graph", "acme", "api"),
+  );
+});
+
+test("loadConfig refuses a relative graphProject instead of resolving it", () => {
+  const p = project("demo");
+  const api = p.routing.repos["api"];
+  if (api === undefined) throw new Error("fixture lost its repo");
+  api.graphProject = "../graph/api";
+  writeRawConfig({ version: CONFIG_VERSION, defaults: { ...DEFAULT_CAPS }, projects: [p] });
+
+  // This path is written by one process and read by another — a worker session
+  // whose cwd is its own throwaway worktree. A relative value would name a
+  // different directory for every reader and the indexed one for none of them,
+  // and the worker would find an empty graph and silently go back to grepping.
+  expect(() => loadConfig()).toThrow(/graphProject must be an absolute path/);
+  expect(() => loadConfig()).toThrow(/\.\.\/graph\/api/);
 });
 
 test("loadConfig reports a misshapen reporting block alongside every other fault", () => {

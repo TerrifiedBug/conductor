@@ -1,0 +1,403 @@
+/**
+ * Code-graph discovery: the indexes workers query instead of grepping, and the
+ * commands that create and refresh them.
+ *
+ * Why this exists at all, measured on the dogfood fleet rather than assumed:
+ * workers spend roughly four fifths of a 120-turn budget *finding* code — 30–62
+ * `read` calls and 32–69 `bash` calls against 9–24 edits per run, 215–390k
+ * characters of tool output. A code graph answers "who calls this" and "where is
+ * this defined" in one call, which is the difference between a run that lands
+ * and a run that dies mid-refactor with the work unfinished.
+ *
+ * Two hard boundaries hold everything here together:
+ *
+ * - **This package never runs an indexer, and never depends on one.** Nothing
+ *   below spawns the graph server, imports it, or checks for it; the daemon's
+ *   dispatch, caps and escalation paths do not mention it. `graph-setup` prints
+ *   commands, and with `--write` writes two systemd units — it does not even run
+ *   `systemctl`, because the wizard and the CLI are not root and a package that
+ *   silently writes root-level state is not one you can trust with a fleet.
+ * - **A worker never queries its own worktree.** An index is keyed by the
+ *   realpath of the directory it was built from, with no git-worktree awareness,
+ *   so a run's `worktrees/<issue>` path is always an empty project. Workers are
+ *   pointed at {@link RepoTarget.graphProject} — a conductor-owned clone nothing
+ *   human edits — and {@link graphHint} is the text that makes that unmissable.
+ */
+
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import { expandHome, stateDir } from "./config.ts";
+import type { ProjectConfig, RepoTarget } from "./types.ts";
+
+/**
+ * The indexer's own CLI, invoked by name rather than by path so the generated
+ * unit's explicit `PATH` is the single place a host's install location is
+ * spelled out. `cli <tool> <json>` runs one tool without an MCP session.
+ */
+const INDEXER = "codebase-memory-mcp";
+
+/** Both units and the script share this stem; `cbm` is the indexer's own prefix. */
+export const REINDEX_UNIT = "cbm-reindex";
+
+/** Where a system timer has to live to be enabled by `systemctl`. */
+export const SYSTEMD_UNIT_DIR = "/etc/systemd/system";
+
+/**
+ * Default parent of every index-only clone, under the cache directory because
+ * that is exactly what these are: derived data, disposable, re-creatable from a
+ * clone URL. Deliberately *not* `~/projects/<org>` — that is where a human's own
+ * checkouts live, and pointing a reindexer at one either destroys their
+ * uncommitted work or indexes whatever branch they left checked out.
+ *
+ * `trackerRepo` supplies the org so a fleet's clones land together, which is
+ * also the answer for the common case where the tracker and the code share one
+ * GitHub organisation.
+ */
+export function defaultGraphRoot(trackerRepo: string): string {
+  const org = trackerRepo.split("/")[0] ?? trackerRepo;
+  return join(homedir(), ".cache", "conductor-graph", org);
+}
+
+/** One repo's clone under a chosen root. `~` is expanded here so a path an
+ *  operator typed matches the absolute path the validator accepts. */
+export function graphProjectPath(root: string, repoName: string): string {
+  return join(expandHome(root.trim()), repoName);
+}
+
+/** A repo that has a graph, narrowed so callers need no further guard. */
+export type GraphRepo = RepoTarget & { graphProject: string };
+
+/** The project's repos that have a graph configured, in config order. */
+export function graphRepos(p: ProjectConfig): GraphRepo[] {
+  return Object.values(p.routing.repos).filter((r): r is GraphRepo => r.graphProject !== undefined);
+}
+
+/**
+ * The paragraph a worker's brief carries about its repo's graph, or `""` when
+ * the repo has none — in which case the rendered brief is byte-for-byte the one
+ * this package shipped before graphs existed.
+ *
+ * The leading newline and the three-space indent are load-bearing: the
+ * placeholder sits immediately before the next numbered item in
+ * `briefs/worker.md`, so an empty value leaves no blank line behind and a
+ * non-empty one reads as a continuation of the item above it.
+ *
+ * Every sentence here is defending against one specific failure. A worker that
+ * passes its own cwd gets an empty answer and concludes there is no graph. A
+ * worker that trusts the graph as current edits against a snapshot that predates
+ * its own branch. Both end the same way — a confident diff in the wrong place —
+ * so the wording says the quiet part out loud rather than describing the tool.
+ */
+export function graphHint(repo: RepoTarget): string {
+  const path = repo.graphProject;
+  if (path === undefined) return "";
+
+  return (
+    "\n" +
+    "   **This repo has a code graph, and it was not built from your worktree.**\n" +
+    "   Call `list_projects` first, find the single entry whose `root_path` is\n" +
+    "   exactly\n" +
+    `   \`${path}\`\n` +
+    "   and pass that entry's `name` as the `project` argument to every graph\n" +
+    "   tool. Never pass a path, and never pass your own cwd: that clone is what\n" +
+    "   was indexed, your worktree has no index and never will, so a cwd-based\n" +
+    "   lookup answers nothing and you lose the run to grep.\n" +
+    "\n" +
+    "   Read what it tells you as a snapshot of that clone's default branch at\n" +
+    "   the last reindex: it does not contain your edits, and it can be hours\n" +
+    "   behind the branch you are on. So orient with the graph, then read the\n" +
+    "   real file in your worktree before you change it. If those tools are not\n" +
+    "   mounted in this session, say so in your report and fall back to grep.\n"
+  );
+}
+
+/** Where the generated refresh script lands: conductor state, not a unit
+ *  directory, because it is ours to regenerate and needs no root to write. */
+export function reindexScriptPath(): string {
+  return join(stateDir(), `${REINDEX_UNIT}.sh`);
+}
+
+/** Both unit files, from the one stem `systemctl enable` will be given. */
+export function unitPaths(unitDir = SYSTEMD_UNIT_DIR): { service: string; timer: string } {
+  return {
+    service: join(unitDir, `${REINDEX_UNIT}.service`),
+    timer: join(unitDir, `${REINDEX_UNIT}.timer`),
+  };
+}
+
+/**
+ * `git clone` for one repo's index-only clone.
+ *
+ * `--single-branch` so the working tree can only ever hold the branch the graph
+ * claims to describe, and the destination is quoted because the root is
+ * operator-typed and a space in it would otherwise clone into two directories.
+ */
+export function cloneCommand(r: GraphRepo): string {
+  return `git clone --single-branch --branch ${r.defaultBranch} ${r.cloneUrl} "${r.graphProject}"`;
+}
+
+/** The one-shot index command, as a human would run it to seed a clone. */
+export function indexCommand(r: GraphRepo): string {
+  return `${INDEXER} cli index_repository '{"repo_path": "${r.graphProject}"}'`;
+}
+
+/**
+ * The refresh-and-reindex script both the timer and a human run.
+ *
+ * It fails loudly on purpose, and that is the one thing about it worth
+ * protecting. A first draft of this — hand-written on the live host — used
+ * `git fetch … || true; git pull --ff-only || true`, which meant a fetch that
+ * failed for a week still indexed the stale tree and still exited 0: a green
+ * timer serving a month-old graph, and workers orienting against code that no
+ * longer exists. So: `set -euo pipefail`, no swallowed failures anywhere, and
+ * the first broken repo takes the whole run non-zero where `systemctl status`
+ * and `systemctl is-failed` will report it.
+ *
+ * `git reset --hard origin/<defaultBranch>` rather than a merge or a pull is
+ * safe *because* of what these clones are — conductor's own, never edited by a
+ * human — and it is the only refresh with no failure mode of its own: no
+ * conflict, no divergence, no detached state to recover from. Each repo's own
+ * configured branch is used, because a fleet with a `master` repo in it would
+ * otherwise silently index nothing.
+ */
+export function reindexScript(p: ProjectConfig): string {
+  const lines = [
+    "#!/usr/bin/env bash",
+    `# Refresh and reindex the code graphs for omp-conductor project "${p.name}".`,
+    "#",
+    "# Generated by \`omp-conductor graph-setup\`. Regenerate it rather than editing:",
+    "# the repo list, branches and paths all come from that project's config.json.",
+    "#",
+    "# Every clone below is conductor's own, index-only and never edited by a human,",
+    "# which is what makes the hard reset safe. Do not point one at a checkout you",
+    "# work in: the reset would destroy uncommitted work.",
+    "#",
+    "# Fails loud and stops at the first problem, deliberately. A refresh that",
+    "# swallowed its errors would index a stale tree and still exit 0 — a green",
+    "# timer serving a month-old graph is worse than no graph at all.",
+    "set -euo pipefail",
+    "",
+  ];
+
+  for (const r of graphRepos(p)) {
+    lines.push(
+      `# ${r.name} — ${r.cloneUrl} @ ${r.defaultBranch}`,
+      `cd "${r.graphProject}"`,
+      "git fetch --prune origin",
+      `git reset --hard origin/${r.defaultBranch}`,
+      indexCommand(r),
+      "",
+    );
+  }
+
+  return lines.join("\n");
+}
+
+/**
+ * The service half. `Type=oneshot` with no `[Install]` section: it is started by
+ * its timer, and a service enabled on its own would run once at boot and never
+ * again, which looks exactly like a working install.
+ */
+export function reindexService(p: ProjectConfig, scriptPath = reindexScriptPath()): string {
+  const home = homedir();
+  return [
+    "[Unit]",
+    `Description=Reindex the code graphs omp-conductor project "${p.name}" hands its workers`,
+    "After=network-online.target",
+    "Wants=network-online.target",
+    "",
+    "[Service]",
+    "Type=oneshot",
+    `ExecStart=/bin/bash ${scriptPath}`,
+    "# Both of these are spelled out because systemd supplies neither usefully.",
+    `# The indexer resolves its store from HOME (${join(home, ".cache", "codebase-memory-mcp")}),`,
+    "# so an unset HOME would build a second index nobody queries; and systemd's",
+    "# default PATH has no ~/.local/bin, while the indexer itself shells out to git.",
+    `Environment=HOME=${home}`,
+    `Environment=PATH=${["/.local/bin", "/.bun/bin"].map((d) => join(home, d)).join(":")}` +
+      ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "# Indexing is CPU- and IO-heavy, and this host is also running the fleet whose",
+    "# workers read the result.",
+    "Nice=10",
+    "IOSchedulingClass=idle",
+    "# A wedged index must fail rather than hold its timer open indefinitely.",
+    "TimeoutStartSec=1h",
+    "",
+  ].join("\n");
+}
+
+/**
+ * The timer half — and the reason there is a timer at all.
+ *
+ * The graph server's own auto-watch lives inside a connected MCP session and
+ * dies with it, and v0.9.0 ships no daemon. An ephemeral worker session
+ * therefore keeps nothing fresh: whatever it mounts, it un-mounts minutes later.
+ * So the refresh has to come from outside the fleet entirely, on a schedule
+ * nothing in a run can influence.
+ */
+export function reindexTimer(p: ProjectConfig): string {
+  return [
+    "[Unit]",
+    `Description=Nightly code-graph reindex for omp-conductor project "${p.name}"`,
+    "",
+    "[Timer]",
+    "# Nightly, at an hour a shared host is quiet. The graph is orientation-grade —",
+    "# the worker brief tells every session to verify against the real file before",
+    "# editing — so a same-day snapshot is worth far more than a constant reindex.",
+    "# Add another OnCalendar= line for a midday refresh if your repos move fast.",
+    "OnCalendar=*-*-* 03:30:00",
+    "# Persistent catches a host that was down at 03:30; the jitter keeps every",
+    "# install of this unit off the same second.",
+    "Persistent=true",
+    "RandomizedDelaySec=15m",
+    `Unit=${REINDEX_UNIT}.service`,
+    "",
+    "[Install]",
+    "WantedBy=timers.target",
+    "",
+  ].join("\n");
+}
+
+/** The exact line an operator runs after the units exist. Never run by this
+ *  package: it needs root, and root-level side effects are the operator's. */
+export function enableCommand(): string {
+  return `systemctl daemon-reload && systemctl enable --now ${REINDEX_UNIT}.timer`;
+}
+
+function block(title: string, body: string): string[] {
+  return [`--- ${title} ---`, "", body.trimEnd(), ""];
+}
+
+/**
+ * The whole plan as text, with nothing done. This is the default mode of
+ * `graph-setup`, and it is a plan an operator can read, paste, or ignore —
+ * including on a host where they are not root and `--write` would fail.
+ */
+export function formatGraphSetup(p: ProjectConfig, unitDir = SYSTEMD_UNIT_DIR): string {
+  const repos = graphRepos(p);
+  const missing = repos.filter((r) => !existsSync(r.graphProject));
+  // Seeded with 0 so these are still widths when the caller ignored the exit-1
+  // guard and asked for a plan for a project with no graph at all.
+  const nameWidth = Math.max(0, ...repos.map((r) => r.name.length));
+  const pathWidth = Math.max(0, ...repos.map((r) => r.graphProject.length));
+
+  const lines = [
+    `code-graph discovery for project "${p.name}"`,
+    "",
+    "Workers spend most of a run finding code rather than changing it. These",
+    'indexes answer "who calls this" and "where is this defined" in one call, so',
+    "the turns go into the work instead. Nothing below has been run.",
+    "",
+    `repos with a graph configured (${repos.length}):`,
+  ];
+  for (const r of repos) {
+    // Padded so the (missing) markers line up: which clones do not exist yet is
+    // the one thing an operator scans this list for.
+    const marker = missing.includes(r) ? "  (missing)" : "";
+    lines.push(`  ${r.name.padEnd(nameWidth)}  ${r.graphProject.padEnd(marker === "" ? 0 : pathWidth)}${marker}`);
+  }
+
+  lines.push("", "1. create the clones that are missing", "");
+  if (missing.length === 0) {
+    lines.push("   every clone above already exists — nothing to create.");
+  } else {
+    lines.push(
+      "   These are conductor's, not yours. Nothing human edits them, which is what",
+      "   makes step 3's hard reset both safe and deterministic — so never point a",
+      "   graphProject at a checkout you work in.",
+      "",
+    );
+    for (const r of missing) lines.push(`   ${cloneCommand(r)}`);
+  }
+
+  lines.push(
+    "",
+    "2. index each one once now, so the first worker does not wait for the timer",
+    "",
+  );
+  for (const r of repos) lines.push(`   ${indexCommand(r)}`);
+  lines.push(
+    "",
+    "   Then check what a worker will see. Each root_path below must match a path",
+    "   above exactly, and the name beside it is what a worker passes as `project`:",
+    "",
+    `   ${INDEXER} cli list_projects`,
+    "",
+    "3. keep them current",
+    "",
+  );
+
+  const script = reindexScriptPath();
+  const { service, timer } = unitPaths(unitDir);
+  lines.push(
+    `   \`graph-setup --write\` writes these three files for you (${script},`,
+    `   and the two units in ${unitDir}); it never runs systemctl.`,
+    "",
+    ...block(script, reindexScript(p)),
+    ...block(service, reindexService(p, script)),
+    ...block(timer, reindexTimer(p)),
+    "   then, as root:",
+    "",
+    `   ${enableCommand()}`,
+    "",
+    `   HOME and PATH in the service are this command's own user (${homedir()}), and`,
+    "   the unit sets no User= so it runs as root. If those are different accounts,",
+    "   fix both Environment= lines before enabling.",
+  );
+
+  return lines.join("\n");
+}
+
+/** What `graph-setup --write` did, and the root-only steps it deliberately left. */
+export interface GraphSetupWrite {
+  written: string[];
+  next: string;
+}
+
+/**
+ * Writes the script and both units, and returns what to do next.
+ *
+ * Deliberately stops there. Running `systemctl` would need root the wizard and
+ * the CLI may not have, and a package that enables system timers behind an
+ * operator's back is one you cannot audit by reading its output.
+ */
+export function writeGraphSetup(p: ProjectConfig, unitDir = SYSTEMD_UNIT_DIR): GraphSetupWrite {
+  const script = reindexScriptPath();
+  const { service, timer } = unitPaths(unitDir);
+
+  mkdirSync(dirname(script), { recursive: true });
+  writeFileSync(script, reindexScript(p));
+  // Executable so an operator can run the refresh by hand before trusting a
+  // timer with it; the unit calls bash explicitly either way.
+  chmodSync(script, 0o755);
+  // The unit directory is never created: a host without `/etc/systemd/system`
+  // has no systemd, and a package that answers that by making the directory has
+  // written two files nothing will ever read.
+  writeFileSync(service, reindexService(p, script));
+  writeFileSync(timer, reindexTimer(p));
+
+  const missing = graphRepos(p).filter((r) => !existsSync(r.graphProject));
+  const next = [
+    "nothing has been enabled or started — this command never runs systemctl.",
+    "",
+    "next, as root:",
+    "",
+    `  ${enableCommand()}`,
+    "",
+    "then watch one real run before trusting the schedule (it takes minutes per repo):",
+    "",
+    `  systemctl start ${REINDEX_UNIT}.service && systemctl status ${REINDEX_UNIT}.service`,
+    ...(missing.length === 0
+      ? []
+      : [
+          "",
+          `first, though: ${missing.length} clone(s) do not exist yet, and the script fails`,
+          "loudly rather than skipping them —",
+          "",
+          ...missing.map((r) => `  ${cloneCommand(r)}`),
+        ]),
+  ].join("\n");
+
+  return { written: [script, service, timer], next };
+}

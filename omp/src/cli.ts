@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { checkBrief, formatBriefStatus, writeMergedBrief } from "./brief-upgrade.ts";
 import { findProject, loadConfig, resolveCaps, stateDir } from "./config.ts";
 import { dbPath, formatStatus, runDaemon, setPaused, statusSnapshot } from "./daemon.ts";
+import { formatGraphSetup, graphRepos, writeGraphSetup, type GraphSetupWrite } from "./graph.ts";
 import {
   clearRecord,
   DEFAULT_PORT,
@@ -38,6 +39,7 @@ usage:
   omp-conductor daemon [--once] [--port N] [--project NAME]
   omp-conductor pause
   omp-conductor resume
+  omp-conductor graph-setup [--project NAME] [--write]
   omp-conductor brief-upgrade [--apply] [--file PATH] [--project NAME]
   omp-conductor help
 
@@ -63,6 +65,13 @@ usage:
            and exits. This is what \`start\` launches.
   pause    stop claiming new work. The running daemon notices on its next tick.
   resume   allow claiming again.
+  graph-setup
+           print how to set up the code-graph indexes workers query instead of
+           grepping: the clone commands for any missing index-only clone, the
+           index command per repo, and a systemd service+timer that keeps them
+           current. --write writes the two units and the script they run, and
+           prints the systemctl line to run — it never runs systemctl itself.
+           Exits 1 when no repo in the project has graphProject configured.
   brief-upgrade
            compare a project's ORCHESTRATOR.md against the brief this version of
            the package ships. Reports by default; --apply replaces the half above
@@ -450,6 +459,42 @@ try {
       setPaused(false);
       process.stdout.write("resumed — work will be claimed on the next tick\n");
       break;
+
+    case "graph-setup": {
+      const project = findProject(loadConfig(), flag(argv, "project"));
+      if (graphRepos(project).length === 0) {
+        // Not a warning: with nothing configured there is nothing to print, and
+        // the fix is a wizard answer rather than a flag on this command.
+        process.stderr.write(
+          `omp-conductor: no repo in project "${project.name}" has graphProject set — re-run\n` +
+            "/conductor setup and say yes to code-graph discovery.\n",
+        );
+        process.exit(1);
+      }
+
+      if (!argv.includes("--write")) {
+        process.stdout.write(`${formatGraphSetup(project)}\n`);
+        break;
+      }
+
+      let result: GraphSetupWrite;
+      try {
+        result = writeGraphSetup(project);
+      } catch (err) {
+        // Overwhelmingly likely EACCES on /etc/systemd/system, occasionally a
+        // host with no systemd at all. "Permission denied" on its own tells an
+        // operator neither that this one command is the part that needs root,
+        // nor that the printed plan is a complete substitute for it.
+        process.stderr.write(
+          `omp-conductor: could not write the units (${err instanceof Error ? err.message : String(err)}).\n` +
+            "System units live under /etc/systemd/system, so this needs root on a systemd host:\n" +
+            "re-run with sudo, or drop --write and copy the printed text yourself.\n",
+        );
+        process.exit(1);
+      }
+      process.stdout.write(`wrote:\n${result.written.map((f) => `  ${f}`).join("\n")}\n\n${result.next}\n`);
+      break;
+    }
 
     case "brief-upgrade": {
       // `--file` exists because a real fleet's brief is often not where the wizard

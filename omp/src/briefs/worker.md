@@ -39,16 +39,27 @@ files are canonical; your priors are not.
    mid-refactor loses the run. If code-graph MCP tools are mounted (a
    `codebase-memory` server or similar), start there: list its indexed projects,
    and query by **project name** — your worktree is a throwaway path the index
-   has never seen, so a cwd-based lookup finds nothing while the canonical
-   checkout's index has the whole call graph. Fall back to grep where the graph
+   has never seen, so a cwd-based lookup finds nothing while the clone that was
+   actually indexed has the whole call graph. Fall back to grep where the graph
    is silent. Either way, trace the real flow end to end — every file the change
    touches — and check the callers of any function you are about to change; the
    smallest diff in the wrong place is a second bug.
-2. **Follow existing patterns.** A second convention beside an existing one is a
+{{GRAPH_HINT}}2. **One read per file, not one per question.** A turn that reads forty lines
+   costs exactly what a turn that rewrites a module costs, and you have a fixed
+   number of them. So take every range you already know you want in a single
+   call — `read path.py:1-40,120-160,300-340` — rather than returning to the
+   same file three times as each question occurs to you. When you do not yet
+   know the ranges, read the file once and keep what you learned instead of
+   re-reading a neighbouring slice later. Measured on this fleet: one run spent
+   58 reads, of which 20 were consecutive reads of the *same* file and 28 were
+   return visits to a file it had already opened — roughly a sixth of its whole
+   budget, on a run that then died with the work unfinished. The same applies to
+   `grep`: one pattern that answers the question beats three that narrow it.
+3. **Follow existing patterns.** A second convention beside an existing one is a
    defect. Reuse the helper that already exists rather than writing a sibling.
-3. **Keep the diff small.** Small PRs merge; large ones conflict. If the issue
+4. **Keep the diff small.** Small PRs merge; large ones conflict. If the issue
    genuinely cannot be done small, stop and escalate rather than ballooning.
-4. **Fix the root cause, never the symptom.** Do not suppress a warning, delete an
+5. **Fix the root cause, never the symptom.** Do not suppress a warning, delete an
    assertion, or special-case an input to make a check pass.
 
 ## Tests — read this carefully

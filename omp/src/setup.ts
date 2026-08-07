@@ -24,6 +24,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { configPath, resolveCaps, stateDir } from "./config.ts";
+import { graphProjectPath, graphRepos } from "./graph.ts";
 import {
   CONFIG_VERSION,
   DEFAULT_AUTHORITY,
@@ -83,6 +84,17 @@ export interface SetupAnswers {
    * that session to drain, rather than starting a second brain.
    */
   orchestratorMode: OrchestratorMode;
+  /**
+   * Parent directory of the index-only clones workers query, or absent when the
+   * operator declined code-graph discovery — in which case no repo gets a
+   * `graphProject` and every rendered brief is the one this package shipped
+   * before graphs existed.
+   *
+   * One answer for the whole project rather than one per repo: the clones are
+   * derived data with no reason to live apart, and a per-repo prompt would ask
+   * the same question four times to arrive at four siblings.
+   */
+  graphRoot?: string;
 }
 
 /** What `gh auth status` says the active token may do. */
@@ -398,12 +410,19 @@ function buildProject(a: SetupAnswers): ProjectConfig {
   const dir = stateDir();
 
   const repos: Record<string, RepoTarget> = {};
+  const graphRoot = a.graphRoot?.trim();
   for (const r of a.targetRepos) {
     repos[r.name] = {
       name: r.name,
       cloneUrl: r.cloneUrl,
       defaultBranch: r.defaultBranch,
       gates: r.gates.map((g) => ({ cmd: g.cmd, cwd: g.cwd })),
+      // One answered root becomes one clone per routed repo. Omitted entirely
+      // when unanswered rather than written empty: the key's absence is what
+      // makes an existing config's briefs render exactly as they did before.
+      ...(graphRoot === undefined || graphRoot.length === 0
+        ? {}
+        : { graphProject: graphProjectPath(graphRoot, r.name) }),
     };
   }
 
@@ -692,6 +711,19 @@ export function summarisePlan(
     if (r.gates.length === 0) {
       lines.push("                   gate: none — nothing is verified before a push");
     }
+  }
+
+  // Absent entirely when unanswered: a plan for a project with no graph must
+  // read exactly as it did before graphs were a thing this wizard could offer.
+  const graphed = graphRepos(project);
+  if (graphed.length > 0) {
+    lines.push("", "code graph     workers query these clones instead of grepping:");
+    for (const r of graphed) lines.push(`                 ${r.name}  ${r.graphProject}`);
+    lines.push(
+      "               conductor's own index-only clones — nothing human edits them, and",
+      "               nothing here creates them. Run `omp-conductor graph-setup` after",
+      "               setup: it prints the clone, index and systemd-timer commands.",
+    );
   }
 
   lines.push("", "caps (effective)");

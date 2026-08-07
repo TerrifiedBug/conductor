@@ -12,6 +12,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync
 import { dirname, join, relative } from "node:path";
 import { configPath, findProject, loadConfig, resolveCaps, stateDir } from "./config.ts";
 import { createEscalator } from "./escalate.ts";
+import { graphHint } from "./graph.ts";
 import { livingDaemon } from "./lifecycle.ts";
 import { STALL_MARKER_FILE } from "./orchestrator-tick.ts";
 import { startOrchestrator } from "./orchestrator.ts";
@@ -429,7 +430,16 @@ function endedBy(killedBy: KilledBy | undefined): string {
   return "a failed run";
 }
 
-async function buildBrief(
+/**
+ * The worker's opening prompt.
+ *
+ * Exported for the same reason `salvageLines` is: this text is the entire
+ * context a session with the host's credentials gets, so the two things a test
+ * can hold it to are worth holding — that a configured graph reaches the worker,
+ * and that a project without one gets the brief this package has always shipped,
+ * to the byte.
+ */
+export async function buildBrief(
   project: ProjectConfig,
   r: Routed,
   branch: string,
@@ -447,6 +457,10 @@ async function buildBrief(
     WORKTREE: worktree,
     ACCEPTANCE_CRITERIA: acceptanceCriteria(r.issue),
     GATES: gatesBlock(r.repo),
+    // Empty for a repo with no `graphProject`, and empty means *nothing*: the
+    // placeholder sits flush against the next list item in the template, so an
+    // unconfigured render leaves no blank line where a hint would have gone.
+    GRAPH_HINT: graphHint(r.repo),
   });
 }
 

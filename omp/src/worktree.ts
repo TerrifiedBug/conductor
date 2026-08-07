@@ -300,6 +300,28 @@ const SALVAGE_COMMIT_CONFIG = [
 ];
 
 /**
+ * Shapes a worker creates for itself and no one else ever wants committed: a
+ * local env helper, a scratch directory, a debug dump, an editor's droppings.
+ *
+ * Excluded from salvage rather than left to each repo's `.gitignore`, because
+ * salvage runs against whatever repo the fleet was pointed at and cannot assume
+ * the operator has anticipated this. A repo that *does* ignore them loses
+ * nothing here — the patterns simply never match.
+ *
+ * Deliberately narrow. Anything ambiguous belongs in the commit, because the
+ * cost of over-keeping is a reviewer deleting a file, and the cost of
+ * over-skipping is the destroyed work this whole mechanism exists to prevent.
+ */
+const SALVAGE_EXCLUDES = [
+  ":(exclude).scratch*",
+  ":(exclude)**/.scratch*",
+  ":(exclude).env.local",
+  ":(exclude)**/.env.local",
+  ":(exclude)*.local.sh",
+  ":(exclude)**/*.local.sh",
+];
+
+/**
  * Commits a dead run's uncommitted work to the run's own branch and pushes it,
  * so that the tree the next attempt destroys is no longer the only copy.
  *
@@ -343,7 +365,22 @@ export async function salvageWip(
     const branch = await git(["rev-parse", "--abbrev-ref", "HEAD"], worktree);
 
     // `-A` on purpose: the losses this exists for were mostly *new* files.
-    await git(["add", "-A"], worktree);
+    // Everything except the shapes below, which are a worker's own scaffolding
+    // — a local env helper, a scratch dir, a debug dump. They are worthless to
+    // the next attempt and actively harmful in a pushed commit: on 2026-08-07 a
+    // salvage swept up a `.scratch82/env.sh` of loopback dev defaults, which
+    // read enough like a leaked secret that the orchestrator broke its own
+    // "never touch a worker's branch" boundary trying to scrub it. Excluding
+    // them is cheaper than every future reader having to judge them.
+    await git(["add", "-A", "--", ".", ...SALVAGE_EXCLUDES], worktree);
+
+    // The dirty check above ran before the excludes, so a tree whose only
+    // changes were scratch had work by that test and has none by this one.
+    // Without this, `commit` exits non-zero on an empty index and a tree
+    // holding nothing worth keeping gets reported as a salvage *failure*.
+    if ((await git(["diff", "--cached", "--name-only"], worktree)) === "") {
+      return { kind: "nothing" };
+    }
     await git(
       [
         ...SALVAGE_COMMIT_CONFIG,

@@ -524,6 +524,70 @@ honour the pattern it says so, and the daemon logs that per run:
 Worth reading the log for. A run that quietly used a weaker model than you chose
 otherwise looks like a run that was merely unlucky.
 
+## Code-graph discovery
+
+Optional, off unless you answer yes in the wizard, and worth answering yes to for
+one measured reason: **workers spend most of a run finding code, not changing it.**
+On the dogfood fleet a single run typically spends 30–62 `read` calls and 32–69
+`bash` calls against 9–24 edits — 215–390k characters of tool output, roughly four
+fifths of a 120-turn budget — and the runs that died at the turns cap died with
+the work unfinished. A code graph answers "who calls this" and "where is this
+defined" in one call instead of twenty greps.
+
+Say yes and the wizard asks for one root, then derives one clone per routed repo
+underneath it (default `~/.cache/conductor-graph/<org>/<repo>`) and writes it to
+each repo's [`graphProject`](#configuration). Nothing else changes: this package
+never runs an indexer, never imports one, and behaves identically with the graph
+server absent — dispatch, caps and escalation do not know it exists.
+
+### Why the clone, and not your checkout or the worktree
+
+This is the part that decides whether the feature helps or hurts, so it is worth
+being blunt about all three candidates.
+
+| Directory | Why not |
+| --- | --- |
+| **The worker's worktree** | An index is keyed by the realpath of the directory it was built from, and has no git-worktree awareness. A run's `worktrees/<issue>` path is therefore *always* an empty project — a worker that queried its own cwd would get silence, conclude there is no graph, and spend the run grepping. This is why `graphProject` is an absolute path in the config and not something derived at run time. |
+| **Your own checkout** | Refreshing an index means resetting the clone to its default branch. In a directory you work in, that either destroys uncommitted work or — if it is made safe instead — indexes whatever feature branch you left checked out, so the fleet orients against your WIP. |
+| **A conductor mirror** | The daemon's mirrors are bare. There is no working tree to index. |
+
+So `graphProject` names a fourth thing: a clone that exists only to be indexed,
+that nothing human ever edits, and that is therefore safe to `git reset --hard`
+every night. The worker brief names that path, tells the session to match it
+against `list_projects`' `root_path` and query by the `name` beside it, and says
+plainly that the graph is a snapshot which does **not** contain the worker's own
+edits — orient with it, then read the real file before changing it.
+
+### Creating and refreshing them
+
+```bash
+omp-conductor graph-setup            # print the plan: clones, index commands, units
+sudo omp-conductor graph-setup --write   # write the script and the two units
+```
+
+`graph-setup` prints a `git clone` for every clone that does not exist yet, the
+one-shot index command per repo, and a `cbm-reindex.service` + `cbm-reindex.timer`
+pair built from the project's own repos and branches. `--write` writes them and
+then prints the `systemctl` line for you to run — it never runs `systemctl`, never
+enables anything, and is the only part of this package that wants root.
+
+Two properties of the generated unit are deliberate:
+
+- **It is a timer, not the server's own watcher.** That watcher lives inside a
+  connected MCP session and dies with it, so an ephemeral worker session keeps
+  nothing fresh. The refresh has to come from outside the fleet.
+- **It fails loudly.** The refresh is `set -euo pipefail`, then per repo
+  `git fetch --prune origin` and `git reset --hard origin/<its own defaultBranch>`
+  before indexing. Nothing is `|| true`-ed, so a fetch that has been broken for a
+  week turns the unit red instead of quietly re-indexing a stale tree and exiting
+  `0` — a green timer serving a month-old graph is worse than no graph at all.
+
+The unit spells out `HOME` and an explicit `PATH`, because systemd supplies
+neither usefully: the indexer resolves its store from `HOME`, systemd's default
+`PATH` has no `~/.local/bin`, and the indexer shells out to `git`. Both are the
+user that ran `graph-setup`; the unit sets no `User=`, so check them if that is
+not the account the timer runs as.
+
 ## Escalation tiers
 
 | Tier | Meaning | Raised by | Delivered to |
@@ -638,7 +702,8 @@ A complete, valid config for one project with two target repos:
             "gates": [
               { "cmd": "bun run lint", "cwd": "." },
               { "cmd": "bun test", "cwd": "." }
-            ]
+            ],
+            "graphProject": "~/.cache/conductor-graph/acme/api"
           },
           "worker": {
             "name": "worker",
@@ -687,6 +752,7 @@ Field notes:
 | `routing.labelPrefix` | Optional; defaults to `repo:`. |
 | `routing.repos` | At least one entry, or nothing can be routed. `name` defaults to the map key, `defaultBranch` to `main`. |
 | `gates` | The exact cheap commands CI also runs, each with the `cwd` it runs from (`cwd` defaults to `.`). Running the real gate locally is what makes an unattended push safe — a subset lets an error outside the source dir reach the runners. |
+| `graphProject` | Optional, per repo. Absolute path of the **index-only clone** whose code graph this repo's workers query — conductor's own disposable clone, pinned to the repo's default branch, never a checkout you work in and never a worker's worktree. Written by the wizard; `~` is expanded, and a relative path is an error rather than something resolved against whichever cwd happened to read the file. Absent means this repo has no graph and its briefs say nothing about one. See [Code-graph discovery](#code-graph-discovery). |
 | `caps` | Per-project overrides; omit it or pin only the fields you want to change. |
 | `escalation.fallbackToIssueComment` | Defaults to `true`. Absent means "yes, still tell me". |
 | `escalation.orchestrator` | Optional; `"embedded"` (default) or `"external"`. `external` means an orchestrator session already runs elsewhere: the daemon starts none, and tier-1 escalations post as issue comments for that session to drain. Any other value is an error. |
@@ -863,6 +929,7 @@ omp-conductor unblock <issue> [--project NAME]
 omp-conductor daemon [--once] [--port N] [--project NAME]
 omp-conductor pause
 omp-conductor resume
+omp-conductor graph-setup [--project NAME] [--write]
 omp-conductor brief-upgrade [--apply] [--file PATH] [--project NAME]
 omp-conductor help
 ```
@@ -881,6 +948,8 @@ omp-conductor help
 | `--project NAME` | Pick the project to service. One daemon process serves exactly one project; with several configured projects the name is required. |
 | `pause` | Stop claiming new work. The running daemon notices on its next tick; runs already in flight finish. The orchestrator heartbeat keeps ticking — its gate is the arm marker, not this flag. |
 | `resume` | Allow claiming again. |
+| `graph-setup` | Print how to set up the code-graph indexes workers query instead of grepping: a `git clone` for every index-only clone that does not exist yet, the one-shot index command per repo, and a `cbm-reindex.service` + `cbm-reindex.timer` pair generated from the project's own repos and branches. Reads only, so it is safe on a host where you are not root. Exits `1` when no repo in the project has [`graphProject`](#configuration) set, because the fix is a wizard answer rather than a flag. See [Code-graph discovery](#code-graph-discovery). |
+| `--write` | Only for `graph-setup`. Writes the refresh script into the state directory and the two units into `/etc/systemd/system`, then prints the exact `systemctl daemon-reload && systemctl enable --now cbm-reindex.timer` to run. It never runs `systemctl` itself and never enables anything: that needs root, and a package that enables system timers behind your back is one you cannot audit by reading its output. |
 | `brief-upgrade` | Compare a project's `ORCHESTRATOR.md` against the brief this version of the package ships. Reports by default; see [Keeping a brief current](#keeping-a-brief-current). |
 | `--apply` | Only for `brief-upgrade`. Replaces the half above the `YOURS TO EDIT` banner and keeps everything below it, backing the previous file up first. Ignored when the brief cannot be split or the template is unrendered. |
 | `--file PATH` | Only for `brief-upgrade`. Check a brief that is not where the wizard would have put it, on a host that may have no config at all. |
@@ -921,6 +990,7 @@ dispatcher. The brief is explicit about the boundary:
 | It may | It must not |
 | --- | --- |
 | Read the issue and the repo's own guidance (`AGENTS.md`, `CLAUDE.md`, `CONTEXT.md`, relevant ADRs) before writing anything. | Touch any path outside its worktree, or switch branches. |
+| Query its repo's [code graph](#code-graph-discovery), when one is configured, by the project name whose `root_path` matches the clone its brief names. | Query that graph by its own cwd or worktree path — no index of a worktree exists — or treat what it returns as current. It is a snapshot of the clone's default branch; the real file in the worktree wins. |
 | Edit code inside its own worktree. | Weaken, skip, delete or loosen **any test it did not write** — that is a design question to escalate, and it is checked by diff review before the push. |
 | Add or update tests for behaviour it introduced. | Suppress a warning, delete an assertion, or special-case an input to make a check pass. |
 | Run the repo's configured cheap gates, each from its listed `cwd`, over the whole tree. | Run docker or image builds, production builds, browser/e2e suites, or the full test suite on the shared host — CI owns the heavy gates. |

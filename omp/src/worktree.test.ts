@@ -273,6 +273,54 @@ describe("salvageWip", () => {
   );
 
   it(
+    "keeps the work but leaves a worker's own scratch behind",
+    async () => {
+      const { mirrorRoot, workspaceRoot } = sandbox("salvage-scratch");
+      const branch = "conductor/issue-808";
+
+      const tree = await addWorktree(repo, mirrorRoot, workspaceRoot, 808, branch);
+      writeFileSync(join(tree, "detection_gates.py"), "# the actual work\n");
+      // The 2026-08-07 shape: a loopback env helper a worker wrote to run the
+      // test suite. Harmless, and still expensive — it read enough like a
+      // leaked secret to cost an orchestrator tick and a boundary violation.
+      mkdirSync(join(tree, ".scratch808"), { recursive: true });
+      writeFileSync(join(tree, ".scratch808/env.sh"), "export POSTGRES_PASSWORD=devpass\n");
+      writeFileSync(join(tree, ".env.local"), "DEBUG=true\n");
+
+      const outcome = await salvageWip(tree, 808, 1, "the turns cap");
+
+      expect(outcome).toMatchObject({ kind: "salvaged", pushed: true });
+      if (outcome.kind !== "salvaged") throw new Error("unreachable");
+      expect(git(["show", "--name-only", "--format=", outcome.sha], tree).split("\n")).toEqual([
+        "detection_gates.py",
+      ]);
+
+      // Left on disk, not deleted: skipping it is a judgement about what to
+      // publish, not licence to destroy something the worker may still want.
+      expect(existsSync(join(tree, ".scratch808/env.sh"))).toBe(true);
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "reports nothing, not a failure, when only scratch is dirty",
+    async () => {
+      const { mirrorRoot, workspaceRoot } = sandbox("salvage-only-scratch");
+
+      const tree = await addWorktree(repo, mirrorRoot, workspaceRoot, 909, "conductor/issue-909");
+      const before = git(["rev-parse", "HEAD"], tree);
+      writeFileSync(join(tree, ".env.local"), "DEBUG=true\n");
+
+      // The tree is dirty by `status`, empty by the index once excludes apply.
+      // Committing an empty index exits non-zero, so without the second check
+      // a tree holding nothing worth keeping escalates as a salvage failure.
+      expect(await salvageWip(tree, 909, 1, "the turns cap")).toEqual({ kind: "nothing" });
+      expect(git(["rev-parse", "HEAD"], tree)).toBe(before);
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
     "never throws, whatever state the tree is in",
     async () => {
       // A run that died before it had a checkout, and one whose tree a crash or

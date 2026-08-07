@@ -151,6 +151,37 @@ test("the chosen report scope reaches the config the daemon will load", () => {
   expect(loadConfig().projects[0]?.reporting).toEqual({ scope: "escalations" });
 });
 
+test("one answered graph root becomes one index-only clone per routed repo", () => {
+  const root = join(home, "graph", "acme");
+  saveConfig(
+    buildConfig(
+      answers({
+        graphRoot: root,
+        targetRepos: [
+          { name: "api", cloneUrl: "git@github.com:acme/api.git", defaultBranch: "main", gates: [] },
+          { name: "web", cloneUrl: "git@github.com:acme/web.git", defaultBranch: "trunk", gates: [] },
+        ],
+      }),
+    ),
+  );
+
+  // Siblings under one root, and absolute — the validator would reject anything
+  // else, because a worker reads these from inside its own worktree.
+  const repos = loadConfig().projects[0]?.routing.repos;
+  expect(repos?.["api"]?.graphProject).toBe(join(root, "api"));
+  expect(repos?.["web"]?.graphProject).toBe(join(root, "web"));
+});
+
+test("declining code-graph discovery writes no graph key at all", () => {
+  saveConfig(buildConfig(answers()));
+
+  // The invariant behind the whole feature being optional: with no answer, the
+  // config is what it was before graphs existed, so every brief this project
+  // ever renders is too.
+  const api = loadConfig().projects[0]?.routing.repos["api"];
+  expect(Object.hasOwn(api ?? {}, "graphProject")).toBe(false);
+});
+
 // --------------------------------------------------------- orchestrator brief
 
 test("the rendered brief carries this project's coordinates and nothing unfilled", () => {
@@ -400,6 +431,24 @@ test("the plan names who merges, who releases, and who triages — before anythi
   );
   expect(delegated).toContain("authority      merge=orchestrator  release=orchestrator");
   expect(delegated).toContain("triage         external");
+});
+
+test("the plan names every graph clone it would have workers query, or none at all", () => {
+  const scopes: ScopeCheck = { ok: true, login: "acme", scopes: ["repo", "project"], missing: [] };
+  const root = join(home, "graph", "acme");
+
+  const on = summarisePlan(answers({ graphRoot: root }), scopes, labelPlan(), NO_TELEGRAM);
+  expect(on).toContain("code graph");
+  expect(on).toContain(join(root, "api"));
+  // The indexes are not created by setup, and an operator who thinks otherwise
+  // arms a fleet whose workers query an empty graph on their first run.
+  expect(on).toContain("omp-conductor graph-setup");
+
+  // Declined: not a line, not a "none" row. The consent screen for a project
+  // with no graph reads exactly as it did before graphs were on offer.
+  const off = summarisePlan(answers(), scopes, labelPlan(), NO_TELEGRAM);
+  expect(off).not.toContain("code graph");
+  expect(off).not.toContain("graph-setup");
 });
 
 test("the plan names both reporting answers, so neither is applied unseen", () => {
