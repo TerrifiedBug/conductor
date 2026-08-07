@@ -1,6 +1,6 @@
 ---
 name: conductor-onboarding
-description: Interview-driven onboarding for omp-conductor. Use when the user wants to set up conductor, onboard a new fleet or project, configure the fleet, asks for conductor setup help, asks what belongs in ORCHESTRATOR.md, or wants an agent's release and merge authority scoped and written down. Interviews the operator on release policy, escalation taste and reporting scope, reads each routing repo's CI to propose the real pre-push gates, learns the product and roadmap the fleet will groom, scaffolds the release procedure from the repo's own release workflows rather than from the operator's memory, tailors ORCHESTRATOR.md from the shipped template, verifies the worker brief's assumptions against the actual repos, then finishes through the deterministic /conductor setup wizard.
+description: Interview-driven onboarding for omp-conductor. Use when the user wants to set up conductor, onboard a new fleet or project, configure the fleet, asks for conductor setup help, asks what belongs in ORCHESTRATOR.md, or wants an agent's release and merge authority scoped and written down. Interviews the operator on release policy, escalation taste and reporting scope, reads each routing repo's CI to propose the real pre-push gates, learns the product and roadmap the fleet will groom, scaffolds the release procedure from the repo's own release workflows rather than from the operator's memory, tailors ORCHESTRATOR.md from the shipped template, verifies the worker brief's assumptions against the actual repos, finishes through the deterministic /conductor setup wizard, then builds the code-graph indexes workers query instead of grepping.
 ---
 
 # Onboarding a conductor fleet
@@ -549,9 +549,11 @@ You have the answers ready, so this is fast — and it stays the wizard's decisi
 to write, not yours. It asks, in this order: project name; tracker repo; queue
 label; whether to rename the state labels; routing label prefix; then per repo the
 routing key, clone URL, default branch and **pre-push gates** (your Step 2
-proposal, in `cmd @ cwd` form); whether to add another repo; caps; the Telegram
-chat id for tier 2; the escalation fallback; the report scope; and finally whether
-to write `ORCHESTRATOR.md`.
+proposal, in `cmd @ cwd` form); whether to add another repo; whether to set up
+**code-graph discovery** and the root its clones live under (Step 8); caps; the
+authority confirms; the worker model; the Telegram chat id for tier 2; the
+escalation fallback; whether an orchestrator session already runs elsewhere; the
+report scope; and finally whether to write `ORCHESTRATOR.md`.
 
 Two things about the end of it that you must not smooth over:
 
@@ -606,7 +608,98 @@ Operators conflate these, and the failure modes are not the same.
 
 ---
 
-## Step 8 — hand over the learning loop
+## Step 8 — build the code graph, if they said yes to it
+
+Only if the wizard's code-graph question was answered yes. It is optional, and a
+fleet without it works exactly as it did before — but it is the cheapest single
+improvement to how far a worker gets, so lead with the number: **workers spend
+most of a run finding code, not changing it.** Measured on the reference fleet, a
+run typically spends 30–62 `read` and 32–69 `bash` calls against 9–24 edits, and
+the runs that hit the turns cap hit it with the work unfinished. A graph answers
+"who calls this" in one call instead of twenty greps.
+
+Say the thing operators get wrong before you run anything: **the indexed
+directories are conductor's, not theirs.** Three candidates and only one works.
+
+- A worker's **worktree** cannot be indexed usefully — an index is keyed by the
+  realpath it was built from, so a throwaway `worktrees/<issue>` path is always an
+  empty project. That is why the brief hands the worker an absolute path instead.
+- Their **own checkout** must not be indexed. Refreshing means resetting to the
+  default branch, which in a directory they work in either destroys uncommitted
+  work or indexes the feature branch they left checked out.
+- Conductor's **mirrors** are bare. No working tree, nothing to index.
+
+So each `graphProject` is a fourth thing: a disposable clone that exists only to
+be indexed, pinned to the repo's default branch, never edited by a human. Say that
+out loud, because an operator who points it at `~/projects/<repo>` to "save disk"
+has armed something that will one day `git reset --hard` over their work.
+
+Two host prerequisites come before any of that, and neither is conductor's to
+install. `graph-setup` reports both as step 0, so run it first and read that
+block before running anything else.
+
+- **The indexer must be on PATH.** `codebase-memory-mcp` is a separate project
+  ([source](https://github.com/DeusData/codebase-memory-mcp)); the package never
+  installs, spawns or depends on it. A host without it gets command-not-found
+  partway down the plan.
+- **It must be mounted as an MCP server for sessions**, in `~/.omp/agent/mcp.json`
+  on the account the daemon runs as. This is the one that bites, because it fails
+  *silently*: indexing succeeds, the databases are real and correct, and worker
+  sessions have no graph tools at all — so every worker quietly greps and the
+  whole thing looks like it simply did not help. `graph-setup` prints the exact
+  entry to paste, pointed at the binary it found.
+
+Check the mount on the daemon's account, not yours — a per-user config that is
+present for the operator and absent for the service account looks fine from the
+shell they are typing in.
+
+Then, on the host that runs the daemon:
+
+```bash
+omp-conductor graph-setup                 # read-only: prints the whole plan
+```
+
+Walk them through what it printed rather than pasting it silently. It has three
+parts, and each one is a decision they can still refuse: a `git clone` per missing
+clone, an index command per repo (minutes each — run them now, or the first worker
+queries an empty graph), and a `cbm-reindex.service` + `cbm-reindex.timer` pair
+derived from their own repos and branches. Then:
+
+```bash
+omp-conductor graph-setup --write         # stages the script and the two units (no root)
+```
+
+**Have them run this as the account the fleet runs as, not under `sudo`.** The
+command refuses sudo outright, and that refusal is the whole point: config path,
+state directory, `~/.cache` and the unit's own `User=` all resolve per-account,
+so a root run stages a timer that goes green while writing indexes into
+`/root/.cache` where no worker session looks. It is silent, and it looks exactly
+like the feature not helping.
+
+`--write` stages all three files in the state directory and prints the two `sudo`
+lines that install and enable them — installing units is the only privileged
+step, and it never runs `systemctl` itself. Have them start the service once by
+hand and read the result: a first real run is where a wrong branch or a missing
+clone shows up, and the unit is written to fail loudly rather than index a stale
+tree.
+
+Two things to leave them with:
+
+- **A timer, not the server's own watcher.** That watcher lives inside a connected
+  MCP session and dies with it, so nothing a worker mounts keeps anything fresh.
+  If the timer is not enabled, the graph decays and no one is told.
+- **The graph is a snapshot, and the brief says so.** Workers are told to orient
+  with it and then read the real file before editing, because the index is the
+  default branch at the last reindex — not their branch, and not their edits.
+
+Verify before moving on: `codebase-memory-mcp cli list_projects` must show one
+entry per repo whose `root_path` is exactly the configured `graphProject`. That
+match is the whole contract — the worker brief tells the session to find its
+project by that path, so a mismatch means a silent fallback to grep.
+
+---
+
+## Step 9 — hand over the learning loop
 
 Finish by telling the operator the truth about what they just wrote:
 

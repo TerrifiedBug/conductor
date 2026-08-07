@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { checkBrief, formatBriefStatus, writeMergedBrief } from "./brief-upgrade.ts";
 import { findProject, loadConfig, resolveCaps, stateDir } from "./config.ts";
 import { dbPath, formatStatus, runDaemon, setPaused, statusSnapshot } from "./daemon.ts";
+import { formatGraphSetup, graphRepos, writeGraphSetup, type GraphSetupWrite } from "./graph.ts";
 import {
   clearRecord,
   DEFAULT_PORT,
@@ -38,6 +39,7 @@ usage:
   omp-conductor daemon [--once] [--port N] [--project NAME]
   omp-conductor pause
   omp-conductor resume
+  omp-conductor graph-setup [--project NAME] [--write]
   omp-conductor brief-upgrade [--apply] [--file PATH] [--project NAME]
   omp-conductor help
 
@@ -63,6 +65,13 @@ usage:
            and exits. This is what \`start\` launches.
   pause    stop claiming new work. The running daemon notices on its next tick.
   resume   allow claiming again.
+  graph-setup
+           print how to set up the code-graph indexes workers query instead of
+           grepping: the clone commands for any missing index-only clone, the
+           index command per repo, and a systemd service+timer that keeps them
+           current. --write writes the two units and the script they run, and
+           prints the systemctl line to run — it never runs systemctl itself.
+           Exits 1 when no repo in the project has graphProject configured.
   brief-upgrade
            compare a project's ORCHESTRATOR.md against the brief this version of
            the package ships. Reports by default; --apply replaces the half above
@@ -450,6 +459,57 @@ try {
       setPaused(false);
       process.stdout.write("resumed — work will be claimed on the next tick\n");
       break;
+
+    case "graph-setup": {
+      // Refused rather than accommodated. Under sudo every path this command
+      // derives — the config it loads, the state directory it writes to, the
+      // HOME and User= it bakes into the unit — resolves as root instead of the
+      // fleet's account, and the result is a timer that goes green while
+      // building indexes in a store no worker session ever reads. Nothing about
+      // that announces itself, so the only safe answer is to stop.
+      if (process.env["SUDO_USER"] !== undefined) {
+        process.stderr.write(
+          "omp-conductor: run graph-setup as the account the fleet runs as, not under sudo.\n" +
+            `Under sudo the config, ~/.cache and the unit's User= all resolve as root, and the\n` +
+            `indexes land where no worker can read them. Only installing the units needs root,\n` +
+            "and this command prints those two lines for you at the end.\n",
+        );
+        process.exit(1);
+      }
+
+      const project = findProject(loadConfig(), flag(argv, "project"));
+      if (graphRepos(project).length === 0) {
+        // Not a warning: with nothing configured there is nothing to print, and
+        // the fix is a wizard answer rather than a flag on this command.
+        process.stderr.write(
+          `omp-conductor: no repo in project "${project.name}" has graphProject set — re-run\n` +
+            "/conductor setup and say yes to code-graph discovery.\n",
+        );
+        process.exit(1);
+      }
+
+      if (!argv.includes("--write")) {
+        process.stdout.write(`${formatGraphSetup(project)}\n`);
+        break;
+      }
+
+      let result: GraphSetupWrite;
+      try {
+        result = writeGraphSetup(project);
+      } catch (err) {
+        // No longer the permissions case — all three files go to this account's
+        // own state directory — so this is a full disk, a read-only mount or a
+        // state directory someone else owns. Say what failed and offer the
+        // printed plan, which is a complete substitute for the write.
+        process.stderr.write(
+          `omp-conductor: could not stage the files (${err instanceof Error ? err.message : String(err)}).\n` +
+            "Drop --write and copy the printed text yourself — it is the same content.\n",
+        );
+        process.exit(1);
+      }
+      process.stdout.write(`wrote:\n${result.written.map((f) => `  ${f}`).join("\n")}\n\n${result.next}\n`);
+      break;
+    }
 
     case "brief-upgrade": {
       // `--file` exists because a real fleet's brief is often not where the wizard

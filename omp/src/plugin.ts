@@ -11,8 +11,9 @@
  * worth protecting is on `setup()` below — nothing is written before the confirm.
  */
 import { existsSync, readFileSync } from "node:fs";
+import { dirname, isAbsolute } from "node:path";
 import { checkBrief, formatBriefStatus, writeMergedBrief } from "./brief-upgrade.ts";
-import { configPath, findProject, loadConfig, saveConfig } from "./config.ts";
+import { configPath, expandHome, findProject, loadConfig, saveConfig } from "./config.ts";
 import {
   armConductor,
   formatStatus,
@@ -22,6 +23,7 @@ import {
   statusSnapshot,
   type QueuePreview,
 } from "./daemon.ts";
+import { defaultGraphRoot } from "./graph.ts";
 import {
   ORCHESTRATOR_BRIEF_NAME,
   REPORT_SCOPE_CHOICES,
@@ -288,6 +290,44 @@ async function askOrchestratorMode(ctx: CommandContext, prior: OrchestratorMode)
 }
 
 /**
+ * Whether workers get a code graph, and where its clones live.
+ *
+ * One confirm and at most one prompt, asked after the repos are known because
+ * the answer is derived per repo. A declined answer leaves the field off every
+ * repo, which is what keeps an existing fleet's briefs byte-identical.
+ *
+ * The root is validated as absolute here rather than at load time so the
+ * operator learns immediately: a relative path would be resolved against
+ * whichever cwd happened to read the config, and never against the directory
+ * that was indexed.
+ */
+async function askGraphRoot(
+  ctx: CommandContext,
+  trackerRepo: string,
+  repoNames: string[],
+  prior: string | undefined,
+): Promise<string | undefined> {
+  const wanted = await ctx.ui.confirm(
+    "Code-graph discovery",
+    "Set up code-graph discovery for workers? Workers spend most of their turn budget finding code; " +
+      'a graph answers "who calls this" in one call. Conductor keeps one disposable clone per repo, ' +
+      "pinned to the default branch purely for indexing — never your own checkout" +
+      `${prior === undefined ? "" : `. Currently on, under ${prior}`}.`,
+  );
+  if (!wanted) return undefined;
+
+  return await askValid(
+    ctx,
+    `Root for those clones — one per repo (${repoNames.join(", ")}) is created under it`,
+    prior ?? defaultGraphRoot(trackerRepo),
+    (v) =>
+      isAbsolute(expandHome(v))
+        ? undefined
+        : `"${v}" is not an absolute path — a worker reads this from its own worktree, so a relative one names the wrong directory.`,
+  );
+}
+
+/**
  * Whether to render the operator's own brief, and — separately — whether an
  * existing one may be replaced. Two questions on purpose: that file is where a
  * fleet's release and reporting policy ends up, so it is never overwritten by
@@ -400,6 +440,17 @@ async function collectAnswers(
     if (!more) break;
   }
 
+  // Straight after the repos, because it is a fact about them: one clone per
+  // routed repo, under one root. Seeded from whichever prior repo already had
+  // one — the wizard writes them as siblings, so any one of them names the root.
+  const priorGraph = Object.values(prior?.routing.repos ?? {}).find((r) => r.graphProject !== undefined);
+  const graphRoot = await askGraphRoot(
+    ctx,
+    trackerRepo,
+    targetRepos.map((r) => r.name),
+    priorGraph?.graphProject === undefined ? undefined : dirname(priorGraph.graphProject),
+  );
+
   const caps: Partial<Caps> = { ...prior?.caps };
   const tuneCaps = await ctx.ui.confirm(
     "Caps",
@@ -495,6 +546,7 @@ async function collectAnswers(
   };
   if (telegramChatId !== undefined) answers.telegramChatId = telegramChatId;
   if (workerModel !== undefined) answers.workerModel = workerModel;
+  if (graphRoot !== undefined) answers.graphRoot = graphRoot;
   return { ...answers, writeOrchestratorBrief: await askOrchestratorBrief(ctx, answers) };
 }
 

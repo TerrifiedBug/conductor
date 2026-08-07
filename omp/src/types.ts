@@ -46,6 +46,31 @@ export interface RepoTarget {
    * subset lets lint errors outside the source dir reach the runners.
    */
   gates: { cmd: string; cwd: string }[];
+  /**
+   * Absolute path of the **conductor-owned, index-only clone** of this repo
+   * whose code-graph index workers query. Optional: absent means this repo has
+   * no graph, and the worker brief says nothing about one.
+   *
+   * Two things it deliberately is not, and both were paid for:
+   *
+   * - **Not a worker's worktree.** A code-graph index is keyed by the realpath
+   *   of the directory it was built from, with no git-worktree awareness, so a
+   *   run's throwaway `worktrees/<issue>` path is always an empty project. A
+   *   worker that queried its own cwd would find nothing, conclude there is no
+   *   graph, and go back to grepping — which is the entire cost this field
+   *   exists to remove.
+   * - **Not a human's checkout.** Refreshing an index means hard-resetting the
+   *   clone to its default branch. Doing that where somebody works destroys
+   *   their uncommitted edits; making it safe instead (a fast-forward pull)
+   *   means the graph reflects whatever feature branch they left checked out.
+   *   So this names a disposable clone nothing human ever edits, which is what
+   *   makes the reset both safe and deterministic.
+   *
+   * `omp-conductor graph-setup` prints how to create and refresh it. Nothing in
+   * this package reads an index itself: the daemon only passes this path into
+   * the worker brief.
+   */
+  graphProject?: string;
 }
 
 /**

@@ -31,11 +31,12 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
   admitCandidates,
+  buildBrief,
   checkIntegrity,
   checkStall,
   manifestDiff,
@@ -704,5 +705,49 @@ describe("checkStall", () => {
     const verdict = checkStall(gate, marker);
     expect(verdict.page).toBe(true);
     expect(verdict.since).toBeUndefined();
+  });
+});
+
+/**
+ * The brief is the entire context a session with the host's credentials gets, so
+ * the two things worth holding are: a configured graph reaches the worker with
+ * the right target, and a project without one gets exactly the brief this
+ * package has always shipped.
+ */
+describe("buildBrief", () => {
+  const routed = candidate(42);
+  const shipped = join(import.meta.dir, "briefs", "worker.md");
+
+  it("says nothing at all about a graph the project has not configured", async () => {
+    const brief = await buildBrief(project(), routed, "feat/widget", "/tmp/conductor/work/42");
+    const template = readFileSync(shipped, "utf8");
+
+    // Byte-identical to the template with the placeholder simply gone — no blank
+    // line, no heading, no "no graph configured" caveat. The placeholder sits
+    // flush against the next numbered item precisely so that this holds; a
+    // maintainer who gives it its own line breaks this test and nothing else.
+    expect(brief).toContain("smallest diff in the wrong place is a second bug.\n2. **One read per file");
+    expect(brief).not.toContain("{{");
+    expect(brief).not.toContain("list_projects");
+    expect(brief.split("\n").length).toBe(template.split("\n").length);
+  });
+
+  it("points a configured worker at the indexed clone, never at its own worktree", async () => {
+    const graphed: Routed = {
+      issue: routed.issue,
+      repo: { ...REPO, graphProject: "/srv/graph/acme/api" },
+    };
+
+    const brief = await buildBrief(project(), graphed, "feat/widget", "/tmp/conductor/work/42");
+
+    // The clone's path, and the lookup that turns it into a project name. An
+    // index is keyed by the realpath it was built from, so the worktree named
+    // two lines below in the same brief has no index and never will.
+    expect(brief).toContain("/srv/graph/acme/api");
+    expect(brief).toContain("list_projects");
+    expect(brief).toContain("never pass your own cwd");
+    // Still one list, still no orphaned placeholder.
+    expect(brief).toContain("\n2. **One read per file");
+    expect(brief).not.toContain("{{");
   });
 });

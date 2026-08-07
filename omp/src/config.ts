@@ -14,7 +14,7 @@
 
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import {
   AUTHORITY_HOLDERS,
   CONFIG_VERSION,
@@ -432,15 +432,45 @@ function normalizeRepos(parsed: unknown, label: string, problems: string[]): Rec
       problems.push(`${label}: routing.repos.${key}.cloneUrl must be a non-empty string`);
       continue;
     }
-    repos[key] = {
+    const target: RepoTarget = {
       name: pickString(value?.["name"], key),
       cloneUrl,
       defaultBranch: pickString(value?.["defaultBranch"], "main"),
       gates: normalizeGates(value?.["gates"], `${label}: routing.repos.${key}`, problems),
     };
+    const graph = normalizeGraphProject(value?.["graphProject"], `${label}: routing.repos.${key}`, problems);
+    if (graph !== undefined) target.graphProject = graph;
+    repos[key] = target;
   }
 
   return repos;
+}
+
+/**
+ * The path of the index-only clone whose code graph this repo's workers query,
+ * or `undefined` when the repo has none.
+ *
+ * A relative path is rejected rather than resolved, and that rejection is the
+ * whole reason this is validated here: the value is written in one process and
+ * *used* in another, by a session whose cwd is its own throwaway worktree. So
+ * `../graph/api` would name a different directory for every reader, and none of
+ * them the one that was indexed. There is no cwd this file could honestly
+ * resolve it against, so it says so rather than guessing.
+ */
+function normalizeGraphProject(parsed: unknown, label: string, problems: string[]): string | undefined {
+  if (parsed === undefined) return undefined;
+  if (!nonEmptyString(parsed)) {
+    problems.push(`${label}.graphProject must be a non-empty absolute path, found ${JSON.stringify(parsed)}`);
+    return undefined;
+  }
+
+  const path = expandHome(parsed.trim());
+  if (isAbsolute(path)) return path;
+  problems.push(
+    `${label}.graphProject must be an absolute path — it is read by sessions whose cwd is their own ` +
+      `worktree — found ${JSON.stringify(parsed)}`,
+  );
+  return undefined;
 }
 
 /**
@@ -550,8 +580,14 @@ function pickLiteral<T extends string>(
   return hit;
 }
 
-/** `~/x` in a hand-written config must not create a literal `~` directory. */
-function expandHome(p: string): string {
+/**
+ * `~/x` in a hand-written config must not create a literal `~` directory.
+ *
+ * Exported because the wizard and `graph-setup` derive paths the operator may
+ * have typed with a `~` in them, and one spelling of this rule in the package
+ * is the only way a path shown in a plan matches the path a validator accepts.
+ */
+export function expandHome(p: string): string {
   if (p === "~") return homedir();
   return p.startsWith("~/") ? join(homedir(), p.slice(2)) : p;
 }
