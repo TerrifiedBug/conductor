@@ -43,6 +43,15 @@ export interface WorkerOpts {
    */
   model?: string;
   onTurn?: (n: number) => void;
+  /**
+   * The transcript path, handed over the moment the session opens it rather
+   * than at the end with {@link WorkerResult.sessionFile}. Both report the same
+   * path; only this one arrives while there is still something to watch, which
+   * is what `omp-conductor tail` attaches to. Never called for a session that
+   * opened no transcript — there is no path to report, and an empty string
+   * would be a path that fails to open rather than an absence.
+   */
+  onSessionFile?: (path: string) => void;
 }
 
 /**
@@ -144,6 +153,11 @@ export async function runWorker(
     ...(o.sessionDir === undefined ? {} : { sessionDir: o.sessionDir }),
     ...(o.model === undefined ? {} : { model: o.model }),
   });
+
+  // Before the first turn, not after the last: a caller that only learns the
+  // transcript path from the result learns it once the run it wanted to watch
+  // is already over.
+  if (session.sessionFile !== undefined) o.onSessionFile?.(session.sessionFile);
 
   // Every exit below reports the session's own facts the same way: the
   // transcript it actually opened, and any model downgrade it announced. Read at

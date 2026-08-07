@@ -30,7 +30,7 @@ import {
   type SetupAnswers,
   type TelegramPresence,
 } from "./setup.ts";
-import { DEFAULT_CAPS, DEFAULT_REPORT_SCOPE } from "./types.ts";
+import { DEFAULT_AUTHORITY, DEFAULT_CAPS, DEFAULT_REPORT_SCOPE } from "./types.ts";
 
 const CONDUCTOR_HOME = "OMP_CONDUCTOR_HOME";
 const TELEGRAM_HOME = "OMP_TELEGRAM_STATE_DIR";
@@ -77,6 +77,8 @@ function answers(overrides: Partial<SetupAnswers> = {}): SetupAnswers {
     caps: {},
     fallbackToIssueComment: true,
     reportScope: DEFAULT_REPORT_SCOPE,
+    authority: { ...DEFAULT_AUTHORITY },
+    orchestratorMode: "embedded",
     writeOrchestratorBrief: false,
     ...overrides,
   };
@@ -102,7 +104,12 @@ test("a config built from answers survives its own validator", () => {
   const project = loaded.projects[0];
   expect(project?.tracker).toEqual({ kind: "github", repo: "acme/demo" });
   expect(project?.caps).toEqual({ maxConcurrentWorkers: 3, dailySpendUsd: 40 });
-  expect(project?.escalation).toEqual({ fallbackToIssueComment: false, telegramChatId: "424242" });
+  expect(project?.escalation).toEqual({
+    fallbackToIssueComment: false,
+    telegramChatId: "424242",
+    orchestrator: "embedded",
+  });
+  expect(project?.authority).toEqual({ merge: "human", release: "human" });
   expect(project?.routing.repos["api"]?.gates).toEqual([{ cmd: "bun run check", cwd: "." }]);
   expect(project?.reporting).toEqual({ scope: "material" });
   expect(loaded.defaults).toEqual(DEFAULT_CAPS);
@@ -174,6 +181,44 @@ test("the brief defaults to never releasing, and says the section is the operato
   expect(text).toContain("Every claim cites evidence");
 });
 
+test("delegating in setup renders a Releases paragraph that says so", () => {
+  const text = renderOrchestratorBrief(answers({ authority: { merge: "orchestrator", release: "orchestrator" } }));
+
+  // The whole point of the key: the session must never read a prohibition its
+  // own config has already lifted.
+  expect(text).toContain("**Delegated in setup: you merge, and you release.**");
+  expect(text).not.toContain("**Default: humans release, and you do not merge.**");
+  // Delegated or not, the procedure is still the operator's to write.
+  expect(text).toContain("Spell out all seven.");
+});
+
+test("each authority combination renders its own paragraph, and none renders a placeholder", () => {
+  for (const merge of ["human", "orchestrator"] as const) {
+    for (const release of ["human", "orchestrator"] as const) {
+      const text = renderOrchestratorBrief(answers({ authority: { merge, release } }));
+
+      expect(text).not.toContain("{{RELEASES_DEFAULT}}");
+      expect(text).toContain(
+        merge === "orchestrator" ? "you merge" : release === "orchestrator" ? "humans merge" : "you do not merge",
+      );
+    }
+  }
+});
+
+test("Duty 1's green-PR branch is worded from the same grant as the standing orders", () => {
+  const kept = renderOrchestratorBrief(answers());
+  expect(kept).toContain("waiting on a human merge");
+  expect(kept).toContain("You do not merge it.");
+
+  // The failure this guards: a session told "merging is yours" in its standing
+  // orders, and told "you do not merge it" by its own Duty 1, does whichever it
+  // read last — and a delegated fleet's PRs then sit green forever.
+  const delegated = renderOrchestratorBrief(answers({ authority: { merge: "orchestrator", release: "human" } }));
+  expect(delegated).toContain("merging is yours");
+  expect(delegated).not.toContain("You do not merge it.");
+  expect(delegated).not.toContain("waiting on a human merge");
+});
+
 test("a worker's release prohibition is fixed, while the orchestrator's is policy", () => {
   const text = renderOrchestratorBrief(answers());
   const banner = text.indexOf("YOURS TO EDIT");
@@ -187,12 +232,37 @@ test("a worker's release prohibition is fixed, while the orchestrator's is polic
   // The concurrency invariant binds whoever merges, so it is fixed too — otherwise
   // a delegated release could land two PRs at once and clobber them.
   expect(fixed).toContain("PRs land one at a time");
+  // The self-modification wall is fixed for the same reason: a session that may
+  // edit its own dispatcher can relax every other boundary by construction.
+  expect(fixed).toContain("Nobody patches the running conductor.");
 
   // The orchestrator's own authority is deliberately NOT a hard boundary: an
   // operator who delegates releases must be able to say so without the brief
   // contradicting itself, and the Learning loop forbids relaxing hard boundaries.
   expect(fixed).toContain("**Your own** merge and release authority is not decided here.");
   expect(editable).toContain("it is the only place your merge");
+});
+
+test("the fixed half never contradicts a delegated grant", () => {
+  const text = renderOrchestratorBrief(
+    answers({ authority: { merge: "orchestrator", release: "orchestrator" } }),
+  );
+  const fixed = text.slice(0, text.indexOf("YOURS TO EDIT"));
+
+  // Hard boundaries and the Releases paragraph sit ~60 lines apart in one
+  // standing prompt. This shipped as "unedited it is none", which a delegated
+  // fleet rendered directly above "you merge, and you release" — two opposite
+  // instructions in one file, which is the drift `authority` exists to end. The
+  // fixed half may describe where the grant comes from; it may never assert what
+  // the grant is.
+  expect(fixed).not.toContain("unedited it is none");
+  expect(fixed).toContain("granted at setup time");
+
+  // Same failure, other direction: Duty 2 tells this session to groom the queue,
+  // so the coordinates cannot also declare that adding the queue label is never
+  // its job — a fleet that cannot promote stops dead once the queue drains.
+  expect(fixed).not.toContain("You never add it");
+  expect(fixed).toContain("Adding it to an issue is *promotion*");
 });
 
 test("the rendered brief ships the amendment protocol above the operator's half", () => {
@@ -296,6 +366,25 @@ test("the plan shows effective caps, marking the ones that were answered", () =>
   expect(text).toMatch(/maxConcurrentWorkers\s+5\s+\(answered\)/);
   // Unanswered caps still show, at the shipped default, so nothing is implicit.
   expect(text).toMatch(new RegExp(`workerMaxTurns\\s+${DEFAULT_CAPS.workerMaxTurns}$`, "m"));
+});
+
+test("the plan names who merges, who releases, and who triages — before anything is written", () => {
+  const scopes: ScopeCheck = { ok: true, login: "acme", scopes: ["repo", "project"], missing: [] };
+
+  const kept = summarisePlan(answers(), scopes, labelPlan(), NO_TELEGRAM);
+  expect(kept).toContain("authority      merge=human  release=human");
+  expect(kept).toContain("triage         embedded");
+
+  // The consent screen is the last place a delegation can be caught before it
+  // is granted, so it has to say the word.
+  const delegated = summarisePlan(
+    answers({ authority: { merge: "orchestrator", release: "orchestrator" }, orchestratorMode: "external" }),
+    scopes,
+    labelPlan(),
+    NO_TELEGRAM,
+  );
+  expect(delegated).toContain("authority      merge=orchestrator  release=orchestrator");
+  expect(delegated).toContain("triage         external");
 });
 
 test("the plan names both reporting answers, so neither is applied unseen", () => {

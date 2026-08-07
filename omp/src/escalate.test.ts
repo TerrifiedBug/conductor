@@ -5,7 +5,8 @@ import { join } from "node:path";
 
 import { createEscalator, formatEscalation } from "./escalate.ts";
 import type { OrchestratorHandle } from "./orchestrator.ts";
-import type { Escalation, ProjectConfig, Store, Tracker } from "./types.ts";
+import { DEFAULT_AUTHORITY } from "./types.ts";
+import type { Escalation, OrchestratorMode, ProjectConfig, Store, Tracker } from "./types.ts";
 
 /** Obvious junk: this must never reach the network, a log or an assertion. */
 const FAKE_TOKEN = "1234567:AA-fake-test-token-not-a-secret";
@@ -52,7 +53,11 @@ function stubFetch(reply: () => Response): FetchCall[] {
   return calls;
 }
 
-function makeProject(escalation: ProjectConfig["escalation"]): ProjectConfig {
+/** `orchestrator` defaults to `embedded`: these tests are about where an
+ *  escalation goes, and every one of them predates the external mode. */
+function makeProject(
+  escalation: Omit<ProjectConfig["escalation"], "orchestrator"> & { orchestrator?: OrchestratorMode },
+): ProjectConfig {
   return {
     name: "demo",
     tracker: { kind: "github", repo: "acme/demo" },
@@ -60,7 +65,8 @@ function makeProject(escalation: ProjectConfig["escalation"]): ProjectConfig {
     stateLabels: { inProgress: "agent:running", blocked: "agent:blocked", failed: "agent:failed" },
     routing: { labelPrefix: "repo:", repos: {} },
     caps: {},
-    escalation,
+    escalation: { orchestrator: "embedded", ...escalation },
+    authority: { ...DEFAULT_AUTHORITY },
     workspaceRoot: "/tmp/conductor/work",
     mirrorRoot: "/tmp/conductor/mirrors",
   };
@@ -96,6 +102,7 @@ function makeStore() {
     activeRuns: () => [],
     liveRuns: () => [],
     attemptsFor: () => 0,
+    latestRun: () => undefined,
     runsStartedSince: () => 0,
     spendSince: () => 0,
     wasNotified: (key: string) => notified.has(key),

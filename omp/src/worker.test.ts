@@ -16,13 +16,27 @@ import { DEFAULT_CAPS } from "./types.ts";
  * A session that settles immediately with the report it was handed. Records the
  * options it was created with, which is the only way to prove `runWorker` passes
  * a configured model through instead of dropping it.
+ *
+ * `gated` holds `prompt()` open until `release()` is called, so a test can
+ * inspect what the run has already done while it is provably still in flight.
+ * `started` resolves the moment `prompt()` is entered, which makes that
+ * inspection a handshake rather than a sleep.
  */
-function fakeHarness(opts?: { report?: string; modelFallbackMessage?: string }) {
+function fakeHarness(opts?: {
+  report?: string;
+  modelFallbackMessage?: string;
+  sessionFile?: string;
+  gated?: boolean;
+}) {
   const received: { cwd?: string; sessionDir?: string; model?: string }[] = [];
   const handlers = new Map<string, ((e: unknown) => void)[]>();
+  const entered = Promise.withResolvers<void>();
+  const gate = Promise.withResolvers<void>();
 
   const session: AgentSessionLike = {
     prompt: async () => {
+      entered.resolve();
+      if (opts?.gated === true) await gate.promise;
       for (const cb of handlers.get("message_end") ?? []) {
         cb({ message: { role: "assistant", content: opts?.report ?? "state: pushed-green" } });
       }
@@ -34,6 +48,7 @@ function fakeHarness(opts?: { report?: string; modelFallbackMessage?: string }) 
       handlers.set(event, list);
     },
     abort: () => {},
+    ...(opts?.sessionFile === undefined ? {} : { sessionFile: opts.sessionFile }),
     ...(opts?.modelFallbackMessage === undefined
       ? {}
       : { modelFallbackMessage: opts.modelFallbackMessage }),
@@ -41,6 +56,9 @@ function fakeHarness(opts?: { report?: string; modelFallbackMessage?: string }) 
 
   return {
     received,
+    /** Resolves once the run is under way — `prompt()` has been entered. */
+    started: entered.promise,
+    release: () => gate.resolve(),
     deps: {
       createSession: async (o: { cwd: string; sessionDir?: string; model?: string }) => {
         received.push(o);
@@ -96,6 +114,46 @@ describe("runWorker session options", () => {
     const result = await runWorker(workerOpts({ model: "smol" }), harness.deps);
 
     expect(result.modelFallbackMessage).toBeUndefined();
+  });
+
+  test("hands the transcript path over while the run is still in flight", async () => {
+    const transcript = "/tmp/sessions/2026-08-06T00-00-00-000Z_run.jsonl";
+    const harness = fakeHarness({ gated: true, sessionFile: transcript });
+    const seen: string[] = [];
+    let settled = false;
+
+    const run = runWorker(
+      workerOpts({ onSessionFile: (p) => seen.push(p) }),
+      harness.deps,
+    ).finally(() => {
+      settled = true;
+    });
+
+    // The gate holds `prompt()` open, so this is the middle of the run, not a
+    // guess about timing. Ordering is the whole point of the seam: `tail`
+    // resolves an issue to a transcript through the row this callback writes,
+    // and a path that only lands with the result arrives once there is nothing
+    // left to follow.
+    await harness.started;
+    expect(seen).toEqual([transcript]);
+    expect(settled).toBe(false);
+
+    harness.release();
+    await run;
+    // Once, not once per turn: the callback names a file, not an event.
+    expect(seen).toEqual([transcript]);
+  });
+
+  test("never calls onSessionFile for a session that opened no transcript", async () => {
+    const harness = fakeHarness();
+    const seen: string[] = [];
+
+    const result = await runWorker(workerOpts({ onSessionFile: (p) => seen.push(p) }), harness.deps);
+
+    // An empty string is a path that fails to open, not an absence — so the
+    // callback stays silent and the result reports no transcript either.
+    expect(seen).toEqual([]);
+    expect(result.sessionFile).toBeUndefined();
   });
 });
 

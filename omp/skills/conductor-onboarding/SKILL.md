@@ -119,16 +119,25 @@ are the orchestrator and a human.** The orchestrator is the right agent for it i
 any agent is: it is long-lived, it can see everything that merged since the last
 release, and batching is exactly the judgement a per-issue session cannot make.
 
-So frame it as **three** options, in this order, and name the default:
+So frame it as **three** options, in this order, and name the default. Each one
+maps to an `authority` answer the wizard asks for directly — the interview
+decides *which answer to give*, and `/conductor setup` is what records it. Never
+write authority into the brief by hand: the config is what words the brief, and
+a hand-edit is a second source that outlives the operator's memory of making it.
 
 1. **Humans release.** *(default, and what the package ships)* Work ends at a
    green PR. Merging is a separate human action; releasing is a separate human
    action after that. Neither a worker nor the orchestrator ever tags, pins,
    publishes, or deploys. "This needs releasing" becomes something the
-   orchestrator *reports*.
+   orchestrator *reports*. → `authority: merge=human, release=human`; answer
+   **no** to both wizard confirms.
 2. **The orchestrator releases up to a named boundary.** Delegating part of the
    release to the supervising session, with the stopping line written down.
-3. **The orchestrator releases fully.**
+   → usually `merge=orchestrator, release=orchestrator`, with the boundary in
+   the procedure rather than in the grant; `merge=orchestrator, release=human`
+   when the line falls before the tag.
+3. **The orchestrator releases fully.** → `merge=orchestrator,
+   release=orchestrator`.
 
 Then ask the question that makes option 2 real:
 
@@ -344,7 +353,8 @@ about gates: an operator describes the release they *remember*, and a release is
 the one procedure where being approximately right is worst.
 
 Skip this step only for option 1 (humans release). There is nothing to scaffold:
-the shipped paragraph is already correct and the brief keeps it verbatim.
+the rendered paragraph already says humans hold both, and there is no procedure
+under it to write.
 
 ### Find the release authority
 
@@ -433,24 +443,24 @@ PR URL, an issue number, or a named check actually read.* "Should be fine",
 
 Know what is *not* up there, though, because operators expect it to be: the
 orchestrator's own merge and release authority is **not** a hard boundary. It is
-policy, it lives in Releases, and it defaults to none. What is fixed above the
-banner is that a *worker* never merges or releases, and that PRs land one at a time
-with a freshness re-check. Delegating a release to the orchestrator does not touch
-either of those, so it needs no negotiation with the shipped half.
+config — the two `authority` answers — and it defaults to none. What is fixed
+above the banner is that a *worker* never merges or releases, and that PRs land
+one at a time with a freshness re-check. Delegating a release to the
+orchestrator does not touch either of those, so it needs no negotiation with the
+shipped half.
 
 **Below the banner — rewrite from the interview.**
 
-- **Releases.** Replace the section with the procedure you scaffolded in Step 4. If
-  humans-release, say so in one short paragraph and stop; do not leave the "replace
-  this paragraph if you are delegating" instructions in a finished brief, because
-  a standing prompt full of alternatives it did not choose is a standing prompt
-  the session has to guess its way through. If they chose a boundary, write the
-  boundary as a sentence with an end — *"your leg ends at the merged pin PR; you
-  never deploy it"* — then the scaffolded steps, then the forbidden list with its
-  citations. State the merge authority explicitly either way: a brief that
-  prescribes landing a release PR without ever saying the orchestrator may merge is
-  a brief the session has to infer permission from, and it will infer wrong in one
-  direction or the other.
+- **Releases.** The section's opening paragraph is rendered from the `authority`
+  answers, and Duty 1's "the PR is green" branch is rendered from the same
+  place. Leave both alone: they are the config speaking, and re-running
+  `/conductor setup` is how they change. What you write is everything under that
+  paragraph — the procedure you scaffolded in Step 4. If humans-release, there is
+  nothing to scaffold and you stop. If they chose a boundary, write the boundary
+  as a sentence with an end — *"your leg ends at the merged pin PR; you never
+  deploy it"* — then the scaffolded steps, then the forbidden list with its
+  citations. Do not restate the merge grant in your own words: a second spelling
+  of it is exactly the disagreement the rendered paragraph exists to prevent.
 - **Reporting.** Rewrite it as the one scope they chose, in the second person,
   concretely. Delete the description of the scope they did not choose: it is
   useful in a template and noise in a live prompt. Keep the closing constraint

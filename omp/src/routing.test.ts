@@ -29,7 +29,8 @@ const project: ProjectConfig = {
   },
   routing: { labelPrefix: "repo:", repos: { api, worker } },
   caps: {},
-  escalation: { fallbackToIssueComment: true },
+  escalation: { fallbackToIssueComment: true, orchestrator: "embedded" },
+  authority: { merge: "human", release: "human" },
   workspaceRoot: "/tmp/conductor/ws",
   mirrorRoot: "/tmp/conductor/mirrors",
 };

@@ -22,11 +22,13 @@ import { join } from "node:path";
 
 /**
  * Mirrors `DEFAULT_PORT` in ./daemon.ts. Duplicated rather than imported so
- * this module stays free of the dispatcher's dependency tree.
- * // ponytail: two constants that must agree. If a third caller ever needs it,
- * // move it into ./types.ts and import it in both places.
+ * this module stays free of the dispatcher's dependency tree; exported so the
+ * CLI can name the port a foreground daemon will serve on without adding a
+ * third literal.
+ * // ponytail: two constants that must agree. If a third *definition* ever
+ * // appears, move it into ./types.ts and import it everywhere.
  */
-const DEFAULT_PORT = 8787;
+export const DEFAULT_PORT = 8787;
 
 /** How long `startDaemon` waits for the first successful `/healthz`. */
 const READY_TIMEOUT_MS = 15_000;

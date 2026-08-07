@@ -66,6 +66,33 @@ export type ReportScope = (typeof REPORT_SCOPES)[number];
 export const DEFAULT_REPORT_SCOPE: ReportScope = "material";
 
 /**
+ * Who holds an authority the daemon itself never exercises. Declared as data
+ * for the same reason as {@link REPORT_SCOPES}: the validator, the wizard and
+ * the brief renderer all enumerate the same two holders, so a third one cannot
+ * be added while any of them still knows only two.
+ */
+export const AUTHORITY_HOLDERS = ["human", "orchestrator"] as const;
+
+export type AuthorityHolder = (typeof AUTHORITY_HOLDERS)[number];
+
+/**
+ * What a project that never answered the question gets: humans keep both. A
+ * default that delegated merging would hand a fresh fleet write access to its
+ * own main branch on the strength of an unread config file.
+ */
+export const DEFAULT_AUTHORITY: ProjectConfig["authority"] = { merge: "human", release: "human" };
+
+/**
+ * Where the session that triages escalations lives. `embedded` is the daemon's
+ * own child session; `external` means an operator already runs one — a visible
+ * TUI session, say — and the daemon must not start a second brain that would
+ * re-triage the same issues from a different transcript.
+ */
+export const ORCHESTRATOR_MODES = ["embedded", "external"] as const;
+
+export type OrchestratorMode = (typeof ORCHESTRATOR_MODES)[number];
+
+/**
  * Everything the dispatcher needs to service one product: where work comes
  * from, where code goes, and what it may spend doing it. Config is per project
  * so unrelated products cannot consume each other's budget.
@@ -91,8 +118,18 @@ export interface ProjectConfig {
    * answered the question wants.
    */
   workerModel?: string;
-  /** How a stuck run reaches a human, and what to do when it cannot. */
-  escalation: { telegramChatId?: string; fallbackToIssueComment: boolean };
+  /**
+   * How a stuck run reaches a human, what to do when it cannot, and who runs
+   * the session that triages it. See {@link ORCHESTRATOR_MODES}.
+   */
+  escalation: { telegramChatId?: string; fallbackToIssueComment: boolean; orchestrator: OrchestratorMode };
+  /**
+   * Who lands green PRs and who cuts releases. The daemon never acts on this
+   * itself — it words the orchestrator's standing orders and the rendered brief
+   * scaffold with it, so config and prompt can never disagree about which of
+   * them is holding the merge button.
+   */
+  authority: { merge: AuthorityHolder; release: AuthorityHolder };
   /**
    * How loud the orchestrator is. Optional on disk — a config written before
    * this key existed loads as {@link DEFAULT_REPORT_SCOPE} — so read it through
@@ -214,6 +251,10 @@ export interface Store {
   /** Runs backed by a worker process — what capacity counts. Subset of {@link Store.activeRuns}. */
   liveRuns(project: string): RunRecord[];
   attemptsFor(project: string, issue: number): number;
+  /** Newest attempt for one issue, whatever state it reached. `omp-conductor
+   *  tail` resolves an issue number to a transcript through this; the number is
+   *  what an operator has, the run id is not. */
+  latestRun(project: string, issue: number): RunRecord | undefined;
   runsStartedSince(project: string, sinceEpochMs: number): number;
   spendSince(project: string, sinceEpochMs: number): number;
   /** Idempotence guard so a retry loop cannot page a human repeatedly for the

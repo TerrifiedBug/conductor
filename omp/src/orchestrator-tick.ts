@@ -6,12 +6,9 @@
  * loop, so this extension is the heartbeat: every `intervalSeconds` it injects
  * one message that starts a turn.
  *
- * Four properties are worth protecting, and each one is a branch in
+ * Three properties are worth protecting, and each one is a branch in
  * `tickDecision()`:
  *
- * - **Pause is honoured.** `isPaused()` is imported from ./daemon.ts — the exact
- *   function `/conductor pause` writes for and the dispatch loop reads. A second
- *   spelling of "is it paused" here is how a paused fleet keeps working.
  * - **A disarmed fleet is not woken.** The arm marker is a file the operator
  *   controls; missing means "not armed", and a tick then does nothing.
  * - **The human channel must still be there.** Autonomous dispatch is only
@@ -27,7 +24,10 @@
  * Beyond those four gates, every tick carries the project's `reporting.scope`
  * as one explicit constraint line, re-read from the conductor config on each
  * tick so a `/conductor setup` change binds the next heartbeat rather than
- * waiting for a session restart.
+ * waiting for a session restart — and one delivery rule
+ * ({@link TICK_DELIVERY_RULE}), because a tick is injected locally and a report
+ * written as end-of-turn text on such a turn reaches nobody. An operator's own
+ * `message` replaces both, and is re-read per tick for the same reason.
  *
  * The extension is inert unless `<cwd>/.conductor-tick.json` exists, so shipping
  * it inside `omp-conductor` costs an ordinary session nothing.
@@ -36,7 +36,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { findProject, loadConfig } from "./config.ts";
-import { isPaused } from "./daemon.ts";
 import { DEFAULT_REPORT_SCOPE, type ReportScope } from "./types.ts";
 
 /** The activation file. Absent means "this is not an orchestrator session". */
@@ -146,13 +145,20 @@ export type TickConfigResult =
  * The prompt when the config names none. The timestamp is what makes two
  * consecutive ticks distinguishable in the session log.
  *
+ * "Re-read … from disk" is an order, not colour. A 24/7 session holds a copy of
+ * the brief from its own start (or its last compaction), and a tick that merely
+ * says "run your loop" was observed acting on that cached copy first — which
+ * means an operator's amendment, or a dated standing task added between ticks,
+ * may never bind. The whole point of a file the operator can edit is that the
+ * next tick obeys the file, not the memory of it.
+ *
  * Deliberately silent about reporting volume: that clause is
  * {@link TICK_SCOPE_CONSTRAINTS}, appended per tick from the configured scope.
  * A second spelling of it here would contradict the first inside one prompt the
  * moment a fleet chose `escalations`.
  */
-export function defaultTickMessage(now: Date): string {
-  return `Tick ${now.toISOString()}: run your standing loop from ORCHESTRATOR.md now.`;
+export function defaultTickMessage(now: Date, briefPath = "ORCHESTRATOR.md"): string {
+  return `Tick ${now.toISOString()}: re-read ${briefPath} from disk, then run your standing loop from it.`;
 }
 
 /**
@@ -174,21 +180,49 @@ export const TICK_SCOPE_CONSTRAINTS: { readonly [K in ReportScope]: string } = {
 };
 
 /**
- * The scope this tick carries, and — when it had to fall back — why.
+ * The delivery clause, appended to every default tick prompt.
+ *
+ * End-of-turn text streams to the operator's Telegram only on a turn that
+ * *began* as an inbound Telegram message. A heartbeat tick is injected locally,
+ * so it is never such a turn, and a session that believes otherwise reports
+ * into a void: on 2026-08-06 the fleet this extension runs produced a release
+ * report and two tier-2 escalations as end-of-turn text, and not one of the
+ * three reached anybody. What makes a report real is a tool call the session
+ * watched succeed, so the prompt says so on every tick rather than trusting a
+ * brief that can drift, be edited, or be compacted away.
+ */
+export const TICK_DELIVERY_RULE =
+  "This tick was injected locally, not sent from Telegram, so your end-of-turn text does NOT reach your operator. Deliver anything reportable this turn by calling the telegram_send tool and confirming success; never claim a report was sent otherwise.";
+
+/**
+ * The scope this tick carries, where the brief actually lives, and — when the
+ * config could not answer — why.
  *
  * Read on every tick rather than cached at session start, for the reason the
  * channel gate is: the operator re-runs `/conductor setup` while this session
  * lives, and a heartbeat holding a startup snapshot would keep injecting the
  * old contract until somebody restarted it.
  *
- * Every fault collapses to {@link DEFAULT_REPORT_SCOPE}: no config written yet,
- * an unreadable or invalid one, or several projects with none named — the same
- * ambiguity `findProject` refuses to guess through for `status`. Stopping the
- * heartbeat over a reporting preference would be the worse trade.
+ * `briefPath` exists because the prompt orders a re-read, and an order must
+ * name a file that is really there: the brief lives at
+ * `<workspaceRoot>/ORCHESTRATOR.md`, not in the session cwd — the cwd usually
+ * holds only an `AGENTS.md` symlink to it. The name is spelled here rather than
+ * imported from setup.ts, whose import graph drags the session SDK into an
+ * extension that must stay cheap to load.
+ *
+ * Every fault collapses to {@link DEFAULT_REPORT_SCOPE} and a pathless prompt:
+ * no config written yet, an unreadable or invalid one, or several projects with
+ * none named — the same ambiguity `findProject` refuses to guess through for
+ * `status`. Stopping the heartbeat over either preference would be the worse
+ * trade.
  */
-export function resolveTickScope(): { scope: ReportScope; fallback?: string } {
+export function resolveTickScope(): { scope: ReportScope; briefPath?: string; fallback?: string } {
   try {
-    return { scope: findProject(loadConfig()).reporting?.scope ?? DEFAULT_REPORT_SCOPE };
+    const project = findProject(loadConfig());
+    return {
+      scope: project.reporting?.scope ?? DEFAULT_REPORT_SCOPE,
+      briefPath: join(project.workspaceRoot, "ORCHESTRATOR.md"),
+    };
   } catch (err) {
     return { scope: DEFAULT_REPORT_SCOPE, fallback: err instanceof Error ? err.message : String(err) };
   }
@@ -276,8 +310,18 @@ export function readTickConfig(cwd: string): TickConfigResult {
 /**
  * Whether this tick sends, and why — the whole decision, with no clock, no
  * filesystem and no session in it. The interesting part of a heartbeat is the
- * precedence between "paused", "not armed", "channel down" and "already
- * pending", and that is worth being able to test without a session at all.
+ * precedence between "not armed", "channel down" and "already pending", and
+ * that is worth being able to test without a session at all.
+ *
+ * The pause sentinel is deliberately NOT consulted. `pause` is the dispatch
+ * daemon's flag — "stop claiming; in-flight work finishes" — and this heartbeat
+ * drives a different brain: the supervising session whose duties (groom the
+ * queue, drain escalations, report) are exactly the ones that stay useful while
+ * dispatch is stopped. Honouring it here shipped once, when the tick-driven
+ * session WAS the dispatcher; the day dispatch moved into the daemon, one flag
+ * silencing both brains became a starvation bug: a paused fleet's orchestrator
+ * could neither groom nor even say it was paused. The operator's lever for this
+ * session is the arm marker — `disarm` stops ticks, and only the operator arms.
  *
  * `armed` and `channelOk` are the *satisfied* gates, not the files behind them:
  * a config with no `armedFile` passes the first, and one with no `accessFile`
@@ -286,7 +330,6 @@ export function readTickConfig(cwd: string): TickConfigResult {
  * channel gate means "this session is not the fleet", not "the check is off".
  */
 export function tickDecision(input: {
-  paused: boolean;
   armed: boolean;
   channelOk: boolean;
   hasPending: boolean;
@@ -294,7 +337,6 @@ export function tickDecision(input: {
   send: boolean;
   reason: string;
 } {
-  if (input.paused) return { send: false, reason: "paused" };
   if (!input.armed) return { send: false, reason: "not armed" };
   if (!input.channelOk) return { send: false, reason: "escalation channel down" };
   if (input.hasPending) return { send: false, reason: "tick already pending" };
@@ -331,9 +373,30 @@ function channelIsUp(path: string): boolean {
 }
 
 /**
- * One tick: gather the four facts, ask `tickDecision`, log the reason either
- * way. Skips are deliberately silent in the UI — a paused fleet would otherwise
- * emit a notification every interval, forever.
+ * The operator's own prompt for this tick, re-read from the session cwd rather
+ * than taken from the startup snapshot — for the reason {@link resolveTickScope}
+ * and the channel gate re-read: the operator of a 24/7 session reconfigures it
+ * out-of-band, and a heartbeat holding a startup copy would keep injecting last
+ * week's prompt until somebody restarted the session.
+ *
+ * A re-read that succeeds owns the answer, "no `message` key any more" included:
+ * deleting the override hands the prompt back to the shipped default. A re-read
+ * that fails keeps the startup value — a mid-edit truncation, a file moved away
+ * or a fault the validator collects must not stop the heartbeat, and must not
+ * silently swap the operator's prompt for ours over a transient bad read.
+ *
+ * `intervalSeconds` is deliberately *not* re-read here: rescheduling a live
+ * managed timer is a different change, so a period edit still needs a restart.
+ */
+function currentMessage(cwd: string, startup: TickConfig): string | undefined {
+  const reread = readTickConfig(cwd);
+  return reread.kind === "ok" ? reread.config.message : startup.message;
+}
+
+/**
+ * One tick: gather the three facts, ask `tickDecision`, log the reason either
+ * way. Skips are deliberately silent in the UI — a disarmed fleet would
+ * otherwise emit a notification every interval, forever.
  *
  * `session` holds the only thing one tick remembers for the next: whether the
  * scope fallback has been logged. Without it, a host with no conductor config
@@ -342,7 +405,6 @@ function channelIsUp(path: string): boolean {
  */
 function tick(pi: TickApi, ctx: TickContext, config: TickConfig, session: { scopeFallbackLogged: boolean }): void {
   const decision = tickDecision({
-    paused: isPaused(),
     armed: config.armedFile === undefined || existsSync(config.armedFile),
     channelOk: config.accessFile === undefined || channelIsUp(config.accessFile),
     hasPending: ctx.hasPendingMessages(),
@@ -353,16 +415,17 @@ function tick(pi: TickApi, ctx: TickContext, config: TickConfig, session: { scop
     return;
   }
 
-  // A configured message owns the whole contract, reporting clause included: an
-  // operator who wrote their own prompt did not ask for ours appended to it.
-  let content = config.message;
+  // A configured message owns the whole contract, reporting and delivery clauses
+  // included: an operator who wrote their own prompt did not ask for ours
+  // appended to it.
+  let content = currentMessage(ctx.cwd, config);
   if (content === undefined) {
     const scope = resolveTickScope();
     if (scope.fallback !== undefined && !session.scopeFallbackLogged) {
       session.scopeFallbackLogged = true;
       pi.logger.info(`[omp-conductor] tick reporting scope: using ${DEFAULT_REPORT_SCOPE} — ${scope.fallback}`);
     }
-    content = `${defaultTickMessage(new Date())}\n${TICK_SCOPE_CONSTRAINTS[scope.scope]}`;
+    content = `${defaultTickMessage(new Date(), scope.briefPath)}\n${TICK_SCOPE_CONSTRAINTS[scope.scope]}\n${TICK_DELIVERY_RULE}`;
   }
 
   pi.sendMessage(

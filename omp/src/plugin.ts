@@ -43,6 +43,7 @@ import {
   DEFAULT_REPORT_SCOPE,
   type Caps,
   type ConductorConfig,
+  type OrchestratorMode,
   type ProjectConfig,
   type ReportScope,
 } from "./types.ts";
@@ -240,6 +241,53 @@ async function askReportScope(ctx: CommandContext, current: ReportScope): Promis
 }
 
 /**
+ * Who merges and who releases. Two confirms rather than one four-way list:
+ * these are independent grants — delegating merges is routine, delegating
+ * releases is not — and a menu of four combinations frames them as equally
+ * ordinary choices, which is exactly the framing a release grant must not get.
+ *
+ * Neither confirm can start on "yes", so a re-run that Enters through the
+ * wizard revokes rather than renews. That is the safe direction, and the
+ * current grant is named in the question so the revoke is never a surprise.
+ */
+async function askAuthority(
+  ctx: CommandContext,
+  prior: ProjectConfig["authority"],
+): Promise<ProjectConfig["authority"]> {
+  const merge = await ctx.ui.confirm(
+    "Merge authority",
+    "Delegate PR merging to the orchestrator session? It would land green PRs one at a time, each " +
+      "re-checked against the base branch first. Default: humans merge" +
+      `${prior.merge === "orchestrator" ? " — currently delegated, answer no to take it back" : ""}.`,
+  );
+  const release = await ctx.ui.confirm(
+    "Release authority",
+    "Delegate release cutting to the orchestrator session? It would tag, pin and publish by the " +
+      "procedure you write into its brief — and its brief forbids cutting one before you have. " +
+      "Default: humans release" +
+      `${prior.release === "orchestrator" ? " — currently delegated, answer no to take it back" : ""}.`,
+  );
+  return { merge: merge ? "orchestrator" : "human", release: release ? "orchestrator" : "human" };
+}
+
+/**
+ * Where the session that triages escalations lives. Phrased as a fact about the
+ * host rather than a preference, because that is what it is: answering yes when
+ * no such session exists leaves tier-1 escalations sitting in issue comments
+ * that nobody drains.
+ */
+async function askOrchestratorMode(ctx: CommandContext, prior: OrchestratorMode): Promise<OrchestratorMode> {
+  const external = await ctx.ui.confirm(
+    "Orchestrator session",
+    "Do you already run your own orchestrator session for this project — a visible TUI session, say? " +
+      "Then the daemon starts none of its own, and posts tier-1 escalations as issue comments for yours " +
+      "to drain. Default: no, the daemon runs one" +
+      `${prior === "external" ? " — currently external" : ""}.`,
+  );
+  return external ? "external" : "embedded";
+}
+
+/**
  * Whether to render the operator's own brief, and — separately — whether an
  * existing one may be replaced. Two questions on purpose: that file is where a
  * fleet's release and reporting policy ends up, so it is never overwritten by
@@ -382,6 +430,11 @@ async function collectAnswers(
     );
   }
 
+  // Straight after the caps, and for the same reason they sit together: these
+  // are the two questions that decide what an unattended fleet may do without
+  // asking anybody.
+  const authority = await askAuthority(ctx, prior?.authority ?? SETUP_DEFAULTS.authority);
+
   // Outside the caps block: a model is not a ceiling, and an operator who left
   // the caps alone may still want workers on a cheaper model.
   const answeredModel = await ask(
@@ -417,6 +470,11 @@ async function collectAnswers(
     "Also comment on the issue when a run escalates? Recommended: a chat message you miss is a run nobody sees.",
   );
 
+  const orchestratorMode = await askOrchestratorMode(
+    ctx,
+    prior?.escalation.orchestrator ?? SETUP_DEFAULTS.orchestratorMode,
+  );
+
   const reportScope = await askReportScope(ctx, prior?.reporting?.scope ?? DEFAULT_REPORT_SCOPE);
 
   const answers: SetupAnswers = {
@@ -428,6 +486,8 @@ async function collectAnswers(
     targetRepos,
     caps,
     fallbackToIssueComment,
+    authority,
+    orchestratorMode,
     reportScope,
     // Asked last, and asked with the real path in the question — which needs the
     // rest of the answers to derive, so the decision is folded in below.
