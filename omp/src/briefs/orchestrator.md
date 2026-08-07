@@ -66,14 +66,28 @@ by design — it is the guard that stops the next tick double-dispatching — bu
 nothing removes it, so a dead worker's issue sits "in progress" forever, occupying
 a slot that no longer exists. Compare the in-progress labels against the active
 runs `omp-conductor status` just showed you: **an in-progress issue with no
-matching active run is an orphan.**
+matching active run is unattended — nobody is working under that label, and only
+you can say why.**
 
-For an orphan, inspect what the dead worker left before touching the label. Read
+For each, inspect what is actually there before touching the label. Read
 the issue itself (`gh issue view <n> --json labels` — the label-filtered *list*
 reads GitHub's eventually-consistent search index and lags label writes in both
 directions), then the worktree (`git status --porcelain`, `git log
-origin/main..HEAD`) and any PR. Four cases, checked in this order:
+origin/main..HEAD`) and any PR. Not every one of these is a dead worker: the
+conductor settles a green run's row once its PR resolves, so a resolved PR whose
+issue nobody relabelled looks identical to an orphan from the outside. Six cases,
+checked in this order:
 
+- **A merged PR.** Nothing died — the work landed and the row already says
+  `merged`. Never release the label: the open-PR guard only objects to an *open*
+  PR, so a re-claim would re-implement a PR that is already on the base branch.
+  Close the issue if the merge satisfied it (a merge with no closing keyword
+  leaves it open), take the queue label off, and remove the in-progress label last.
+- **A PR closed without merging.** A human read the work and said no; the row says
+  `failed`. Read the rejection before you touch anything — most of the time a
+  review comment is a spec change. Fold what it says into the issue, then release
+  the label so the next tick can attempt it again; the attempt counter still bounds
+  it. If the answer was "this should not be built", take it off the queue instead.
 - **An open PR that is green.** That worker finished; it just never got to report.
   This is the "already done" case above — handle it exactly the same way. Never
   release-and-re-claim it — a fresh worker would duplicate a finished run.

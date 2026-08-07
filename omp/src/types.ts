@@ -181,6 +181,15 @@ export interface ReadyIssue {
 }
 
 /**
+ * How a pull request ended, in tracker-agnostic terms. Lowercase because the
+ * loop's vocabulary is lowercase; mapping GitHub's `MERGED`/`CLOSED`/`OPEN` onto
+ * it is the adapter's job.
+ *
+ * `closed` is closed *without* merging — a human looked at the work and said no.
+ */
+export type PrState = "merged" | "closed" | "open";
+
+/**
  * Deliberately narrow so a Gitea or local-file tracker can drop in later.
  * Nothing here is GitHub-shaped; the GitHub adapter owns `gh` entirely.
  */
@@ -205,6 +214,19 @@ export interface Tracker {
    * only party that remembers across all of those.
    */
   openCloserFor(issue: number): Promise<string | undefined>;
+  /**
+   * The state of one specific pull request, or undefined when this adapter
+   * could not tell — a network failure, a deleted PR, a URL it cannot parse.
+   * Undefined never means "no".
+   *
+   * Deliberately separate from {@link Tracker.openCloserFor}, which answers a
+   * different question: that one asks "should this candidate be admitted", and
+   * answers undefined for merged, closed-unmerged, no PR at all and a deleted
+   * PR alike, because admission treats all four the same. This one asks "did
+   * *this* run's PR land", where those answers are opposites. Collapsing them
+   * is how a PR a human rejected gets recorded as merged.
+   */
+  prState(url: string): Promise<PrState | undefined>;
 }
 
 /**
@@ -216,6 +238,8 @@ export type RunState =
   | "claimed"
   | "running"
   | "pushed-green"
+  /** Its PR landed. Written by the tick's settle sweep, never by a worker: only
+   *  the tracker knows, and it knows minutes to days after the run ended. */
   | "merged"
   | "blocked"
   | "failed"

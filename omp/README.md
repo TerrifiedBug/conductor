@@ -312,25 +312,32 @@ Per tick, for the daemon's project:
 1. **Paused?** If the pause sentinel exists, the tick claims nothing and returns.
    Pause is checked first, so `omp-conductor pause` takes effect on the next tick
    without signalling the process.
-2. **List the queue.** Open issues in `tracker.repo` labelled `queueLabel`.
-3. **Filter and route.** An issue is eligible only if it carries the queue label
+2. **Settle the green PRs.** For every run in `pushed-green`, ask the tracker
+   what became of its PR. Merged → the row becomes `merged`; closed without
+   merging → `failed`, with the PR named in the row's `lastError`. Still open, or
+   an answer that could not be obtained at all → the row is left exactly as it
+   is. Bounded by the number of green PRs awaiting a merge, which is a handful by
+   construction. This runs above admission so a row settled here frees its issue
+   in the same tick. See [what settles a green PR](#what-settles-a-green-pr).
+3. **List the queue.** Open issues in `tracker.repo` labelled `queueLabel`.
+4. **Filter and route.** An issue is eligible only if it carries the queue label
    and none of the three state labels (`inProgress`, `blocked`, `failed`). Eligible
    issues are partitioned into routable and unroutable.
-4. **Escalate the unroutable** at Tier 1, quoting the repo labels actually seen and
+5. **Escalate the unroutable** at Tier 1, quoting the repo labels actually seen and
    the configured repo names. These are never dispatched.
-5. **Check spend.** If spend since local midnight has reached `dailySpendUsd`, the
+6. **Check spend.** If spend since local midnight has reached `dailySpendUsd`, the
    daemon **pauses itself**, pages at Tier 2, and returns.
-6. **Check capacity.** `maxConcurrentWorkers` minus *live* workers (runs in
+7. **Check capacity.** `maxConcurrentWorkers` minus *live* workers (runs in
    `claimed` or `running`) gives the free slots. A green PR awaiting a human
    merge occupies its issue but not a slot: its worker is finished, and counting
    it would let two green PRs stop the fleet. If no slot is free, the tick logs
    and returns.
-7. **Admit issues** up to the free slots, skipping any issue that already has
+8. **Admit issues** up to the free slots, skipping any issue that already has
    an active run — including a green PR, so a second attempt can never land on a
    live PR. An issue that has used `maxAttemptsPerIssue` escalates at Tier 1
    instead of being admitted.
-8. **Ask the tracker whether the work already exists.** For each candidate that
-   survived step 7 — so at most one API call per free slot, never one per queued
+9. **Ask the tracker whether the work already exists.** For each candidate that
+   survived step 8 — so at most one API call per free slot, never one per queued
    issue — the daemon asks whether an **open** PR already closes the issue. If one
    does, the issue is skipped with its PR named in the log. Drafts count: a draft
    PR's branch still holds the only copy of the work. This is the guard the store
@@ -340,7 +347,7 @@ Per tick, for the daemon's project:
    retried next tick: the cost of holding is five minutes, the cost of admitting
    on an unknown is a burned attempt and a duplicate PR. Only that candidate is
    held, so a flaky API cannot stall the rest of the queue.
-9. **Dispatch** the admitted issues concurrently.
+10. **Dispatch** the admitted issues concurrently.
 
 Then, per admitted issue:
 
@@ -367,6 +374,9 @@ Then, per admitted issue:
    | `blocked` | swapped to `agent:blocked` | removed | Tier 1 |
    | `failed` / `killed` | swapped to `agent:failed` | dirty tree committed to the branch, then **kept** as evidence | Tier 1 |
    | unexpected error | swapped to `agent:failed` | same | Tier 1 |
+
+   `pushed-green` is not the end of the row: a later tick settles it once the PR
+   resolves. See [what settles a green PR](#what-settles-a-green-pr).
 
    Label swaps add the new label before removing the old one: the reverse order
    leaves a window in which the issue carries no state label at all, which is
@@ -404,6 +414,34 @@ the run's branch in the mirror, which a retry deliberately reattaches), and a
 clean orphan has its label released so the next tick re-claims it. Orphaned
 attempts still count toward `maxAttemptsPerIssue`, so a crash loop escalates
 instead of redispatching forever.
+
+### What settles a green PR
+
+`pushed-green` means the worker finished, pushed, and watched the checks go green.
+What happens next is a human's decision, taken minutes to days later and never
+announced to the daemon — so every tick asks the tracker about every green PR it
+is still holding, and settles the ones that resolved:
+
+| PR | Row becomes | Why |
+| --- | --- | --- |
+| merged | `merged` | The work landed. This is the state `merged` was reserved for. |
+| closed without merging | `failed`, with the PR in `lastError` | A human read the work and said no. Leaving it `pushed-green` strands the issue forever behind a PR nobody will merge, and calling it `merged` is a lie about code that is not on the base branch. `failed` is true, and it releases the issue so a re-queue can be attempted again. |
+| still open | unchanged | The normal steady state. Its issue must stay occupied, or a second attempt lands on the live PR. |
+| could not be determined | unchanged | A flaky network, a revoked token, a deleted PR. An unknown answer never settles a row; the next tick asks again for free. |
+
+The attempt counter is untouched either way, because both were real attempts. Run
+rows are the only thing that changes: a merge normally closes the issue, and a
+human who closed a PR is already looking at it, so what an issue's labels should
+say next is the orchestrator's drain-duty judgement — the same division of labour
+as a restart, above. One unreachable PR costs its own row and nothing else; the
+rest of the sweep still settles.
+
+Until this existed, nothing ever revisited a `pushed-green` row: the startup
+reconciler only settles rows that held a process, and `merged` went unwritten. On
+2026-08-07 the reference fleet reported three active runs whose PRs were all
+merged and whose issues were all closed, through two daemon restarts — and because
+the active set *is* the busy set, those three issues were permanently unclaimable.
+A status page that has stopped being evidence is worse than no status page.
 
 ### Branch names
 
@@ -869,6 +907,11 @@ curl -s localhost:8787/healthz
 Any other path or method returns `404`. Note that `ok` reports only that the
 process is serving. It does not report that the fleet is doing work: read
 `paused` to tell those apart.
+
+`activeRuns` counts occupied issues — live workers plus green PRs still awaiting a
+merge — and each of those is settled by the tick once its PR resolves, so the
+number goes back down on its own. A count that only ever grows is the bug this
+used to have: read [what settles a green PR](#what-settles-a-green-pr).
 
 ## What a worker may and may not do
 
