@@ -20,8 +20,11 @@ import {
   livingDaemon,
   readRecord,
   runtimeDir,
+  setSystemctlForTest,
   startDaemon,
   stopDaemon,
+  SYSTEMD_UNIT,
+  systemdMainPid,
   writeRecord,
 } from "./lifecycle.ts";
 
@@ -40,6 +43,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  setSystemctlForTest(undefined);
   if (previousDir === undefined) delete process.env[ENV_KEY];
   else process.env[ENV_KEY] = previousDir;
   rmSync(dir, { recursive: true, force: true });
@@ -144,12 +148,114 @@ test("startDaemon refuses to double-start against a live pid", async () => {
 
 test("stopDaemon reports not-running and clears a stale record", async () => {
   writeRecord(record({ pid: DEAD_PID }));
-  expect(await stopDaemon()).toBe("not-running");
+  // No unit on this host (or the stub says so) — bare not-running.
+  setSystemctlForTest(() => ({ ok: false, stdout: "", stderr: "unit not found" }));
+  expect(await stopDaemon()).toEqual({ kind: "not-running" });
   expect(existsSync(recordFile())).toBe(false);
 });
 
 test("stopDaemon reports not-running when there was never a pidfile", async () => {
-  expect(await stopDaemon()).toBe("not-running");
+  setSystemctlForTest(() => ({ ok: false, stdout: "", stderr: "unit not found" }));
+  expect(await stopDaemon()).toEqual({ kind: "not-running" });
+});
+
+test("stopDaemon uses systemctl when the unit MainPID matches the live daemon", async () => {
+  const calls: string[][] = [];
+  // A child we own and can kill if the signal path is wrongly taken.
+  const child = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
+  const pid = child.pid;
+  try {
+    writeRecord(record({ pid }));
+    setSystemctlForTest((args) => {
+      calls.push(args);
+      if (args[0] === "show") {
+        return { ok: true, stdout: `${pid}\nactive\n`, stderr: "" };
+      }
+      if (args[0] === "stop" && args[1] === SYSTEMD_UNIT) {
+        // Mimic systemd reaping the MainPID.
+        child.kill("SIGTERM");
+        return { ok: true, stdout: "", stderr: "" };
+      }
+      return { ok: false, stdout: "", stderr: `unexpected ${args.join(" ")}` };
+    });
+
+    expect(await stopDaemon()).toEqual({ kind: "stopped", pid, via: "systemctl" });
+    expect(calls.some((a) => a[0] === "stop" && a[1] === SYSTEMD_UNIT)).toBe(true);
+    expect(existsSync(recordFile())).toBe(false);
+    expect(isAlive(pid)).toBe(false);
+  } finally {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+    await child.exited;
+  }
+});
+
+test("stopDaemon falls back to SIGTERM when the unit MainPID is someone else", async () => {
+  const calls: string[][] = [];
+  const child = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
+  const pid = child.pid;
+  try {
+    writeRecord(record({ pid }));
+    setSystemctlForTest((args) => {
+      calls.push(args);
+      if (args[0] === "show") {
+        // Unit is up, but its MainPID is not our daemon — a neighbour.
+        return { ok: true, stdout: `${DEAD_PID}\nactive\n`, stderr: "" };
+      }
+      // stop must never be requested against a foreign MainPID.
+      return { ok: false, stdout: "", stderr: `unexpected ${args.join(" ")}` };
+    });
+
+    expect(await stopDaemon()).toEqual({ kind: "stopped", pid, via: "signal" });
+    expect(calls.every((a) => a[0] !== "stop")).toBe(true);
+    expect(existsSync(recordFile())).toBe(false);
+    expect(isAlive(pid)).toBe(false);
+  } finally {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+    await child.exited;
+  }
+});
+
+test("stopDaemon stops a unit-owned daemon even with no pidfile", async () => {
+  const child = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
+  const pid = child.pid;
+  try {
+    setSystemctlForTest((args) => {
+      if (args[0] === "show") return { ok: true, stdout: `${pid}\nactive\n`, stderr: "" };
+      if (args[0] === "stop") {
+        child.kill("SIGTERM");
+        return { ok: true, stdout: "", stderr: "" };
+      }
+      return { ok: false, stdout: "", stderr: "" };
+    });
+
+    expect(await stopDaemon()).toEqual({ kind: "stopped", pid, via: "systemctl" });
+    expect(isAlive(pid)).toBe(false);
+  } finally {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+    await child.exited;
+  }
+});
+
+test("systemdMainPid returns undefined when the unit is inactive", () => {
+  setSystemctlForTest(() => ({ ok: true, stdout: "0\ninactive\n", stderr: "" }));
+  expect(systemdMainPid()).toBeUndefined();
+});
+
+test("systemdMainPid returns the MainPID of an active unit", () => {
+  setSystemctlForTest(() => ({ ok: true, stdout: "4242\nactive\n", stderr: "" }));
+  expect(systemdMainPid()).toBe(4242);
 });
 
 test("healthCheck resolves ok:false against a closed port instead of rejecting", async () => {
