@@ -328,23 +328,49 @@ export function refreshComposedBrief(opts: {
 export interface RetrofitProposal {
   /** Byte offset in the live text where the banner block should be inserted. */
   cut: number;
-  /** Heading that starts the owned half, when one was found. */
-  atHeading?: string;
-  /** Headings classified as owned vs floor-like for the operator to review. */
+  /** Heading that starts the owned half. */
+  atHeading: string;
+  /** Owned-topic headings (Releases / Project context / Reporting / Amendments). */
   ownedHeadings: string[];
-  floorHeadings: string[];
+  /** Non-owned headings that appear *before* the cut — stay on the floor side. */
+  floorAbove: string[];
   /** Live text with the compose banner inserted at `cut`. */
   retrofitted: string;
 }
 
 /**
- * Propose inserting the YOURS TO EDIT banner before the first owned-topic
- * heading. If none exist, refuses (returns undefined) rather than guessing EOF.
+ * Why a retrofit cannot be applied automatically.
+ *
+ * `interleaved` means a floor-like heading (Duty, Learning loop, Hard boundaries,
+ * …) appears *below* the first owned-topic cut. Applying the banner there would
+ * push that floor section into POLICY.md on migrate — silent ownership theft.
  */
-export function proposeRetrofit(live: string): RetrofitProposal | undefined {
+export type RetrofitRefusal = {
+  kind: "interleaved";
+  atHeading: string;
+  ownedHeadings: string[];
+  floorAbove: string[];
+  floorBelow: string[];
+};
+
+export type RetrofitResult =
+  | { kind: "ok"; proposal: RetrofitProposal }
+  | { kind: "no-cut" }
+  | RetrofitRefusal;
+
+/**
+ * Propose inserting the YOURS TO EDIT banner before the first owned-topic
+ * heading.
+ *
+ * Headings are classified by **position relative to that cut**, not globally:
+ * floor-like headings above the cut stay above; any floor-like heading below
+ * the cut is a refuse — the operator must reorder or hand-classify before apply.
+ */
+export function proposeRetrofit(live: string): RetrofitResult {
   const lines = live.split("\n");
   const ownedHeadings: string[] = [];
-  const floorHeadings: string[] = [];
+  const floorAbove: string[] = [];
+  const floorBelow: string[] = [];
   let cutLine = -1;
   let atHeading: string | undefined;
   for (let i = 0; i < lines.length; i++) {
@@ -357,11 +383,25 @@ export function proposeRetrofit(live: string): RetrofitProposal | undefined {
         cutLine = i;
         atHeading = heading;
       }
-    } else {
-      floorHeadings.push(heading);
+      continue;
     }
+    // Position relative to the (eventual) cut — headings before any owned topic
+    // are tentatively "above"; once the cut is known, later floor headings are
+    // "below" and block apply.
+    if (cutLine < 0) floorAbove.push(heading);
+    else floorBelow.push(heading);
   }
-  if (cutLine < 0 || atHeading === undefined) return undefined;
+  if (cutLine < 0 || atHeading === undefined) return { kind: "no-cut" };
+
+  if (floorBelow.length > 0) {
+    return {
+      kind: "interleaved",
+      atHeading,
+      ownedHeadings,
+      floorAbove,
+      floorBelow,
+    };
+  }
 
   // Byte offset: sum of prior lines + newlines.
   let cut = 0;
@@ -370,7 +410,10 @@ export function proposeRetrofit(live: string): RetrofitProposal | undefined {
     cut += (line?.length ?? 0) + 1;
   }
   const retrofitted = `${live.slice(0, cut)}${COMPOSE_BANNER}\n\n${live.slice(cut)}`;
-  return { cut, atHeading, ownedHeadings, floorHeadings, retrofitted };
+  return {
+    kind: "ok",
+    proposal: { cut, atHeading, ownedHeadings, floorAbove, retrofitted },
+  };
 }
 
 /** Insert the banner into a hand-written brief (with backup). */
@@ -455,11 +498,35 @@ export function formatRetrofitProposal(path: string, proposal: RetrofitProposal)
     "",
     `Owned-topic headings (${proposal.ownedHeadings.length}):`,
     ...proposal.ownedHeadings.map((h) => `  - ${h}`),
-    `Other ## headings left above the banner (${proposal.floorHeadings.length}):`,
-    ...proposal.floorHeadings.map((h) => `  - ${h}`),
+    `Floor-like headings above the banner (${proposal.floorAbove.length}):`,
+    ...(proposal.floorAbove.length === 0
+      ? ["  (none)"]
+      : proposal.floorAbove.map((h) => `  - ${h}`)),
     "",
     "Apply:  omp-conductor brief-upgrade --retrofit --apply",
     "Then:   omp-conductor brief-upgrade --migrate",
+  ].join("\n");
+}
+
+export function formatRetrofitRefusal(path: string, refusal: RetrofitRefusal): string {
+  return [
+    `retrofit ${path}`,
+    "",
+    `Refused: floor-like heading(s) appear below the proposed cut at ## ${refusal.atHeading}.`,
+    "Applying the banner here would put those sections into POLICY.md on migrate.",
+    "",
+    `Owned-topic headings (${refusal.ownedHeadings.length}):`,
+    ...refusal.ownedHeadings.map((h) => `  - ${h}`),
+    `Floor-like headings above the cut (${refusal.floorAbove.length}):`,
+    ...(refusal.floorAbove.length === 0
+      ? ["  (none)"]
+      : refusal.floorAbove.map((h) => `  - ${h}`)),
+    `Floor-like headings BELOW the cut — must move or reclassify (${refusal.floorBelow.length}):`,
+    ...refusal.floorBelow.map((h) => `  - ${h}`),
+    "",
+    "Reorder so all Duties / Hard boundaries / Learning loop sit above Releases,",
+    "or hand-insert the YOURS TO EDIT banner at the line you intend, then migrate.",
+    "Nothing was written.",
   ].join("\n");
 }
 

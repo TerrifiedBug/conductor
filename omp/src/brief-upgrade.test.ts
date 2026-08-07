@@ -16,6 +16,7 @@ import {
   composeOrchestrator,
   formatBriefStatus,
   inspectBriefLayout,
+  formatRetrofitRefusal,
   migrateToPolicy,
   missingSections,
   proposeRetrofit,
@@ -251,14 +252,54 @@ test("proposeRetrofit inserts the banner before the first owned heading", () => 
     "daily digest.",
     "",
   ].join("\n");
-  const proposal = proposeRetrofit(live);
-  expect(proposal).toBeDefined();
-  expect(proposal?.atHeading).toBe("Releases");
-  expect(proposal!.retrofitted).toContain("YOURS TO EDIT");
-  expect(proposal!.retrofitted.indexOf("YOURS TO EDIT")).toBeLessThan(
-    proposal!.retrofitted.indexOf("## Releases"),
+  const result = proposeRetrofit(live);
+  expect(result.kind).toBe("ok");
+  if (result.kind !== "ok") return;
+  expect(result.proposal.atHeading).toBe("Releases");
+  expect(result.proposal.floorAbove).toEqual(["Duty 1 — drain"]);
+  expect(result.proposal.retrofitted).toContain("YOURS TO EDIT");
+  expect(result.proposal.retrofitted.indexOf("YOURS TO EDIT")).toBeLessThan(
+    result.proposal.retrofitted.indexOf("## Releases"),
   );
-  expect(proposal!.ownedHeadings).toEqual(["Releases", "Reporting"]);
+  expect(result.proposal.ownedHeadings).toEqual(["Releases", "Reporting"]);
+});
+
+test("proposeRetrofit refuses when a floor-like heading sits below the owned cut", () => {
+  // Interleaved order: Releases starts the owned half, then a Learning loop
+  // (floor protocol) appears below it. Cutting before Releases would push
+  // Learning loop into POLICY.md on migrate — that is ownership theft.
+  const live = [
+    "# Hand written",
+    "",
+    "## Duty 1 — drain",
+    "do the loop.",
+    "",
+    "## Releases",
+    "humans release.",
+    "",
+    "## Learning loop",
+    "amend policy.",
+    "",
+    "## Reporting",
+    "daily digest.",
+    "",
+  ].join("\n");
+  const result = proposeRetrofit(live);
+  expect(result.kind).toBe("interleaved");
+  if (result.kind !== "interleaved") return;
+  expect(result.atHeading).toBe("Releases");
+  expect(result.floorAbove).toEqual(["Duty 1 — drain"]);
+  expect(result.floorBelow).toEqual(["Learning loop"]);
+  expect(result.ownedHeadings).toEqual(["Releases", "Reporting"]);
+  const report = formatRetrofitRefusal("/x/ORCHESTRATOR.md", result);
+  expect(report).toContain("Refused");
+  expect(report).toContain("Learning loop");
+  expect(report).toContain("Nothing was written");
+  expect(report).not.toContain("brief-upgrade --retrofit --apply");
+});
+
+test("proposeRetrofit reports no-cut when no owned-topic heading exists", () => {
+  expect(proposeRetrofit("# Mine\n\n## Duty 1\nloop.\n").kind).toBe("no-cut");
 });
 
 test("refreshComposedBrief rewrites ORCHESTRATOR.md from floor + POLICY.md", () => {

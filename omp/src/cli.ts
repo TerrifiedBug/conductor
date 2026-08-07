@@ -13,6 +13,7 @@ import {
   formatBriefStatus,
   formatMigrateResult,
   formatRetrofitProposal,
+  formatRetrofitRefusal,
   inspectBriefLayout,
   migrateToPolicy,
   proposeRetrofit,
@@ -571,16 +572,20 @@ try {
           process.stderr.write(`omp-conductor: no brief at ${path}.\n`);
           process.exit(1);
         }
-        const proposal = proposeRetrofit(live);
-        if (proposal === undefined) {
+        const result = proposeRetrofit(live);
+        if (result.kind === "no-cut") {
           process.stdout.write(
             `brief ${path}\n\nNo Releases / Project context / Reporting / Amendments heading found — cannot classify a cut.\n`,
           );
           process.exit(1);
         }
-        process.stdout.write(`${formatRetrofitProposal(path, proposal)}\n`);
+        if (result.kind === "interleaved") {
+          process.stdout.write(`${formatRetrofitRefusal(path, result)}\n`);
+          process.exit(1);
+        }
+        process.stdout.write(`${formatRetrofitProposal(path, result.proposal)}\n`);
         if (argv.includes("--apply")) {
-          const backup = applyRetrofit(path, proposal);
+          const backup = applyRetrofit(path, result.proposal);
           process.stdout.write(`\napplied retrofit — previous brief kept at ${backup}\n`);
         }
         break;
