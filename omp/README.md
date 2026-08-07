@@ -375,6 +375,9 @@ message on stderr) on every uncertainty:
 - the configured agent name is not unique, or the claimed pane runs some other agent
 - `pane process-info` fails, or the claim is live `omp` but names no recognizable
   omp foreground PID — "cannot see it" is never reported as "it is stopped"
+- a signal cannot be delivered, or liveness cannot be probed — only `ESRCH`
+  ("no such process") proves death, so `EPERM` reads as "exists, not ours",
+  never as "stopped"
 - the process is still alive after `SIGTERM` then `SIGKILL`
 
 The pin is written to the pane's own directory (the one holding

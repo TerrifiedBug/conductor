@@ -9,16 +9,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   armTicks,
+  classifyKillError,
   clearPaneHalt,
+  deliverSignal,
   disarmTicks,
   fleetLayers,
   formatFleetStatus,
   halt,
   haltWithPane,
   hold,
+  type KillFn,
   ompPidsFromProcessInfo,
   PANE_HALT_FILE,
   paneHaltPath,
+  pidLiveness,
   pinPaneHalt,
   releaseHold,
   sessionDirForCwd,
@@ -409,6 +413,88 @@ esac
     child.kill("SIGKILL");
     await child.exited;
   }
+});
+
+test("halt --pane throws when liveness cannot be probed — EPERM is not death", async () => {
+  writeMinimalConfig();
+  writeTick();
+  await expect(
+    haltWithPane(undefined, {
+      listAgents: async () => [{ name: "fleet", paneId: "w1:p1", agent: "omp" }],
+      panePids: async () => [5150],
+      isAlive: () => {
+        // What the real probe now does for EPERM: the process exists, we just
+        // may not signal it. Answering `false` here used to read as "stopped".
+        throw new Error("cannot probe pid 5150 (EPERM) — liveness unknown, not dead");
+      },
+      signalPid: () => true,
+      sleep: async () => {},
+    }),
+  ).rejects.toThrow(/cannot tell whether the conductor agent is still running/);
+  expect(existsSync(paneHaltPath())).toBe(true);
+});
+
+test("halt --pane throws when a signal cannot be delivered", async () => {
+  writeMinimalConfig();
+  writeTick();
+  const attempt = async (signalPid: (pid: number, sig: NodeJS.Signals) => boolean) => {
+    // Clock advances so a regression that drops the refusal fails the
+    // assertion instead of spinning in the liveness loop forever.
+    let clock = 0;
+    return haltWithPane(undefined, {
+      listAgents: async () => [{ name: "fleet", paneId: "w1:p1", agent: "omp" }],
+      panePids: async () => [5150],
+      isAlive: () => true,
+      signalPid,
+      now: () => clock,
+      sleep: async (ms) => {
+        clock += ms;
+      },
+    });
+  };
+
+  await expect(
+    attempt(() => {
+      throw new Error("cannot send SIGTERM to pid 5150 (EPERM)");
+    }),
+  ).rejects.toThrow(/SIGTERM to pid 5150 failed/);
+  // A probe that merely reports non-delivery is the same refusal.
+  await expect(attempt(() => false)).rejects.toThrow(/SIGTERM to pid 5150 was not delivered/);
+  expect(existsSync(paneHaltPath())).toBe(true);
+});
+
+test("kill errors map to gone only on ESRCH", () => {
+  expect(classifyKillError(Object.assign(new Error("x"), { code: "ESRCH" }))).toBe("gone");
+  // EPERM means the process exists and is not ours — the bug this guards.
+  expect(classifyKillError(Object.assign(new Error("x"), { code: "EPERM" }))).toBe("unknown");
+  expect(classifyKillError(Object.assign(new Error("x"), { code: "EINVAL" }))).toBe("unknown");
+  expect(classifyKillError(new Error("no errno"))).toBe("unknown");
+});
+
+test("pidLiveness and deliverSignal refuse an EPERM answer", () => {
+  // The kill syscall is injected: no real process is signalled, so this cannot
+  // page init on a host where pid 1 happens to be ours.
+  const eperm: KillFn = () => {
+    throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+  };
+  const esrch: KillFn = () => {
+    throw Object.assign(new Error("no such process"), { code: "ESRCH" });
+  };
+
+  expect(() => pidLiveness(4242, eperm)).toThrow(/liveness unknown, not dead/);
+  expect(pidLiveness(4242, esrch)).toBe(false);
+  expect(() => deliverSignal(4242, "SIGTERM", eperm)).toThrow(/cannot send SIGTERM to pid 4242/);
+  // Already gone is the outcome we wanted.
+  expect(deliverSignal(4242, "SIGTERM", esrch)).toBe(true);
+});
+
+test("pidLiveness tracks a real process through exit", async () => {
+  const child = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
+  expect(pidLiveness(child.pid)).toBe(true);
+  child.kill("SIGKILL");
+  await child.exited;
+  expect(pidLiveness(child.pid)).toBe(false);
+  expect(deliverSignal(child.pid, "SIGTERM")).toBe(true);
 });
 
 test("disarm removes marker; arm requires inbound user-turn proof", async () => {

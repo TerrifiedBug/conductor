@@ -277,10 +277,59 @@ export interface HerdrAgent {
   sessionPath?: string;
 }
 
+/** The kill syscall, injectable so error mapping is testable without one. */
+export type KillFn = (pid: number, sig: NodeJS.Signals | 0) => void;
+
+const realKill: KillFn = (pid, sig) => {
+  process.kill(pid, sig);
+};
+
+/**
+ * What a failed `kill` proves.
+ *
+ * Only `ESRCH` — "no such process" — proves the process is gone. `EPERM` means
+ * it *exists* and merely is not ours to signal; every other errno is an answer
+ * we cannot read. Collapsing either into "gone" is how a live conductor gets
+ * reported as stopped.
+ */
+export function classifyKillError(err: unknown): "gone" | "unknown" {
+  return (err as NodeJS.ErrnoException | undefined)?.code === "ESRCH" ? "gone" : "unknown";
+}
+
+/** Whether `pid` is still running. Throws when the answer cannot be read. */
+export function pidLiveness(pid: number, kill: KillFn = realKill): boolean {
+  try {
+    kill(pid, 0);
+    return true;
+  } catch (err) {
+    if (classifyKillError(err) === "gone") return false;
+    const code = (err as NodeJS.ErrnoException).code;
+    throw new Error(`cannot probe pid ${pid} (${code ?? String(err)}) — liveness unknown, not dead`);
+  }
+}
+
+/**
+ * Deliver `sig` to `pid`. An already-gone process is success — that is the
+ * outcome we wanted. Every other failure throws: an undelivered signal must
+ * never read as a kill.
+ */
+export function deliverSignal(pid: number, sig: NodeJS.Signals, kill: KillFn = realKill): boolean {
+  try {
+    kill(pid, sig);
+    return true;
+  } catch (err) {
+    if (classifyKillError(err) === "gone") return true;
+    const code = (err as NodeJS.ErrnoException).code;
+    throw new Error(`cannot send ${sig} to pid ${pid} (${code ?? String(err)})`);
+  }
+}
+
 export interface PaneStopDeps {
   herdrBin?: string;
   herdrSession?: string;
+  /** Deliver a signal. Return `false` or throw when delivery is unproven. */
   signalPid?: (pid: number, sig: NodeJS.Signals) => boolean;
+  /** Liveness probe. MUST throw when it cannot tell — never answer `false`. */
   isAlive?: (pid: number) => boolean;
   /** Clock for deterministic deadline tests. */
   now?: () => number;
@@ -316,7 +365,8 @@ export async function haltWithPane(
  * `already-gone`). Any uncertainty **throws**: an unparseable tick config (the
  * agent name is then a guess), herdr unreachable, output we cannot read as an
  * explicit agent list, ambiguous identity, a live omp claim with no recognized
- * PID, or a process that survives SIGKILL. Callers must not treat a thrown
+ * PID, a liveness probe or signal delivery that fails (`EPERM` is "exists but
+ * not ours", never "dead"), or a process that survives SIGKILL. Callers must not treat a thrown
  * error as "maybe stopped".
  */
 export async function stopConductorPane(
@@ -339,26 +389,42 @@ export async function stopConductorPane(
       : DEFAULT_FLEET_AGENT_NAME;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const now = deps.now ?? Date.now;
-  const signalPid =
-    deps.signalPid ??
-    ((pid: number, sig: NodeJS.Signals) => {
+  const signalPid = deps.signalPid ?? deliverSignal;
+  const alive = deps.isAlive ?? pidLiveness;
+  const pinned = "Recovery pin was written";
+
+  /** Any-alive across `pids`; an unreadable probe refuses instead of "dead". */
+  const anyAlive = (pids: number[], stage: string): boolean => {
+    try {
+      return pids.some((pid) => alive(pid));
+    } catch (err) {
+      throw new Error(
+        `halt --pane: cannot tell whether the conductor agent is still running ${stage} ` +
+          `(${err instanceof Error ? err.message : String(err)}) — refusing to report success. ` +
+          `${pinned}; check the pane by hand.`,
+      );
+    }
+  };
+
+  /** Send `sig` to every pid, refusing on any delivery we cannot prove. */
+  const deliver = (pids: number[], sig: NodeJS.Signals): void => {
+    for (const pid of pids) {
+      let delivered: boolean;
       try {
-        process.kill(pid, sig);
-        return true;
+        delivered = signalPid(pid, sig);
       } catch (err) {
-        return (err as NodeJS.ErrnoException).code === "ESRCH";
+        throw new Error(
+          `halt --pane: ${sig} to pid ${pid} failed ` +
+            `(${err instanceof Error ? err.message : String(err)}) — refusing to report success. ${pinned}.`,
+        );
       }
-    });
-  const alive =
-    deps.isAlive ??
-    ((pid: number) => {
-      try {
-        process.kill(pid, 0);
-        return true;
-      } catch {
-        return false;
+      if (!delivered) {
+        throw new Error(
+          `halt --pane: ${sig} to pid ${pid} was not delivered — refusing to report success. ${pinned}.`,
+        );
       }
-    });
+    }
+  };
 
   let agents: HerdrAgent[];
   try {
@@ -410,7 +476,7 @@ export async function stopConductorPane(
     );
   }
 
-  const live = pids.filter((pid) => alive(pid));
+  const live = pids.filter((pid) => anyAlive([pid], `for pane ${claim.paneId}`));
   if (live.length === 0) {
     // Live agent=omp claim but no recognizable omp PID: we cannot prove gone.
     // Treating this as already-gone would exit 0 while the pane may still run.
@@ -420,10 +486,10 @@ export async function stopConductorPane(
     );
   }
 
-  for (const pid of live) signalPid(pid, "SIGTERM");
+  deliver(live, "SIGTERM");
   const softDeadline = now() + 10_000;
   while (now() < softDeadline) {
-    if (!live.some((pid) => alive(pid))) {
+    if (!anyAlive(live, "after SIGTERM")) {
       return {
         stopped: "herdr-agent",
         detail: `SIGTERM omp in agent ${agentName} pane ${claim.paneId} pids ${live.join(",")}`,
@@ -433,10 +499,10 @@ export async function stopConductorPane(
     await sleep(100);
   }
 
-  for (const pid of live) signalPid(pid, "SIGKILL");
+  deliver(live, "SIGKILL");
   const hardDeadline = now() + 2_000;
   while (now() < hardDeadline) {
-    if (!live.some((pid) => alive(pid))) {
+    if (!anyAlive(live, "after SIGKILL")) {
       return {
         stopped: "herdr-agent",
         detail: `SIGKILL omp in agent ${agentName} pane ${claim.paneId} pids ${live.join(",")} after SIGTERM grace`,
@@ -446,7 +512,7 @@ export async function stopConductorPane(
     await sleep(50);
   }
 
-  const survivors = live.filter((pid) => alive(pid));
+  const survivors = live.filter((pid) => anyAlive([pid], "after SIGKILL"));
   throw new Error(
     `halt --pane: agent ${agentName} pane ${claim.paneId} still alive after SIGTERM+SIGKILL ` +
       `(pids ${survivors.join(",")}). Recovery pin was written; kill by hand before trusting a quiet fleet.`,
