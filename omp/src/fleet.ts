@@ -232,19 +232,52 @@ export async function halt(projectName?: string): Promise<HaltResult> {
 }
 
 /**
- * Where `halt --pane` pins recovery off. This must be the pane's own cwd —
- * `herdr-conductor`'s `recover.sh` only reads `$FLEET_CWD/.conductor-pane-halted`,
- * and the tick config lives in that same directory by construction (the
- * heartbeat extension activates on `.conductor-tick.json` in the session cwd).
+ * Where `halt --pane` pins recovery off, or why we cannot say.
  *
- * An *invalid* tick config still names the right directory, so pin beside it
- * rather than in the state dir: the pin has to land somewhere recovery reads
- * before {@link stopConductorPane} refuses over that same invalid config.
+ * `herdr-conductor`'s `recover.sh` reads exactly one path —
+ * `$FLEET_CWD/.conductor-pane-halted`. The only directory this package *knows*
+ * is `FLEET_CWD` is the one holding `.conductor-tick.json`: the heartbeat
+ * extension activates on that file in the session cwd, so the pane's cwd and
+ * the tick config's directory are the same by construction.
+ *
+ * An *invalid* tick config still names that directory, so it resolves. An
+ * *absent* one does not: the state dir is a guess, and a pin written there is
+ * one `recover.sh` never reads — the agent would be respawned seconds after a
+ * "successful" halt.
+ */
+export type ResolvedPaneHalt =
+  | { kind: "ok"; path: string }
+  | { kind: "unresolved"; reason: string };
+
+export function resolvePaneHaltPath(projectName?: string): ResolvedPaneHalt {
+  const tick = resolveTickConfig(projectName);
+  if (tick.kind === "ok" || tick.kind === "invalid") {
+    return { kind: "ok", path: join(tick.cwd, PANE_HALT_FILE) };
+  }
+  return {
+    kind: "unresolved",
+    reason:
+      `no ${TICK_CONFIG_FILE} under ${tickConfigSearchRoots(projectName).join(" or ")} — ` +
+      `the pane's own directory (FLEET_CWD) is unknown, and ${PANE_HALT_FILE} anywhere else ` +
+      `is a file herdr-conductor never reads`,
+  };
+}
+
+/**
+ * {@link resolvePaneHaltPath}, refusing rather than guessing. Used by every
+ * path that writes, clears or promises a pin.
  */
 export function paneHaltPath(projectName?: string): string {
-  const tick = resolveTickConfig(projectName);
-  if (tick.kind === "ok" || tick.kind === "invalid") return join(tick.cwd, PANE_HALT_FILE);
-  return join(stateDir(), PANE_HALT_FILE);
+  const resolved = resolvePaneHaltPath(projectName);
+  if (resolved.kind === "unresolved") {
+    // Verb-neutral: this is also the `release-pane` path.
+    throw new Error(
+      `cannot locate the pane recovery pin — ${resolved.reason}. ` +
+        `Drop a tick config beside the pane, or stop the agent by hand; ` +
+        `\`halt\` without \`--pane\` still stops the dispatch daemon.`,
+    );
+  }
+  return resolved.path;
 }
 
 export function pinPaneHalt(projectName?: string): { path: string } {
@@ -672,7 +705,8 @@ export type TicksLayer =
   | "invalid-heartbeat-config"
   | "ungated";
 export type PaneLayer = "live" | "missing" | "unknown";
-export type RecoveryLayer = "pinned" | "clear";
+/** `unpinnable`: no tick config, so FLEET_CWD — the only path recovery reads — is unknown. */
+export type RecoveryLayer = "pinned" | "clear" | "unpinnable";
 export type HerdrLayer = "active" | "inactive" | "unknown";
 
 export interface FleetLayers {
@@ -724,8 +758,11 @@ export function fleetLayers(projectName?: string): FleetLayers {
   }
   if (armedPath === undefined) armedPath = armedMarkerPath(projectName);
 
-  const haltPath = paneHaltPath(projectName);
-  const recoveryPinned = existsSync(haltPath);
+  // Status reports; it never refuses. An unresolvable pin location is its own
+  // answer — "clear" would claim recovery is armed and ready to be pinned.
+  const resolvedHalt = resolvePaneHaltPath(projectName);
+  const haltPath = resolvedHalt.kind === "ok" ? resolvedHalt.path : undefined;
+  const recoveryPinned = haltPath !== undefined && existsSync(haltPath);
   const omp = probeOmpPane();
   let pane: PaneLayer;
   let paneDetail: string | undefined;
@@ -747,13 +784,17 @@ export function fleetLayers(projectName?: string): FleetLayers {
     ...(ticksDetail === undefined ? {} : { ticksDetail }),
     pane,
     ...(paneDetail === undefined ? {} : { paneDetail }),
-    recovery: recoveryPinned ? "pinned" : "clear",
-    ...(recoveryPinned ? { recoveryDetail: haltPath } : {}),
+    recovery: haltPath === undefined ? "unpinnable" : recoveryPinned ? "pinned" : "clear",
+    ...(haltPath === undefined
+      ? { recoveryDetail: resolvedHalt.kind === "unresolved" ? resolvedHalt.reason : undefined }
+      : recoveryPinned
+        ? { recoveryDetail: haltPath }
+        : {}),
     herdr: herdr.kind,
     ...(herdr.detail === undefined ? {} : { herdrDetail: herdr.detail }),
     armedPath,
     ...(tickConfigPath === undefined ? {} : { tickConfigPath }),
-    paneHaltPath: haltPath,
+    ...(haltPath === undefined ? {} : { paneHaltPath: haltPath }),
     paused,
     daemon: rec === undefined ? { running: false } : { running: true, pid: rec.pid, port: rec.port },
   };

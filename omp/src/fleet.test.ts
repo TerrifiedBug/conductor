@@ -25,6 +25,7 @@ import {
   pidLiveness,
   pinPaneHalt,
   releaseHold,
+  resolvePaneHaltPath,
   sessionDirForCwd,
   stopConductorPane,
   transcriptHasUserCode,
@@ -518,6 +519,52 @@ test("pidLiveness tracks a real process through exit", async () => {
   await child.exited;
   expect(pidLiveness(child.pid)).toBe(false);
   expect(deliverSignal(child.pid, "SIGTERM")).toBe(true);
+});
+
+test("halt --pane refuses when no tick config names FLEET_CWD — pins nothing anywhere", async () => {
+  // The state dir must differ from the pane cwd, or a state-dir fallback would
+  // look correct by accident. recover.sh reads only $FLEET_CWD/.conductor-pane-halted.
+  const fleetCwd = join(home, "fleet");
+  mkdirSync(join(fleetCwd, "worktrees"), { recursive: true });
+  writeMinimalConfig(join(fleetCwd, "worktrees"));
+  const stateDirPath = process.env[COND_KEY]!;
+  expect(fleetCwd).not.toBe(stateDirPath);
+  // No tick config anywhere: FLEET_CWD is unknown.
+
+  expect(resolvePaneHaltPath().kind).toBe("unresolved");
+  expect(() => paneHaltPath()).toThrow(/cannot locate the pane recovery pin/);
+
+  const living = new Set<number>([5150]);
+  await expect(
+    haltWithPane(undefined, {
+      listAgents: async () => [{ name: "fleet", paneId: "w1:p1", agent: "omp" }],
+      panePids: async () => [5150],
+      isAlive: (pid) => living.has(pid),
+      signalPid: (pid) => {
+        living.delete(pid);
+        return true;
+      },
+      sleep: async () => {},
+    }),
+  ).rejects.toThrow(/cannot locate the pane recovery pin/);
+
+  // Refused before anything was killed, and no pin was left in either place.
+  expect(living.has(5150)).toBe(true);
+  expect(existsSync(join(stateDirPath, PANE_HALT_FILE))).toBe(false);
+  expect(existsSync(join(fleetCwd, PANE_HALT_FILE))).toBe(false);
+  // release-pane refuses for the same reason rather than clearing a phantom.
+  expect(() => clearPaneHalt()).toThrow(/cannot locate the pane recovery pin/);
+});
+
+test("status reports recovery unpinnable instead of a phantom clear", () => {
+  const fleetCwd = join(home, "fleet");
+  mkdirSync(join(fleetCwd, "worktrees"), { recursive: true });
+  writeMinimalConfig(join(fleetCwd, "worktrees"));
+
+  const layers = fleetLayers();
+  expect(layers.recovery).toBe("unpinnable");
+  expect(layers.paneHaltPath).toBeUndefined();
+  expect(formatFleetStatus(statusSnapshot(), layers)).toContain("recovery  unpinnable");
 });
 
 test("disarm removes marker; arm requires inbound user-turn proof", async () => {

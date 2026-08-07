@@ -369,6 +369,11 @@ Four control planes used to answer "stop" differently. The package verbs:
 undone by `herdr-conductor` respawning the agent, and then refuses (nonzero exit,
 message on stderr) on every uncertainty:
 
+- no tick config exists at all — `recover.sh` reads only
+  `$FLEET_CWD/.conductor-pane-halted`, and without that file the pane's own
+  directory is unknown, so the pin would land somewhere recovery never looks and
+  the agent would be respawned seconds later. `release-pane` refuses for the
+  same reason, and `status` shows `recovery unpinnable` rather than `clear`
 - the tick config does not parse — the agent name would be a guess
 - `herdr agent list` is unreachable, prints nothing, or prints output with no
   explicit `agents` array; only a real `agents: []` means "no agents"
