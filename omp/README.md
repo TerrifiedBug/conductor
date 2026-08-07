@@ -274,7 +274,7 @@ The standing prompt is two layers:
 
 | Layer | File | Updates how? |
 | --- | --- | --- |
-| Package floor | `src/briefs/orchestrator.md` | Every tick recomposes it into `ORCHESTRATOR.md` from the installed package. `npm install` + restart is enough. |
+| Package floor | `src/briefs/orchestrator.md` | Every tick recomposes it into `ORCHESTRATOR.md` from the installed package. Upgrade the package in this host's existing install root + restart is enough. |
 | Fleet policy | `POLICY.md` | Yours. Setup writes the scaffold once; the Learning loop edits only this file. |
 | Composed view | `ORCHESTRATOR.md` | Regenerated from floor + `POLICY.md` on each tick (and at setup). Do not hand-amend it for durable policy. |
 | Worker brief | `src/briefs/worker.md` | Read per run from the package. |

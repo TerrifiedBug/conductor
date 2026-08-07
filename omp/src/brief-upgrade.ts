@@ -573,7 +573,7 @@ export function formatBriefStatus(path: string, status: BriefStatus): string {
       `  floor        package template → recomposed into ${status.orchestratorPath} each tick`,
       `  policy       ${status.policyPath} (Learning loop / operator edits)`,
       "",
-      "Protocol updates: npm install omp-conductor@… and restart — no brief-upgrade --apply.",
+      "Protocol updates: upgrade omp-conductor in this host's existing install root (same package manager), then restart the daemon — no brief-upgrade --apply.",
       "Legacy migrate:   omp-conductor brief-upgrade --migrate",
     ].join("\n");
   }

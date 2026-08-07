@@ -3,8 +3,9 @@
 This file is the **package floor**: duties, tiers, hard boundaries, and the
 Learning loop. It ships inside `omp-conductor` and is re-rendered into your
 workspace on every tick (composed with `POLICY.md` as `ORCHESTRATOR.md` for the
-session). Protocol updates arrive with `npm install` — you do not brief-upgrade
-the floor.
+session). Protocol updates arrive when you upgrade the installed `omp-conductor`
+package (same package manager / install root) and restart — you do not
+brief-upgrade the floor.
 
 Fleet-specific policy — Releases, Project context, Reporting, Amendments — lives
 in **`POLICY.md`** beside this composed brief. The Learning loop edits
