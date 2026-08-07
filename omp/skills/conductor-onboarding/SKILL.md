@@ -1,6 +1,6 @@
 ---
 name: conductor-onboarding
-description: Interview-driven onboarding for omp-conductor. Use when the user wants to set up conductor, onboard a new fleet or project, configure the fleet, asks for conductor setup help, asks what belongs in ORCHESTRATOR.md, or wants an agent's release and merge authority scoped and written down. Interviews the operator on release policy, escalation taste and reporting scope, reads each routing repo's CI to propose the real pre-push gates, learns the product and roadmap the fleet will groom, scaffolds the release procedure from the repo's own release workflows rather than from the operator's memory, tailors ORCHESTRATOR.md from the shipped template, verifies the worker brief's assumptions against the actual repos, finishes through the deterministic /conductor setup wizard, then builds the code-graph indexes workers query instead of grepping.
+description: Interview-driven onboarding for omp-conductor. Use when the user wants to set up conductor, onboard a new fleet or project, configure the fleet, asks for conductor setup help, asks what belongs in POLICY.md / ORCHESTRATOR.md, or wants an agent's release and merge authority scoped and written down. Interviews the operator on release policy, escalation taste and reporting scope, reads each routing repo's CI to propose the real pre-push gates, learns the product and roadmap the fleet will groom, scaffolds the release procedure from the repo's own release workflows rather than from the operator's memory, tailors POLICY.md (and the composed ORCHESTRATOR.md view) from the shipped templates, verifies the worker brief's assumptions against the actual repos, finishes through the deterministic /conductor setup wizard, then builds the code-graph indexes workers query instead of grepping.
 ---
 
 # Onboarding a conductor fleet
@@ -51,8 +51,9 @@ cat ~/.omp/conductor/config.json     # honours $OMP_CONDUCTOR_HOME
 - **`gh` missing `repo` or `project`?** Say so now. The wizard warns at the
   confirm, but a token that cannot label issues means every claim fails, and it
   is cheaper to fix before the interview than after.
-- **An `ORCHESTRATOR.md` already exists** at `<workspaceRoot>/ORCHESTRATOR.md`
-  (default `~/.omp/conductor/worktrees/ORCHESTRATOR.md`)? Read it. It is the
+- **A `POLICY.md` or `ORCHESTRATOR.md` already exists** under `<workspaceRoot>/`
+  (default `~/.omp/conductor/worktrees/`)? Read `POLICY.md` first when present —
+  that is the editable fleet policy. Otherwise read `ORCHESTRATOR.md`. It is the
   operator's accumulated policy, and it outranks the shipped template. Your job
   becomes amending it, and you must warn that a wizard re-run offers to overwrite
   it.
@@ -228,7 +229,7 @@ Two honesty notes to pass on:
 - **Neither scope is an outbound filter.** Nothing inspects the orchestrator's
   messages and drops the ones the scope did not ask for. It is a constraint handed
   to the model each turn, not a gate it is held to.
-- **Changing the scope later does not rewrite an existing `ORCHESTRATOR.md`.** The
+- **Changing the scope later does not rewrite an existing `POLICY.md`.** The
   tick line changes; the brief does not. Whoever changes it must edit the brief's
   Reporting section too, or the session is carrying two versions of the policy.
 
@@ -553,7 +554,7 @@ proposal, in `cmd @ cwd` form); whether to add another repo; whether to set up
 **code-graph discovery** and the root its clones live under (Step 8); caps; the
 authority confirms; the worker model; the Telegram chat id for tier 2; the
 escalation fallback; whether an orchestrator session already runs elsewhere; the
-report scope; and finally whether to write `ORCHESTRATOR.md`.
+report scope; and finally whether to write `ORCHESTRATOR.md` + `POLICY.md`.
 
 Two things about the end of it that you must not smooth over:
 
@@ -567,7 +568,7 @@ Two things about the end of it that you must not smooth over:
   no state database, no arm. If they decline, the machine is untouched. Never
   answer that confirm on their behalf.
 
-Say yes to writing `ORCHESTRATOR.md`, then **immediately apply the edits you
+Say yes to writing `ORCHESTRATOR.md` + `POLICY.md`, then **immediately apply the edits you
 drafted in Steps 3, 4 and 5** to the file it wrote, and tell them the path. Note
 the trap for later: a future `/conductor setup` re-run offers to overwrite that
 file, and accepting loses every tailored word. Their brief is now a file worth

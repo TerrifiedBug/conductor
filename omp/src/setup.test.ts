@@ -20,6 +20,7 @@ import {
   AMEND_AREA_IDS,
   AMEND_AREAS,
   ORCHESTRATOR_BRIEF_NAME,
+  POLICY_BRIEF_NAME,
   REPORT_SCOPE_CHOICES,
   amendChoices,
   answersFromProject,
@@ -324,6 +325,7 @@ test("the rendered brief ships the amendment protocol above the operator's half"
   // The loop is only self-amending if the protocol is in the shipped half: an
   // operator who rewrites their own sections must not be able to delete it.
   expect(text).toContain("## Learning loop");
+  expect(text).toContain("POLICY.md");
   expect(text.indexOf("## Learning loop")).toBeLessThan(text.indexOf("YOURS TO EDIT"));
   // Approval is the whole safety property — an unapproved self-edit is a session
   // rewriting its own boundaries.
@@ -358,6 +360,10 @@ test("writing the brief creates the workspace root it lands in", () => {
 
   expect(written).toBe(expected);
   expect(readFileSync(expected, "utf8")).toBe(renderOrchestratorBrief(a));
+  const policyPath = join(home, "worktrees", POLICY_BRIEF_NAME);
+  expect(existsSync(policyPath)).toBe(true);
+  expect(readFileSync(policyPath, "utf8")).toContain("## Releases");
+  expect(readFileSync(expected, "utf8")).toContain("POLICY.md");
 });
 
 test("writing the brief again replaces it — the overwrite question is the wizard's", () => {

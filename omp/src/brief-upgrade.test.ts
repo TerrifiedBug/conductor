@@ -8,13 +8,18 @@
  */
 
 import { expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   checkBrief,
+  composeOrchestrator,
   formatBriefStatus,
+  inspectBriefLayout,
+  migrateToPolicy,
   missingSections,
+  proposeRetrofit,
+  refreshComposedBrief,
   sectionText,
   shippedDiff,
   splitBrief,
@@ -193,16 +198,84 @@ test("the report tells the operator which command applies it, and only when it c
   const rendered = brief({ shipped: "## Duty 1\nnew.", owned: "## Releases\ndefault." });
 
   const mergeable = formatBriefStatus("/x/ORCHESTRATOR.md", checkBrief(live, rendered));
+  expect(mergeable).toContain("brief-upgrade --migrate");
   expect(mergeable).toContain("brief-upgrade --apply");
-  expect(mergeable).toContain("carried across");
 
-  // An unsplittable brief must not advertise --apply: it would do nothing, and an
-  // operator who ran it would reasonably believe their brief had been upgraded.
+  // An unsplittable brief must not advertise a silent --apply merge.
   const hand = formatBriefStatus("/x/ORCHESTRATOR.md", checkBrief("# mine\n\n## Duty 1\nx\n", rendered));
-  expect(hand).not.toContain("--apply");
+  expect(hand).not.toContain("brief-upgrade --apply");
   expect(hand).toContain("no YOURS TO EDIT banner");
+  expect(hand).toContain("brief-upgrade --retrofit");
 
   const current = formatBriefStatus("/x/ORCHESTRATOR.md", checkBrief(live, live));
   expect(current).toContain("up to date");
   expect(current).not.toContain("--apply");
+});
+
+test("migrateToPolicy lifts owned half into POLICY.md and recomposes", () => {
+  const dir = mkdtempSync(join(tmpdir(), "brief-migrate-"));
+  try {
+    const orchestratorPath = join(dir, "ORCHESTRATOR.md");
+    const policyPath = join(dir, "POLICY.md");
+    writeFileSync(
+      orchestratorPath,
+      brief({ shipped: "## Duty 1\ndrain.", owned: "## Releases\nMY POLICY.\n\n## Amendments\n- one\n" }),
+    );
+    const result = migrateToPolicy({
+      orchestratorPath,
+      policyPath,
+      floor: "# Floor\n\n## Duty 1\nnew drain.\n",
+    });
+    expect(existsSync(policyPath)).toBe(true);
+    expect(readFileSync(policyPath, "utf8")).toContain("MY POLICY.");
+    expect(readFileSync(orchestratorPath, "utf8")).toContain("new drain.");
+    expect(readFileSync(orchestratorPath, "utf8")).toContain("MY POLICY.");
+    expect(result.ownedBytes).toBeGreaterThan(10);
+    expect(inspectBriefLayout(dir, "").kind).toBe("overlay");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("proposeRetrofit inserts the banner before the first owned heading", () => {
+  const live = [
+    "# Hand written",
+    "",
+    "## Duty 1 — drain",
+    "do the loop.",
+    "",
+    "## Releases",
+    "humans release.",
+    "",
+    "## Reporting",
+    "daily digest.",
+    "",
+  ].join("\n");
+  const proposal = proposeRetrofit(live);
+  expect(proposal).toBeDefined();
+  expect(proposal?.atHeading).toBe("Releases");
+  expect(proposal!.retrofitted).toContain("YOURS TO EDIT");
+  expect(proposal!.retrofitted.indexOf("YOURS TO EDIT")).toBeLessThan(
+    proposal!.retrofitted.indexOf("## Releases"),
+  );
+  expect(proposal!.ownedHeadings).toEqual(["Releases", "Reporting"]);
+});
+
+test("refreshComposedBrief rewrites ORCHESTRATOR.md from floor + POLICY.md", () => {
+  const dir = mkdtempSync(join(tmpdir(), "brief-refresh-"));
+  try {
+    const orchestratorPath = join(dir, "ORCHESTRATOR.md");
+    const policyPath = join(dir, "POLICY.md");
+    writeFileSync(policyPath, "## Releases\nlive policy.\n");
+    writeFileSync(orchestratorPath, "stale\n");
+    expect(
+      refreshComposedBrief({ orchestratorPath, policyPath, floor: "# Floor\n\n## Duty 1\nx.\n" }),
+    ).toBe(true);
+    const composed = readFileSync(orchestratorPath, "utf8");
+    expect(composed).toContain("# Floor");
+    expect(composed).toContain("live policy.");
+    expect(composeOrchestrator("# Floor\n", "## Releases\ny.\n")).toContain("YOURS TO EDIT");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

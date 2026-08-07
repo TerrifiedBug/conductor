@@ -473,10 +473,10 @@ test("the default message orders a disk re-read of the resolved brief and carrie
   // lives at <workspaceRoot>/ORCHESTRATOR.md, not in the session cwd; the bare
   // name is only the no-config fallback.
   expect(defaultTickMessage(at)).toBe(
-    "Tick 2026-08-06T12:00:00.000Z: re-read ORCHESTRATOR.md from disk, then run your standing loop from it.",
+    "Tick 2026-08-06T12:00:00.000Z: re-read ORCHESTRATOR.md (composed package floor + policy) and POLICY.md (editable fleet policy) from disk, then run your standing loop from them. Learning-loop amendments edit only POLICY.md — never the package floor.",
   );
-  expect(defaultTickMessage(at, "/data/fleet/worktrees/ORCHESTRATOR.md")).toBe(
-    "Tick 2026-08-06T12:00:00.000Z: re-read /data/fleet/worktrees/ORCHESTRATOR.md from disk, then run your standing loop from it.",
+  expect(defaultTickMessage(at, "/data/fleet/worktrees/ORCHESTRATOR.md", "/data/fleet/worktrees/POLICY.md")).toBe(
+    "Tick 2026-08-06T12:00:00.000Z: re-read /data/fleet/worktrees/ORCHESTRATOR.md (composed package floor + policy) and /data/fleet/worktrees/POLICY.md (editable fleet policy) from disk, then run your standing loop from them. Learning-loop amendments edit only /data/fleet/worktrees/POLICY.md — never the package floor.",
   );
 });
 

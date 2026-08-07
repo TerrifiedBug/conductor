@@ -11,8 +11,15 @@
  * worth protecting is on `setup()` below — nothing is written before the confirm.
  */
 import { existsSync, readFileSync } from "node:fs";
-import { isAbsolute } from "node:path";
-import { checkBrief, formatBriefStatus, writeMergedBrief } from "./brief-upgrade.ts";
+import { dirname, isAbsolute } from "node:path";
+import {
+  checkBrief,
+  formatBriefStatus,
+  formatMigrateResult,
+  inspectBriefLayout,
+  migrateToPolicy,
+  writeMergedBrief,
+} from "./brief-upgrade.ts";
 import { configPath, expandHome, findProject, loadConfig, saveConfig } from "./config.ts";
 import {
   armConductor,
@@ -27,11 +34,14 @@ import { defaultGraphRoot } from "./graph.ts";
 import {
   AMEND_AREAS,
   ORCHESTRATOR_BRIEF_NAME,
+  POLICY_BRIEF_NAME,
   REPORT_SCOPE_CHOICES,
   SETUP_DEFAULTS,
   amendChoices,
   answersFromProject,
   briefPathForProject,
+  policyPathForProject,
+  renderFloorForProject,
   buildConfig,
   checkTokenScopes,
   createMissingLabels,
@@ -374,17 +384,17 @@ async function askGraphRoot(
 async function askOrchestratorBrief(ctx: CommandContext, a: SetupAnswers): Promise<boolean> {
   const path = orchestratorBriefPath(a);
   const wanted = await ctx.ui.confirm(
-    `Write an orchestrator brief template to ${path}?`,
-    `It is the standing prompt for your supervising session: duties, tiers, and boundaries, ` +
-      `plus a release policy and a reporting section that are yours to edit. ` +
-      `The conductor never reads it back — it stops at green PRs either way.`,
+    `Write ${ORCHESTRATOR_BRIEF_NAME} + ${POLICY_BRIEF_NAME} under ${dirname(path)}?`,
+    `Writes composed ${ORCHESTRATOR_BRIEF_NAME} (package floor, refreshed each tick) and ${POLICY_BRIEF_NAME} ` +
+      `(Releases, Project context, Reporting, Amendments — yours to edit via the Learning loop). ` +
+      `The conductor stops at green PRs either way.`,
   );
   if (!wanted) return false;
   if (!existsSync(path)) return true;
 
   return await ctx.ui.confirm(
-    `Overwrite the existing ${ORCHESTRATOR_BRIEF_NAME}?`,
-    `${path} already exists. Overwriting replaces it with the shipped template — any policy you wrote there is lost.`,
+    `Overwrite existing ${ORCHESTRATOR_BRIEF_NAME} / ${POLICY_BRIEF_NAME}?`,
+    `${path} already exists. Overwriting replaces the composed brief and POLICY.md scaffold — any policy you wrote is lost.`,
   );
 }
 
@@ -885,7 +895,7 @@ async function setup(ctx: CommandContext, projectArg: string | undefined): Promi
       `Wrote ${path} and armed the conductor.`,
       briefPath === undefined
         ? "No orchestrator brief written — the conductor stops at green PRs; merges and releases stay human."
-        : `Wrote ${briefPath} — edit its "Releases" and "Reporting" sections; nothing here reads them back.`,
+        : `Wrote ${briefPath} + POLICY.md — edit POLICY.md (Releases/Reporting); floor refreshes each tick.`,
       "",
       "Dry run against the config just written:",
       ...(await tryPreview(answers.projectName)),
@@ -929,18 +939,51 @@ export default function conductorPlugin(pi: PluginApi): void {
           case "brief-upgrade": {
             const p = findProject(loadConfig(), project);
             const path = briefPathForProject(p);
-            if (!existsSync(path)) {
+            const rendered = renderBriefForProject(p);
+            const layout = inspectBriefLayout(p.workspaceRoot, rendered);
+            if (layout.kind === "missing") {
               ctx.ui.notify(
-                `No brief at ${path} — run /conductor setup and say yes to writing ${ORCHESTRATOR_BRIEF_NAME}.`,
+                `No brief at ${path} — run /conductor setup and say yes to writing ${ORCHESTRATOR_BRIEF_NAME} + ${POLICY_BRIEF_NAME}.`,
                 "warning",
               );
               break;
             }
-            const status = checkBrief(readFileSync(path, "utf8"), renderBriefForProject(p));
-            ctx.ui.notify(formatBriefStatus(path, status), status.kind === "current" ? "info" : "warning");
-            // Confirmed here rather than applied on sight: this file is a standing
-            // prompt the operator may have spent an hour on, so the diff they just
-            // read is the thing they are agreeing to.
+            if (layout.kind === "overlay") {
+              ctx.ui.notify(
+                formatBriefStatus(path, {
+                  kind: "overlay",
+                  policyPath: layout.policyPath,
+                  orchestratorPath: layout.orchestratorPath,
+                }),
+                "info",
+              );
+              break;
+            }
+            if (layout.kind === "legacy-bannered") {
+              ctx.ui.notify(
+                [
+                  `Legacy bannered brief at ${layout.orchestratorPath}.`,
+                  "Migrate the owned half into POLICY.md so the package floor refreshes each tick.",
+                ].join("\n"),
+                "warning",
+              );
+              const migrate = await ctx.ui.confirm(
+                "Migrate to POLICY.md overlay?",
+                "Writes POLICY.md from everything below YOURS TO EDIT, recomposes ORCHESTRATOR.md from the package floor + that policy, and keeps backups.",
+              );
+              if (migrate) {
+                const result = migrateToPolicy({
+                  orchestratorPath: layout.orchestratorPath,
+                  policyPath: policyPathForProject(p),
+                  floor: renderFloorForProject(p),
+                  owned: layout.owned,
+                });
+                ctx.ui.notify(formatMigrateResult(result), "info");
+              }
+              break;
+            }
+            const status = checkBrief(readFileSync(path, "utf8"), rendered);
+            ctx.ui.notify(formatBriefStatus(path, status), "warning");
             if (status.kind === "mergeable") {
               const apply = await ctx.ui.confirm(
                 "Upgrade the brief?",

@@ -1,6 +1,6 @@
 {
   "name": "omp-conductor",
-  "version": "0.3.11",
+  "version": "0.3.12",
   "type": "module",
   "license": "MIT",
   "description": "A 24/7 dispatcher that takes ready GitHub issues to green, mergeable PRs using omp coding sessions, with tiered escalation first to an orchestrator session and then to a human.",

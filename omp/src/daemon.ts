@@ -1264,7 +1264,7 @@ export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
     // is holding the merge button. The daemon still merges nothing itself.
     project.authority.merge === "orchestrator"
       ? "You never edit product code or push a branch — a worker session does that. Merging is yours: one PR at " +
-        "a time, freshness-checked against the base branch, per the Releases section of your ORCHESTRATOR.md."
+        "a time, freshness-checked against the base branch, per the Releases section of your POLICY.md."
       : "You never edit product code, push a branch, or merge a PR — a worker session edits and pushes, and a " +
         "human merges.",
     "Handle each escalation below before the next one.",

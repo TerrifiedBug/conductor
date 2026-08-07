@@ -23,6 +23,15 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import {
+  COMPOSE_BANNER,
+  ORCHESTRATOR_BRIEF_NAME,
+  POLICY_BRIEF_NAME,
+  composeOrchestrator,
+  policyPathForRoot,
+  renderBriefTemplate,
+  writeWithBackup,
+} from "./brief-upgrade.ts";
 import { configPath, resolveCaps, stateDir } from "./config.ts";
 import { graphProjectPath, graphRepos } from "./graph.ts";
 import {
@@ -37,7 +46,6 @@ import {
   type ReportScope,
   type RepoTarget,
 } from "./types.ts";
-import { renderBrief } from "./worker.ts";
 
 /**
  * Every decision the wizard needs, in one plain object. Collected by the UI,
@@ -197,11 +205,13 @@ export const MERGE_DUTY: { readonly [K in ProjectConfig["authority"]["merge"]]: 
     "  one is a hard boundary, not a preference.",
 };
 
-/** The operator's own brief, rendered into the project's workspace root. */
-export const ORCHESTRATOR_BRIEF_NAME = "ORCHESTRATOR.md";
+export { ORCHESTRATOR_BRIEF_NAME, POLICY_BRIEF_NAME };
 
-/** Shipped in `files[]`, so this resolves in an installed package too. */
+/** Shipped floor template — duties, tiers, hard boundaries, Learning loop. */
 const ORCHESTRATOR_TEMPLATE_PATH = join(import.meta.dir, "briefs", "orchestrator.md");
+
+/** Shipped POLICY.md scaffold — Releases, Project context, Reporting, Amendments. */
+const POLICY_TEMPLATE_PATH = join(import.meta.dir, "briefs", "policy.md");
 
 /**
  * `repo` writes labels and closes issues; `project` moves cards on the board.
@@ -572,46 +582,69 @@ export function answersFromProject(p: ProjectConfig): SetupAnswers {
 }
 
 /**
- * Where a configured project's brief lives: beside its worktrees, under the state
- * directory, so it is on the same disk the fleet already owns and survives a
- * reinstall of the package. Derived from the project rather than fixed, so a
- * project that ever gains a chosen workspace root keeps its brief with it.
+ * Where a configured project's composed brief lives: beside its worktrees, under
+ * the state directory, so it is on the same disk the fleet already owns and
+ * survives a reinstall of the package. Derived from the project rather than
+ * fixed, so a project that ever gains a chosen workspace root keeps its brief
+ * with it.
  */
 export function briefPathForProject(p: ProjectConfig): string {
   return join(p.workspaceRoot, ORCHESTRATOR_BRIEF_NAME);
 }
 
-/**
- * The brief template exactly as shipped, placeholders and all.
- *
- * Exported for the upgrade check, which has to be able to read the shipped text
- * on a host that has no config to render it against.
- */
-export function shippedBriefTemplate(): string {
-  return readFileSync(ORCHESTRATOR_TEMPLATE_PATH, "utf8");
+/** Where the fleet-owned POLICY.md overlay lives for a project. */
+export function policyPathForProject(p: ProjectConfig): string {
+  return policyPathForRoot(p.workspaceRoot);
 }
 
-/**
- * The shipped template with a configured project's real values in it.
- *
- * Only the coordinates, the chosen scope and the authority paragraph are
- * substituted: the rest of the policy text is left exactly as shipped, because
- * from here on the file is the operator's to edit and nothing in this package
- * reads it back.
- *
- * Takes a `ProjectConfig` rather than answers so that a *later* upgrade check can
- * reproduce the same render from what is on disk, months after the wizard's
- * answers are gone.
- */
-export function renderBriefForProject(p: ProjectConfig): string {
-  return renderBrief(readFileSync(ORCHESTRATOR_TEMPLATE_PATH, "utf8"), {
+function briefVarsForProject(p: ProjectConfig): Record<string, string> {
+  return {
     PROJECT: p.name,
     TRACKER_REPO: p.tracker.repo,
     QUEUE_LABEL: p.queueLabel,
     RELEASES_DEFAULT: RELEASES_DEFAULTS[`${p.authority.merge}/${p.authority.release}`],
     MERGE_DUTY: MERGE_DUTY[p.authority.merge],
     REPORT_SCOPE: p.reporting?.scope ?? DEFAULT_REPORT_SCOPE,
-  });
+  };
+}
+
+/** Package floor template, placeholders and all. */
+export function shippedFloorTemplate(): string {
+  return readFileSync(ORCHESTRATOR_TEMPLATE_PATH, "utf8");
+}
+
+/** POLICY.md scaffold template, placeholders and all. */
+export function shippedPolicyTemplate(): string {
+  return readFileSync(POLICY_TEMPLATE_PATH, "utf8");
+}
+
+/**
+ * Floor + policy templates concatenated with the compose banner, placeholders
+ * intact. Used when no project config is available to render coordinates.
+ */
+export function shippedBriefTemplate(): string {
+  return composeOrchestrator(shippedFloorTemplate(), shippedPolicyTemplate());
+}
+
+/** Rendered package floor for a configured project. */
+export function renderFloorForProject(p: ProjectConfig): string {
+  return renderBriefTemplate(shippedFloorTemplate(), briefVarsForProject(p));
+}
+
+/** Rendered POLICY.md scaffold for a configured project. */
+export function renderPolicyForProject(p: ProjectConfig): string {
+  return renderBriefTemplate(shippedPolicyTemplate(), briefVarsForProject(p));
+}
+
+/**
+ * Composed session brief: rendered floor + POLICY scaffold (or a caller's policy).
+ *
+ * Setup writes the policy half to `POLICY.md` and this compose to
+ * `ORCHESTRATOR.md`. Later ticks recompose from the live POLICY.md so package
+ * floor updates apply without brief-upgrade.
+ */
+export function renderBriefForProject(p: ProjectConfig, policyText?: string): string {
+  return composeOrchestrator(renderFloorForProject(p), policyText ?? renderPolicyForProject(p));
 }
 
 /** Wizard-time path, via the project the answers describe. */
@@ -625,7 +658,7 @@ export function renderOrchestratorBrief(a: SetupAnswers): string {
 }
 
 /**
- * Writes the rendered brief and returns where it went.
+ * Writes `POLICY.md` + composed `ORCHESTRATOR.md`, and returns the composed path.
  *
  * Unconditional by design: the "do not clobber my edits" decision belongs to the
  * operator, is asked in the wizard, and arrives here as
@@ -634,10 +667,39 @@ export function renderOrchestratorBrief(a: SetupAnswers): string {
  * must get an overwrite.
  */
 export function writeOrchestratorBrief(a: SetupAnswers): string {
-  const path = orchestratorBriefPath(a);
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, renderOrchestratorBrief(a));
-  return path;
+  const project = buildProject(a);
+  const policyPath = policyPathForProject(project);
+  const orchestratorPath = briefPathForProject(project);
+  mkdirSync(dirname(orchestratorPath), { recursive: true });
+  const policy = renderPolicyForProject(project);
+  writeFileSync(policyPath, policy);
+  writeFileSync(orchestratorPath, composeOrchestrator(renderFloorForProject(project), policy));
+  return orchestratorPath;
+}
+
+/**
+ * Recompose `ORCHESTRATOR.md` from the package floor + live `POLICY.md`.
+ *
+ * Returns false when POLICY.md is missing (caller should migrate or set up).
+ */
+export function refreshComposedBriefForProject(p: ProjectConfig): boolean {
+  const policyPath = policyPathForProject(p);
+  if (!existsSync(policyPath)) return false;
+  const orchestratorPath = briefPathForProject(p);
+  mkdirSync(dirname(orchestratorPath), { recursive: true });
+  writeFileSync(
+    orchestratorPath,
+    composeOrchestrator(renderFloorForProject(p), readFileSync(policyPath, "utf8")),
+  );
+  return true;
+}
+
+/** @internal test helper — expose compose banner for assertions. */
+export const BRIEF_COMPOSE_BANNER = COMPOSE_BANNER;
+
+/** Backup-aware POLICY write used by migrate paths that already computed text. */
+export function writePolicyFile(path: string, content: string): string | undefined {
+  return writeWithBackup(path, content);
 }
 
 /**
@@ -861,11 +923,12 @@ export function summarisePlan(
     `  scope          ${a.reportScope} — ${chosen?.description ?? "unknown scope"}`,
   );
   if (a.writeOrchestratorBrief) {
+    const policyPath = briefPath.replace(/ORCHESTRATOR\.md$/, "POLICY.md");
     lines.push(
-      existsSync(briefPath)
-        ? `  brief          would OVERWRITE ${briefPath}`
-        : `  brief          would write ${briefPath}`,
-      "                 yours to edit afterwards — release policy lives there, not in this package",
+      existsSync(briefPath) || existsSync(policyPath)
+        ? `  brief          would OVERWRITE ${briefPath} + POLICY.md`
+        : `  brief          would write ${briefPath} + POLICY.md`,
+      "                 POLICY.md is yours — Releases/Reporting/Amendments; floor recomposes each tick",
     );
   } else {
     lines.push(
@@ -1002,7 +1065,7 @@ export const AMEND_AREAS: {
   },
   brief: {
     name: "orchestrator brief",
-    asks: `whether to render ${ORCHESTRATOR_BRIEF_NAME} — the one area that writes no config key`,
+    asks: `whether to write ${ORCHESTRATOR_BRIEF_NAME} + ${POLICY_BRIEF_NAME} — the one area that writes no config key`,
     describe: (p) => {
       const path = briefPathForProject(p);
       return existsSync(path) ? `written at ${path}` : `none at ${path}`;

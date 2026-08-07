@@ -270,45 +270,32 @@ the question, which is the safer way to leave one alone.
 
 ### Keeping a brief current
 
-Upgrading the package does not upgrade a brief you are already running, and it is
-worth knowing exactly which half of that sentence is true.
+The standing prompt is two layers:
 
-| What | Updates on `omp plugin install`? |
-| --- | --- |
-| `skills/conductor-onboarding/SKILL.md` | Yes. The session reads it from the installed package. |
-| `src/briefs/worker.md` | Yes. It is read per run, so the next worker gets the new text. |
-| `src/briefs/orchestrator.md` | Yes, but it is only a *template*: it is read when the wizard renders a brief. |
-| Your rendered `ORCHESTRATOR.md` | **No.** It was written once and is yours from then on. |
-
-That last row is the point. Once the wizard renders your brief, nothing in this
-package reads it back or rewrites it, so a later version that ships a new protocol
-above the `YOURS TO EDIT` banner is invisible to every fleet already running:
+| Layer | File | Updates how? |
+| --- | --- | --- |
+| Package floor | `src/briefs/orchestrator.md` | Every tick recomposes it into `ORCHESTRATOR.md` from the installed package. `npm install` + restart is enough. |
+| Fleet policy | `POLICY.md` | Yours. Setup writes the scaffold once; the Learning loop edits only this file. |
+| Composed view | `ORCHESTRATOR.md` | Regenerated from floor + `POLICY.md` on each tick (and at setup). Do not hand-amend it for durable policy. |
+| Worker brief | `src/briefs/worker.md` | Read per run from the package. |
+| Onboarding skill | `skills/conductor-onboarding/SKILL.md` | Read from the installed package. |
 
 ```bash
-omp-conductor brief-upgrade              # report only
-omp-conductor brief-upgrade --apply      # replace the shipped half, keep yours
+omp-conductor brief-upgrade                 # report overlay / legacy state
+omp-conductor brief-upgrade --migrate       # dry-run: bannered ORCHESTRATOR.md → POLICY.md
+omp-conductor brief-upgrade --migrate --apply
+omp-conductor brief-upgrade --retrofit      # #20: propose YOURS TO EDIT cut on a hand-written brief
+omp-conductor brief-upgrade --retrofit --apply
 ```
 
-The banner is what makes this safe. Everything above it belongs to the package and
-everything below it belongs to you, so an upgrade replaces the first and copies the
-second across untouched, keeping the previous file as
-`ORCHESTRATOR.md.bak-<timestamp>`. Three cases where it will not write at all:
+- **Overlay already active** (`POLICY.md` present): protocol updates need no brief-upgrade.
+- **Legacy bannered brief**: `--migrate` lifts the owned half into `POLICY.md` and recomposes, with backups.
+- **Hand-written brief** (no banner): `--retrofit` inserts the banner before the first Releases / Project context / Reporting / Amendments heading; then `--migrate`.
+- **Legacy `--apply`**: still merges a bannered single-file brief when you need the old path.
 
-- **Your brief has no banner** (hand-written, or predating the split). There is no
-  way to tell which lines are yours, so it lists the sections the template has and
-  yours does not, and leaves the file alone. Retitled sections count as present, so
-  `## Reporting (low noise)` is not reported as a missing `## Reporting`.
-- **No config resolved**, so the template still carries its `{{PLACEHOLDER}}`
-  coordinates. Merging it would write those literals into a live prompt.
-- **Nothing changed.** It says so and exits.
+`--file PATH` checks a brief that is not where the wizard would have put it.
 
-`--file PATH` checks a brief that is not where the wizard would have put it, which
-is the normal case on a dedicated fleet host: the supervising session runs from its
-own directory, and that host may never have configured a dispatch daemon.
-
-A brief with the **Learning loop** section has a second route. The session running
-from it can propose the missing sections itself, as a diff, for you to approve with
-a yes over Telegram, which is the same protocol it uses for any other amendment.
+The **Learning loop** proposes diffs against `POLICY.md` for you to approve over Telegram.
 
 ## Quick start
 
@@ -1101,7 +1088,7 @@ omp-conductor daemon [--once] [--port N] [--project NAME]
 omp-conductor pause
 omp-conductor resume
 omp-conductor graph-setup [--project NAME] [--write]
-omp-conductor brief-upgrade [--apply] [--file PATH] [--project NAME]
+omp-conductor brief-upgrade [--migrate|--retrofit] [--apply] [--file PATH] [--project NAME]
 omp-conductor help
 ```
 
@@ -1121,8 +1108,10 @@ omp-conductor help
 | `resume` | Allow claiming again. |
 | `graph-setup` | Print how to set up the code-graph indexes workers query instead of grepping: a `git clone` for every index-only clone that does not exist yet, the one-shot index command per repo, and a `cbm-reindex.service` + `cbm-reindex.timer` pair generated from the project's own repos and branches. Reads only, so it is safe on a host where you are not root. Exits `1` when no repo in the project has [`graphProject`](#configuration) set, because the fix is a wizard answer rather than a flag. See [Code-graph discovery](#code-graph-discovery). |
 | `--write` | Only for `graph-setup`. Writes the refresh script into the state directory and the two units into `/etc/systemd/system`, then prints the exact `systemctl daemon-reload && systemctl enable --now cbm-reindex.timer` to run. It never runs `systemctl` itself and never enables anything: that needs root, and a package that enables system timers behind your back is one you cannot audit by reading its output. |
-| `brief-upgrade` | Compare a project's `ORCHESTRATOR.md` against the brief this version of the package ships. Reports by default; see [Keeping a brief current](#keeping-a-brief-current). |
-| `--apply` | Only for `brief-upgrade`. Replaces the half above the `YOURS TO EDIT` banner and keeps everything below it, backing the previous file up first. Ignored when the brief cannot be split or the template is unrendered. |
+| `brief-upgrade` | Inspect the package-floor + `POLICY.md` overlay. Reports by default; see [Keeping a brief current](#keeping-a-brief-current). |
+| `--migrate` | Only for `brief-upgrade`. Lift a bannered `ORCHESTRATOR.md` owned half into `POLICY.md` and recompose. Dry-run unless `--apply`. |
+| `--retrofit` | Only for `brief-upgrade`. Propose (or with `--apply`, write) a `YOURS TO EDIT` banner before the first owned-topic heading on a hand-written brief. |
+| `--apply` | Only for `brief-upgrade`. Confirms `--migrate` / `--retrofit`, or legacy single-file merge above the banner. |
 | `--file PATH` | Only for `brief-upgrade`. Check a brief that is not where the wizard would have put it, on a host that may have no config at all. |
 | `help`, `--help`, `-h` | Print usage. An unknown or missing verb prints it too, and exits `2`. |
 

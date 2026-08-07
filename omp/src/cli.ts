@@ -6,8 +6,18 @@
  * cannot drift apart.
  */
 import { closeSync, openSync, readFileSync, readSync, statSync } from "node:fs";
-import { join } from "node:path";
-import { checkBrief, formatBriefStatus, writeMergedBrief } from "./brief-upgrade.ts";
+import { dirname, join } from "node:path";
+import {
+  applyRetrofit,
+  checkBrief,
+  formatBriefStatus,
+  formatMigrateResult,
+  formatRetrofitProposal,
+  inspectBriefLayout,
+  migrateToPolicy,
+  proposeRetrofit,
+  writeMergedBrief,
+} from "./brief-upgrade.ts";
 import { findProject, loadConfig, resolveCaps, stateDir } from "./config.ts";
 import { dbPath, formatStatus, runDaemon, setPaused, statusSnapshot } from "./daemon.ts";
 import { formatGraphSetup, graphRepos, writeGraphSetup, type GraphSetupWrite } from "./graph.ts";
@@ -22,7 +32,13 @@ import {
   writeRecord,
 } from "./lifecycle.ts";
 import { STALL_MARKER_FILE } from "./orchestrator-tick.ts";
-import { briefPathForProject, renderBriefForProject, shippedBriefTemplate } from "./setup.ts";
+import {
+  briefPathForProject,
+  policyPathForProject,
+  renderBriefForProject,
+  renderFloorForProject,
+  shippedBriefTemplate,
+} from "./setup.ts";
 import { LIVE_STATES, openStore } from "./store.ts";
 import { makeTracker } from "./tracker/github.ts";
 import type { ProjectConfig } from "./types.ts";
@@ -41,7 +57,7 @@ usage:
   omp-conductor pause
   omp-conductor resume
   omp-conductor graph-setup [--project NAME] [--write]
-  omp-conductor brief-upgrade [--apply] [--file PATH] [--project NAME]
+  omp-conductor brief-upgrade [--migrate|--retrofit] [--apply] [--file PATH] [--project NAME]
   omp-conductor help
 
   start    run the dispatch loop in the background and wait until it answers
@@ -79,13 +95,13 @@ usage:
            prints the systemctl line to run — it never runs systemctl itself.
            Exits 1 when no repo in the project has graphProject configured.
   brief-upgrade
-           compare a project's ORCHESTRATOR.md against the brief this version of
-           the package ships. Reports by default; --apply replaces the half above
-           the YOURS TO EDIT banner and keeps everything below it, backing the old
-           file up first. --file checks a brief that is not where the wizard would
-           have put it, on a host that may have no config at all. Nothing is
-           written for a brief with no banner, or when no config resolved and the
-           template still carries its {{PLACEHOLDER}} coordinates.
+           inspect the brief overlay (package floor + POLICY.md). Reports by
+           default. --migrate lifts a bannered ORCHESTRATOR.md owned half into
+           POLICY.md and recomposes. --retrofit proposes inserting the YOURS TO
+           EDIT banner before the first Releases/Project context/Reporting/
+           Amendments heading (#20); --retrofit --apply writes it. Legacy
+           --apply still merges a bannered single-file brief. --file checks a
+           brief that is not where the wizard would have put it.
   help     print this text (also --help, -h).
 
 Pause is a flag file under the state directory, so it applies to every project
@@ -526,10 +542,6 @@ try {
     }
 
     case "brief-upgrade": {
-      // `--file` exists because a real fleet's brief is often not where the wizard
-      // would have put it: the supervising session runs from its own directory, and
-      // that host may never have configured a dispatch daemon at all. Without this
-      // the command cannot check the one file it was written for.
       const override = flag(argv, "file");
       let project: ProjectConfig | undefined;
       let path: string;
@@ -541,11 +553,82 @@ try {
         try {
           project = findProject(loadConfig(), flag(argv, "project"));
         } catch {
-          // No config here, or several projects and no name given. With an explicit
-          // file we need neither, and refusing would make the command unusable on a
-          // fleet host that runs only the supervising session.
           project = undefined;
         }
+      }
+
+      const workspaceRoot = project?.workspaceRoot ?? dirname(path);
+      const rendered =
+        project === undefined ? shippedBriefTemplate() : renderBriefForProject(project);
+      const floor = project === undefined ? shippedBriefTemplate() : renderFloorForProject(project);
+      const layout = inspectBriefLayout(workspaceRoot, rendered);
+
+      if (argv.includes("--retrofit")) {
+        let live: string;
+        try {
+          live = readFileSync(path, "utf8");
+        } catch {
+          process.stderr.write(`omp-conductor: no brief at ${path}.\n`);
+          process.exit(1);
+        }
+        const proposal = proposeRetrofit(live);
+        if (proposal === undefined) {
+          process.stdout.write(
+            `brief ${path}\n\nNo Releases / Project context / Reporting / Amendments heading found — cannot classify a cut.\n`,
+          );
+          process.exit(1);
+        }
+        process.stdout.write(`${formatRetrofitProposal(path, proposal)}\n`);
+        if (argv.includes("--apply")) {
+          const backup = applyRetrofit(path, proposal);
+          process.stdout.write(`\napplied retrofit — previous brief kept at ${backup}\n`);
+        }
+        break;
+      }
+
+      if (argv.includes("--migrate")) {
+        if (layout.kind === "overlay") {
+          process.stdout.write(`${formatBriefStatus(path, { kind: "overlay", ...layout })}\n`);
+          break;
+        }
+        if (layout.kind === "missing") {
+          process.stderr.write(`omp-conductor: no brief at ${path} to migrate.\n`);
+          process.exit(1);
+        }
+        if (layout.kind === "legacy-handwritten") {
+          process.stdout.write(
+            `${formatBriefStatus(path, { kind: "unsplittable", missing: layout.missing })}\n`,
+          );
+          process.exit(1);
+        }
+        if (project === undefined && /\{\{[A-Za-z0-9_]+\}\}/.test(floor)) {
+          process.stderr.write(
+            "omp-conductor: --migrate needs --project (or a config) so the floor renders without {{PLACEHOLDER}}s.\n",
+          );
+          process.exit(1);
+        }
+        if (!argv.includes("--apply")) {
+          process.stdout.write(
+            [
+              `migrate ${layout.orchestratorPath}`,
+              "",
+              "Would write POLICY.md from the owned half below YOURS TO EDIT,",
+              "then recompose ORCHESTRATOR.md from the package floor + that policy.",
+              "",
+              "Apply:  omp-conductor brief-upgrade --migrate --apply",
+            ].join("\n") + "\n",
+          );
+          break;
+        }
+        const policyPath = project ? policyPathForProject(project) : join(workspaceRoot, "POLICY.md");
+        const result = migrateToPolicy({
+          orchestratorPath: layout.orchestratorPath,
+          policyPath,
+          floor: project ? renderFloorForProject(project) : floor,
+          owned: layout.owned,
+        });
+        process.stdout.write(`${formatMigrateResult(result)}\n`);
+        break;
       }
 
       let live: string;
@@ -559,12 +642,14 @@ try {
         process.exit(1);
       }
 
-      // With no config there are no coordinates to substitute, so the template is
-      // compared raw. Headings carry no placeholders, so the section-level report is
-      // unaffected; the note below keeps the printed text honest.
-      const status = checkBrief(live, project === undefined ? shippedBriefTemplate() : renderBriefForProject(project));
-      // Report first, always: --apply on a brief with no banner must not be the
-      // command that silently discards an operator's hand-written policy.
+      if (layout.kind === "overlay") {
+        process.stdout.write(
+          `${formatBriefStatus(path, { kind: "overlay", policyPath: layout.policyPath, orchestratorPath: layout.orchestratorPath })}\n`,
+        );
+        break;
+      }
+
+      const status = checkBrief(live, rendered);
       process.stdout.write(`${formatBriefStatus(path, status)}\n`);
       if (project === undefined) {
         process.stdout.write(
