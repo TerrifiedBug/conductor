@@ -36,14 +36,15 @@ The package ships three deployables, plus one skill:
 
 | Deployable | Entry | What it is for |
 | --- | --- | --- |
-| omp plugin | `/conductor` slash command | Inspect and arm the conductor from inside an omp session: dry-run the queue, read status, pause, resume. |
+| omp plugin | `/conductor` slash command | Inspect and control the fleet from inside an omp session: status, hold/halt, arm/disarm, pause/resume, setup. |
 | Standalone daemon | `omp-conductor` binary | The dispatch loop, managed as a background process (`start` / `stop` / `restart`) with a `/healthz` endpoint for a supervisor. |
 | Orchestrator heartbeat | omp extension, activated by `.conductor-tick.json` | Prompts a 24/7 orchestrator session on a fixed interval so its standing loop actually runs, and marks the session stalled when its prompts stop being consumed. Inert in every other session — including a second session opened in the fleet's own directory. See [Orchestrator tick](#orchestrator-tick). |
 | Onboarding skill | `skill://conductor-onboarding` | Directs an omp session to interview you, read your repos for real CI gates, and tailor `ORCHESTRATOR.md` — then finish through the wizard. Discovered automatically once the plugin is installed. See [Onboarding](#onboarding). |
 
 The first two are thin wrappers over the same `daemon.ts`, so the plugin and the
-CLI cannot disagree about what a cap means or where the state lives. The heartbeat
-reads the same pause flag both of them write.
+CLI cannot disagree about what a cap means or where the state lives. Claiming is
+gated by the pause flag; tick sends are gated by the arm marker — they are not
+the same switch. Prefer `hold` when you want both quiet.
 
 ## Your workflow vs. the package
 
@@ -1129,6 +1130,11 @@ omp-conductor start [--port N] [--project NAME]
 omp-conductor stop
 omp-conductor restart [--port N] [--project NAME]
 omp-conductor status [--project NAME]
+omp-conductor hold [--project NAME]
+omp-conductor halt [--pane] [--project NAME]
+omp-conductor arm [--project NAME]
+omp-conductor disarm [--project NAME]
+omp-conductor release-pane [--project NAME]
 omp-conductor tail <issue> [--project NAME]
 omp-conductor unblock <issue> [--project NAME]
 omp-conductor daemon [--once] [--port N] [--project NAME]
@@ -1144,15 +1150,20 @@ omp-conductor help
 | `start` | Spawn the loop in the background, detached, and wait until it answers `GET /healthz` on `:8787`. Refuses if one is already live, naming its pid. If the process dies or never serves, `start` cleans up after it and quotes the tail of `daemon.log`. |
 | `stop` | Prefer `systemctl stop omp-conductor.service` when that unit's MainPID is the live daemon — systemd then owns the stop and will not schedule a restart for the exit it just requested. Otherwise `SIGTERM`, then `SIGKILL` after a 10-second grace period. Prints `not running` when there is nothing to stop, and tags the confirmation with `(via systemctl)` when the unit path was used. |
 | `restart` | Prefer `systemctl restart` when the unit owns the live pid so the replacement stays supervised; otherwise `stop` then `start`, inheriting the running daemon's port and project unless a flag overrides them. The new process **salvages dirty live worktrees before orphaning** those rows — see [Deploying a new package onto a busy fleet](#deploying-a-new-package-onto-a-busy-fleet). |
-| `status [--project NAME]` | Pause state, config and state paths, resolved caps, active runs and today's usage, plus a `daemon` block: pid, uptime, port, project, `/healthz` result and log path. While live workers > 0, prints a `deploy` line naming the count so a busy restart is visible before you take it. A `.conductor-stalled` marker in the state directory adds an `orchestrator   STALLED since …` line — see [the stall marker](#a-wedged-session-and-the-marker-that-notices). Reads while a daemon in another process writes. |
+| `status [--project NAME]` | Layered fleet report first: `dispatch` / `ticks` / `pane` / `recovery` / `herdr` / `daemon`, then the project body (caps, active runs, today's usage). While live workers > 0, prints a `deploy` line naming the count so a busy restart is visible before you take it. A `.conductor-stalled` marker in the state directory adds an `orchestrator   STALLED since …` line — see [the stall marker](#a-wedged-session-and-the-marker-that-notices). Reads while a daemon in another process writes. |
+| `hold [--project NAME]` | Soft stop: pause claiming **and** disarm ticks. Daemon and pane stay up. Prefer this over `pause` when the intent is "stop the conductor" without killing processes. See [Stop the conductor](#stop-the-conductor-hold--halt). |
+| `halt [--pane] [--project NAME]` | `hold`, then stop the dispatch daemon (systemctl-aware). Pane stays up unless `--pane` is passed. `halt --pane` also pins herdr-conductor recovery off for the conductor agent only — it does **not** stop `herdr-fleet.service` or any other herdr session. Fail-closed: exits nonzero unless the agent is proven gone. |
+| `arm [--project NAME]` | Proof-gated: send a Telegram challenge and write the arm marker only after your reply appears as a user turn in the orchestrator transcript. Never auto-armed by `resume` / `hold`. |
+| `disarm [--project NAME]` | Remove the arm marker so ticks skip. Processes untouched. |
+| `release-pane [--project NAME]` | Clear the `halt --pane` recovery pin so herdr-conductor may resume the fleet agent again. |
 | `tail <issue>` | Follow the newest run for that issue: the worker's assistant text as `assistant: …` and each tool it calls as `tool: <name>`, printed as they land. Workers are omp sessions inside the daemon rather than terminals, so this is the only way to watch one live — a herdr pane running it becomes an observation window. Starts from the top of the transcript, not the end, so attaching to a run that is already ten turns in shows those ten turns. Exits `1` with `no run recorded for #N` when the issue has never been dispatched, or `no transcript yet (state: …)` when the attempt has not opened one. Otherwise it runs until `Ctrl-C`, or until the run has finished and its transcript has been silent for five seconds, and prints `run ended: <state>`. |
 | `unblock <issue>` | Remove that issue's `blocked` and `failed` state labels through the tracker, so the next tick can claim it again. This is the supported way back for an escalation you answered: eligibility disqualifies any issue carrying a state label, so an answered issue that keeps one is never re-claimed and the answer is inert. Removing a label the issue does not carry is a no-op, so both are always cleared and neither has to be looked up first. `agent:in-progress` is deliberately not touched — it means a worker process exists, which is not something an answer changes. The run history is left exactly as it is: an answered block still spent a worker, so it still counts toward `maxAttemptsPerIssue`, and the output says how many attempts remain — or warns that the next tick will escalate instead of dispatching, when none do. Exits `2` with `unblock needs an issue number` on a missing or malformed positional. |
 | `daemon` | Run the loop in the **foreground**, ticking every 5 minutes and serving `/healthz`. This is what `start` launches, and what a systemd unit should call. Writes the pidfile itself, and refuses with `another daemon is alive (pid N); stop it first` rather than becoming a second dispatcher. |
 | `daemon --once` | Run a single tick and exit. No HTTP server, and no pidfile — a drill must not register itself as the daemon, or the next reader believes it and the real daemon's in-flight runs get reconciled as orphans. |
 | `--port N` | Accepted by `start`, `restart` and `daemon`. Both `--port 9000` and `--port=9000` work; missing or out of range exits `2` rather than falling back to the default, because probing the wrong endpoint is worse than a hard failure. |
 | `--project NAME` | Pick the project to service. One daemon process serves exactly one project; with several configured projects the name is required. |
-| `pause` | Stop claiming new work. The running daemon notices on its next tick; runs already in flight finish. The orchestrator heartbeat keeps ticking — its gate is the arm marker, not this flag. |
-| `resume` | Allow claiming again. |
+| `pause` | Stop claiming new work only. The running daemon notices on its next tick; runs already in flight finish. The orchestrator heartbeat keeps ticking if armed — its gate is the arm marker, not this flag. Prefer `hold` to silence both. |
+| `resume` | Clear pause only — does **not** re-arm. Run `arm` after an inbound Telegram proof to resume ticks. |
 | `graph-setup` | Print how to set up the code-graph indexes workers query instead of grepping: a `git clone` for every index-only clone that does not exist yet, the one-shot index command per repo, and a `cbm-reindex.service` + `cbm-reindex.timer` pair generated from the project's own repos and branches. Reads only, so it is safe on a host where you are not root. Exits `1` when no repo in the project has [`graphProject`](#configuration) set, because the fix is a wizard answer rather than a flag. See [Code-graph discovery](#code-graph-discovery). |
 | `--write` | Only for `graph-setup`. Writes the refresh script into the state directory and the two units into `/etc/systemd/system`, then prints the exact `systemctl daemon-reload && systemctl enable --now cbm-reindex.timer` to run. It never runs `systemctl` itself and never enables anything: that needs root, and a package that enables system timers behind your back is one you cannot audit by reading its output. |
 | `brief-upgrade` | Inspect the package-floor + `POLICY.md` overlay. Reports by default; see [Keeping a brief current](#keeping-a-brief-current). |
@@ -1163,12 +1174,14 @@ omp-conductor help
 | `help`, `--help`, `-h` | Print usage. An unknown or missing verb prints it too, and exits `2`. |
 
 Pause is a flag file under the state directory, so it applies to every project and
-survives a daemon restart.
+survives a daemon restart. Hold also removes the arm marker the heartbeat reads,
+so both brains go quiet without killing processes.
 
-Four of these are available in-session as `/conductor setup`, `/conductor status`,
-`/conductor pause` and `/conductor resume`, each taking an optional project name as
-a second word. Background-process management is CLI-only: the plugin does not
-start, stop or restart the daemon.
+These are available in-session as `/conductor setup`, `/conductor status`,
+`/conductor hold`, `/conductor halt [--pane]`, `/conductor arm`, `/conductor disarm`,
+`/conductor release-pane`, `/conductor pause` and `/conductor resume`, each taking
+an optional project name. Background-process management (`start` / `stop` /
+`restart`) is CLI-only: the plugin does not start, stop or restart the daemon.
 
 ### Health endpoint
 
