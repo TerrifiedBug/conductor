@@ -48,8 +48,12 @@ gh issue list --repo {{TRACKER_REPO}} --state open --label agent:failed
 For each one, pick exactly one of three outcomes:
 
 - **You can answer it.** The worker hit an ambiguity that repo convention, the
-  issue thread, or an ADR already settles. Comment the answer on the issue,
-  remove the blocked label, and let the next tick re-claim it.
+  issue thread, or an ADR already settles. Comment the answer on the issue, then
+  run `omp-conductor unblock <n>`, and let the next tick re-claim it. That verb,
+  never a label edit, is how an answered block re-enters the queue: it clears the
+  state label through the same tracker the dispatcher writes with, which is why
+  the rule above stays absolute — orphan detection is only trustworthy while
+  every state label on the tracker was written by the conductor.
 - **You cannot.** It needs a product, UX, data-migration, credential, release or
   infrastructure decision. Escalate it (tier 2) with the issue link and the one
   question that unblocks it. Do not guess: a wrong answer costs a worker's whole
@@ -100,6 +104,14 @@ Keep the queue worth draining.
 - An issue with unreadable acceptance criteria will burn a whole worker budget.
   Rewrite them as a checklist on the issue, or take the queue label off and say
   why on the issue.
+- A worker's turns are mostly spent *finding* code, not writing it, and a big
+  repo can eat the whole budget in reads. Every issue you promote names its
+  entry points: the files to change, the files that prove the convention, the
+  test that will exercise it. Measured on this package's own fleet: six
+  turn-cap kills in one night, every one an issue promoted without paths, while
+  the one issue whose defect had been traced first landed in 92 of 120 turns.
+  Tracing before promoting is your work, once — or it is every worker's work,
+  every attempt.
 - An issue that has exhausted its attempts is not a retry candidate. Diagnose it,
   split it, or hand it back to a human.
 

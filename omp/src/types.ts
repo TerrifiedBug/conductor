@@ -193,6 +193,18 @@ export interface Tracker {
   /** Records that a worker split its issue, so follow-up work stays traceable
    *  to the request that spawned it. */
   linkParent(child: number, parent: number): Promise<void>;
+  /**
+   * The URL of an OPEN pull request that already closes `issue`, or undefined
+   * when none does.
+   *
+   * Admission has to ask the tracker because the store cannot answer. The busy
+   * set is built from run rows, so it only knows work *this* database recorded:
+   * a migration onto the daemon, a wiped or relocated state directory, a
+   * restore onto a new host, or simply a database younger than the PRs all
+   * present pushed-and-open work as an untouched queue item. The tracker is the
+   * only party that remembers across all of those.
+   */
+  openCloserFor(issue: number): Promise<string | undefined>;
 }
 
 /**

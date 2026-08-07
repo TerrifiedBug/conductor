@@ -6,8 +6,9 @@
  * cannot drift apart.
  */
 import { closeSync, openSync, readFileSync, readSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { checkBrief, formatBriefStatus, writeMergedBrief } from "./brief-upgrade.ts";
-import { findProject, loadConfig } from "./config.ts";
+import { findProject, loadConfig, resolveCaps, stateDir } from "./config.ts";
 import { dbPath, formatStatus, runDaemon, setPaused, statusSnapshot } from "./daemon.ts";
 import {
   clearRecord,
@@ -18,9 +19,12 @@ import {
   stopDaemon,
   writeRecord,
 } from "./lifecycle.ts";
+import { STALL_MARKER_FILE } from "./orchestrator-tick.ts";
 import { briefPathForProject, renderBriefForProject, shippedBriefTemplate } from "./setup.ts";
 import { LIVE_STATES, openStore } from "./store.ts";
+import { makeTracker } from "./tracker/github.ts";
 import type { ProjectConfig } from "./types.ts";
+import { formatUnblock, unblockIssue } from "./unblock.ts";
 
 const USAGE = `omp-conductor — dispatch ready issues to omp coding sessions
 
@@ -30,6 +34,7 @@ usage:
   omp-conductor restart [--port N] [--project NAME]
   omp-conductor status [--project NAME]
   omp-conductor tail <issue> [--project NAME]
+  omp-conductor unblock <issue> [--project NAME]
   omp-conductor daemon [--once] [--port N] [--project NAME]
   omp-conductor pause
   omp-conductor resume
@@ -49,6 +54,11 @@ usage:
            the daemon rather than terminals, so this is the only way to watch
            one live. Runs until Ctrl-C, or until the run has finished and its
            transcript has stopped growing.
+  unblock  clear <issue>'s blocked and failed labels so the next tick can claim
+           it again — the supported way back for an escalation you answered,
+           and why the brief's "never hand-edit a state label" rule can stay
+           absolute. Attempts already spent are kept: an answered block still
+           cost a worker.
   daemon   run the dispatch loop in the foreground; --once runs a single tick
            and exits. This is what \`start\` launches.
   pause    stop claiming new work. The running daemon notices on its next tick.
@@ -125,6 +135,33 @@ async function daemonSection(): Promise<string> {
 }
 
 /**
+ * The orchestrator half, and the one thing `status` has ever known about the
+ * supervising session: the stall marker its heartbeat writes when its own
+ * prompts stop being consumed (see {@link STALL_MARKER_FILE}).
+ *
+ * The marker is written in the *session's* cwd, which this process has no way
+ * to discover — so this reads the state directory, on the reference deploy's
+ * convention that the orchestrator session runs from exactly there. That makes
+ * the reading one-directional: a line printed here is proof of a wedge, and no
+ * line is proof of nothing at all. On a fleet whose session lives elsewhere the
+ * check is simply inert, which is why it never prints a reassuring "healthy".
+ */
+function stallLine(): string | undefined {
+  let raw: string;
+  try {
+    raw = readFileSync(join(stateDir(), STALL_MARKER_FILE), "utf8").trim();
+  } catch {
+    return undefined;
+  }
+  // "<ISO timestamp> <one-line diagnosis>". A file truncated by something else
+  // still gets reported: that the marker exists at all is the news.
+  const cut = raw.indexOf(" ");
+  const since = cut < 0 ? raw : raw.slice(0, cut);
+  const diagnosis = cut < 0 ? "" : ` — ${raw.slice(cut + 1)}`;
+  return `orchestrator   STALLED since ${since === "" ? "an unrecorded time" : since}${diagnosis}`;
+}
+
+/**
  * `DaemonRecord.logFile` for a daemon nobody spawned. The field is required and
  * `status` prints it, so it has to say something true: a foreground daemon
  * opened no log of its own — whoever started it owns its stdout, be that
@@ -143,11 +180,15 @@ const TAIL_POLL_MS = 1_000;
  */
 const TAIL_QUIET_MS = 5_000;
 
-/** The `<issue>` positional. Exits 2 rather than following run #NaN. */
-function issueArg(raw: string | undefined): number {
+/**
+ * The `<issue>` positional, for the two verbs that take one. Exits 2 rather
+ * than following run #NaN or clearing the labels of issue #0; `verb` is named
+ * in the message so the operator is told which of the two they mistyped.
+ */
+function issueArg(verb: string, raw: string | undefined): number {
   const issue = raw === undefined ? Number.NaN : Number.parseInt(raw.replace(/^#/, ""), 10);
   if (!Number.isInteger(issue) || issue < 1) {
-    process.stderr.write(`omp-conductor: tail needs an issue number, got "${raw ?? ""}"\n`);
+    process.stderr.write(`omp-conductor: ${verb} needs an issue number, got "${raw ?? ""}"\n`);
     process.exit(2);
   }
   return issue;
@@ -375,13 +416,28 @@ try {
 
     case "status": {
       const snapshot = formatStatus(statusSnapshot(flag(argv, "project")));
-      process.stdout.write(`${snapshot}\n\n${await daemonSection()}\n`);
+      const stalled = stallLine();
+      process.stdout.write(`${snapshot}\n\n${await daemonSection()}\n${stalled === undefined ? "" : `\n${stalled}\n`}`);
       break;
     }
 
     case "tail": {
-      const issue = issueArg(argv[1]);
+      const issue = issueArg("tail", argv[1]);
       await tailRun(findProject(loadConfig(), flag(argv, "project")).name, issue);
+      break;
+    }
+
+    case "unblock": {
+      const issue = issueArg("unblock", argv[1]);
+      const cfg = loadConfig();
+      const project = findProject(cfg, flag(argv, "project"));
+      const store = openStore(dbPath());
+      try {
+        const outcome = await unblockIssue(project, makeTracker(project), store, issue);
+        process.stdout.write(`${formatUnblock(issue, outcome, project, resolveCaps(project, cfg.defaults))}\n`);
+      } finally {
+        store.close();
+      }
       break;
     }
 

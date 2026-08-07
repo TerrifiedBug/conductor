@@ -38,7 +38,7 @@ The package ships three deployables, plus one skill:
 | --- | --- | --- |
 | omp plugin | `/conductor` slash command | Inspect and arm the conductor from inside an omp session: dry-run the queue, read status, pause, resume. |
 | Standalone daemon | `omp-conductor` binary | The dispatch loop, managed as a background process (`start` / `stop` / `restart`) with a `/healthz` endpoint for a supervisor. |
-| Orchestrator heartbeat | omp extension, activated by `.conductor-tick.json` | Prompts a 24/7 orchestrator session on a fixed interval so its standing loop actually runs. Inert in every other session. See [Orchestrator tick](#orchestrator-tick). |
+| Orchestrator heartbeat | omp extension, activated by `.conductor-tick.json` | Prompts a 24/7 orchestrator session on a fixed interval so its standing loop actually runs, and marks the session stalled when its prompts stop being consumed. Inert in every other session. See [Orchestrator tick](#orchestrator-tick). |
 | Onboarding skill | `skill://conductor-onboarding` | Directs an omp session to interview you, read your repos for real CI gates, and tailor `ORCHESTRATOR.md` — then finish through the wizard. Discovered automatically once the plugin is installed. See [Onboarding](#onboarding). |
 
 The first two are thin wrappers over the same `daemon.ts`, so the plugin and the
@@ -329,7 +329,18 @@ Per tick, for the daemon's project:
    an active run — including a green PR, so a second attempt can never land on a
    live PR. An issue that has used `maxAttemptsPerIssue` escalates at Tier 1
    instead of being admitted.
-8. **Dispatch** the admitted issues concurrently.
+8. **Ask the tracker whether the work already exists.** For each candidate that
+   survived step 7 — so at most one API call per free slot, never one per queued
+   issue — the daemon asks whether an **open** PR already closes the issue. If one
+   does, the issue is skipped with its PR named in the log. Drafts count: a draft
+   PR's branch still holds the only copy of the work. This is the guard the store
+   cannot provide, because a store younger than the PRs (a migration, a wiped or
+   relocated state directory, a restore onto a new host) has no row to object
+   with. If the check itself fails, the candidate is **held**, not admitted, and
+   retried next tick: the cost of holding is five minutes, the cost of admitting
+   on an unknown is a burned attempt and a duplicate PR. Only that candidate is
+   held, so a flaky API cannot stall the rest of the queue.
+9. **Dispatch** the admitted issues concurrently.
 
 Then, per admitted issue:
 
@@ -354,12 +365,25 @@ Then, per admitted issue:
    | --- | --- | --- | --- |
    | `pushed-green` | `agent:in-progress` stays until the merge closes the issue | removed | none |
    | `blocked` | swapped to `agent:blocked` | removed | Tier 1 |
-   | `failed` / `killed` | swapped to `agent:failed` | **kept** as evidence | Tier 1 |
-   | unexpected error | swapped to `agent:failed` | kept | Tier 1 |
+   | `failed` / `killed` | swapped to `agent:failed` | dirty tree committed to the branch, then **kept** as evidence | Tier 1 |
+   | unexpected error | swapped to `agent:failed` | same | Tier 1 |
 
    Label swaps add the new label before removing the old one: the reverse order
    leaves a window in which the issue carries no state label at all, which is
    exactly the shape eligibility reads as fresh work.
+
+   **A non-graceful end salvages the tree first.** A turns-cap kill, a
+   wall-clock kill and a crash are all external and unannounced: they land
+   mid-edit, and only the run's *branch* is preserved across attempts — the tree
+   is removed `--force` by the next one. So before the escalation is written,
+   a dirty tree is committed to the run's own branch as
+   `wip(#<issue>): attempt <n> killed by <reason> — auto-salvaged` (everything,
+   including files git has never seen) and pushed, and the escalation says where
+   it went: `WIP committed to <branch> @ <sha>`. A push that is refused leaves
+   the commit in this host's mirror and says so; a salvage that fails outright
+   says that, loudly, naming the tree that now holds the only copy. A `blocked`
+   run is deliberately *not* salvaged — it stopped on purpose, with turns still
+   in hand to commit for itself.
 
 ### What a restart does to runs that were in flight
 
@@ -467,7 +491,7 @@ otherwise looks like a run that was merely unlucky.
 | Tier | Meaning | Raised by | Delivered to |
 | --- | --- | --- | --- |
 | 1 | "Not a human's problem yet" — the run is parked and safe. | Unroutable issue, blocked run, failed or killed run, dispatch error, attempts exhausted. | The orchestrator session, as an injected prompt. Falls back to an issue comment when no orchestrator is running, or when it will not accept the injection. |
-| 2 | "The fleet is stopped until you look." | Daily spend cap reached; the project is already paused. | Telegram, when `escalation.telegramChatId` is set and a bot token is readable; otherwise it falls back to the issue comment. |
+| 2 | "The fleet is stopped until you look." | Daily spend cap reached; the installed package changed under the running daemon. Either way the project is already paused. | Telegram, when `escalation.telegramChatId` is set and a bot token is readable; otherwise it falls back to the issue comment. |
 
 **The orchestrator** is one persistent, file-backed session per daemon run, resumed
 across restarts so it remembers what it has already handled. Its `cwd` is the state
@@ -486,6 +510,17 @@ typically. The daemon then starts none of its own and every tier-1 escalation
 posts as an issue comment, which is what that session drains. One brain, and it
 is the one you can watch.
 
+**Answering a tier 1 is only half of it.** A blocked or failed run leaves its state
+label on the issue, and eligibility reads any state label as disqualifying, so an
+answered issue that keeps one is never re-claimed and the answer is inert — nothing
+fails, the issue just stops existing as far as dispatch is concerned.
+[`omp-conductor unblock <issue>`](#cli-reference) is the way back: it clears the
+label through the same tracker the dispatcher writes with. The brief tells the
+orchestrator to run that verb rather than edit the label itself, and that is not a
+formality — orphan detection works by comparing `agent:in-progress` labels against
+live runs, and it is only trustworthy while every state label on the tracker was
+written by this package.
+
 Tier 2 borrows the bot token that `omp-telegram` already owns, at
 `~/.omp/agent/telegram/.env` (or `$OMP_TELEGRAM_STATE_DIR/.env`). If you run that
 bot, Tier 2 needs no extra configuration beyond the chat id. If the token is
@@ -498,8 +533,8 @@ issue on every poll, so a ledger in the store — keyed by project, issue, tier 
 summary — makes a recurring condition page **once** and suppresses the five-minute
 repeats. The marker is recorded only on successful delivery, so a page that could
 not be delivered is retried on the next tick instead of being written off as sent.
-The spend-cap summary carries the date, so the same cap pages again tomorrow but
-only once per day.
+The spend-cap and integrity-tripwire summaries carry the date, so the same
+condition pages again tomorrow but only once per day.
 
 If `fallbackToIssueComment` is off and no Telegram transport is configured,
 delivery throws instead of dropping silently. The failure is logged and retried,
@@ -669,7 +704,9 @@ It sends **nothing** when:
 - `armedFile` is configured and missing;
 - `accessFile` is configured and the escalation channel is not verifiably up;
 - an earlier tick is still queued. Ticks coalesce rather than stack, so a slow
-  turn cannot leave a backlog of heartbeats behind it.
+  turn cannot leave a backlog of heartbeats behind it — and two coalesced ticks
+  in a row are the signal that the session is not slow but wedged, which is
+  what the [stall marker](#a-wedged-session-and-the-marker-that-notices) is for.
 
 ### The escalation channel is a gate, and it fails closed
 
@@ -706,6 +743,52 @@ cannot supply a reporting scope logs `tick reporting scope: using material` once
 per session. The interval does not re-log it, because the file is unlikely to fix
 itself between two ticks.
 
+### A wedged session, and the marker that notices
+
+Coalescing is also the only wedge detector this package has. On 2026-08-07 the
+dogfood fleet's orchestrator finished a turn, logged `ui.loop-blocked` right
+after an auto-compaction threshold decision, and never started another. The
+process stayed alive, so herdr's recovery — agent listed AND a non-shell
+foreground process — read healthy. The dispatch daemon is a separate process and
+kept working, so `/healthz` was green all night, while the one brain holding
+merge authority sat on a green PR it never merged. A tick injected two minutes
+into the wedge and an operator's Telegram message five minutes later both went
+unconsumed for 23 minutes, until a manual `SIGTERM`. The heartbeat logged `tick
+skipped: tick already pending` throughout, which is exactly what a merely slow
+turn looks like.
+
+So the heartbeat counts them. Two consecutive coalesced ticks — a full hour at
+the reference 1800-second interval, generous by construction — mean the last
+prompt was never consumed, and the extension:
+
+- writes `<session cwd>/.conductor-stalled`, one line of `<ISO timestamp>
+  <diagnosis>`, which any watchdog can stat and treat as "not live". The file is
+  the signal; restarting or paging is the watchdog's policy, not this package's.
+- logs at **error** level: `orchestrator stalled: 2 ticks queued unconsumed —
+  the agent loop is not draining; see .conductor-stalled`.
+
+Both escapes deliberately leave the session, because a loop that cannot drain
+its queue cannot report on itself — that is the whole failure.
+
+The first tick that actually sends clears the counter and deletes the marker,
+and it deletes one it did not write: recovery normally arrives as a fresh
+process resuming the same transcript, so the session doing the clearing is not
+the session that stalled. Nothing else removes the file. Neither the write nor
+the delete can take the heartbeat down — a filesystem error is logged and the
+tick carries on.
+
+`omp-conductor status` reads the same marker from the **state directory** and
+prints one more line under the daemon block:
+
+```text
+orchestrator   STALLED since 2026-08-07T06:27:55.123Z — 2 ticks queued unconsumed — the agent loop is not draining
+```
+
+That reading is the reference deploy's convention — the orchestrator session
+runs from `~/.omp/conductor`, which is the state directory — and it is
+one-directional: a line there proves a wedge, and its absence proves nothing,
+least of all on a fleet whose session lives somewhere else.
+
 ## CLI reference
 
 ```bash
@@ -714,6 +797,7 @@ omp-conductor stop
 omp-conductor restart [--port N] [--project NAME]
 omp-conductor status [--project NAME]
 omp-conductor tail <issue> [--project NAME]
+omp-conductor unblock <issue> [--project NAME]
 omp-conductor daemon [--once] [--port N] [--project NAME]
 omp-conductor pause
 omp-conductor resume
@@ -726,8 +810,9 @@ omp-conductor help
 | `start` | Spawn the loop in the background, detached, and wait until it answers `GET /healthz` on `:8787`. Refuses if one is already live, naming its pid. If the process dies or never serves, `start` cleans up after it and quotes the tail of `daemon.log`. |
 | `stop` | `SIGTERM`, then `SIGKILL` after a 10-second grace period. Prints `not running` when there is nothing to stop. |
 | `restart` | `stop` then `start`, inheriting the running daemon's port and project unless a flag overrides them — a restart that quietly moved to the default port would leave every existing health check pointing at nothing. |
-| `status [--project NAME]` | Pause state, config and state paths, resolved caps, active runs and today's usage, plus a `daemon` block: pid, uptime, port, project, `/healthz` result and log path. Reads while a daemon in another process writes. |
+| `status [--project NAME]` | Pause state, config and state paths, resolved caps, active runs and today's usage, plus a `daemon` block: pid, uptime, port, project, `/healthz` result and log path. A `.conductor-stalled` marker in the state directory adds an `orchestrator   STALLED since …` line — see [the stall marker](#a-wedged-session-and-the-marker-that-notices). Reads while a daemon in another process writes. |
 | `tail <issue>` | Follow the newest run for that issue: the worker's assistant text as `assistant: …` and each tool it calls as `tool: <name>`, printed as they land. Workers are omp sessions inside the daemon rather than terminals, so this is the only way to watch one live — a herdr pane running it becomes an observation window. Starts from the top of the transcript, not the end, so attaching to a run that is already ten turns in shows those ten turns. Exits `1` with `no run recorded for #N` when the issue has never been dispatched, or `no transcript yet (state: …)` when the attempt has not opened one. Otherwise it runs until `Ctrl-C`, or until the run has finished and its transcript has been silent for five seconds, and prints `run ended: <state>`. |
+| `unblock <issue>` | Remove that issue's `blocked` and `failed` state labels through the tracker, so the next tick can claim it again. This is the supported way back for an escalation you answered: eligibility disqualifies any issue carrying a state label, so an answered issue that keeps one is never re-claimed and the answer is inert. Removing a label the issue does not carry is a no-op, so both are always cleared and neither has to be looked up first. `agent:in-progress` is deliberately not touched — it means a worker process exists, which is not something an answer changes. The run history is left exactly as it is: an answered block still spent a worker, so it still counts toward `maxAttemptsPerIssue`, and the output says how many attempts remain — or warns that the next tick will escalate instead of dispatching, when none do. Exits `2` with `unblock needs an issue number` on a missing or malformed positional. |
 | `daemon` | Run the loop in the **foreground**, ticking every 5 minutes and serving `/healthz`. This is what `start` launches, and what a systemd unit should call. Writes the pidfile itself, and refuses with `another daemon is alive (pid N); stop it first` rather than becoming a second dispatcher. |
 | `daemon --once` | Run a single tick and exit. No HTTP server, and no pidfile — a drill must not register itself as the daemon, or the next reader believes it and the real daemon's in-flight runs get reconciled as orphans. |
 | `--port N` | Accepted by `start`, `restart` and `daemon`. Both `--port 9000` and `--port=9000` work; missing or out of range exits `2` rather than falling back to the default, because probing the wrong endpoint is worse than a hard failure. |
@@ -780,6 +865,35 @@ The worker ends with a six-line evidence report (issue, pr, state, gates, change
 next). `pushed-green` means it watched the checks go green rather than expecting
 them to.
 
+### The boundary is prompt text — and one tripwire
+
+A worker session gets a `cwd` and nothing else: the harness applies no filesystem
+or network restriction, so "touch any path outside its worktree" is a rule the
+session is asked to keep, not one the process cannot break. Target selection *is*
+mechanical — only a repo in `routing.repos` is ever checked out — and so are the
+caps, but between them they bound where work starts and how much of it happens,
+not how far a wandering or prompt-injected session can reach.
+
+The one path that is checked mechanically is the conductor itself. At startup the
+daemon sha256s every `.ts` and `.md` file of its own installed `src/` — the
+dispatcher and the briefs both, since rewriting a brief buys more than rewriting
+the loop — and re-walks that tree on every tick (about 0.6 ms). Any difference at
+all, changed or added or removed, is read as the package having been modified
+underneath a running daemon: the tick claims nothing, the fleet is paused, and a
+tier-2 escalation naming the first few differing paths pages you **once**, not
+every five minutes.
+
+**A normal deploy never trips it.** The baseline is recorded per daemon process,
+so installing a new build and restarting the unit re-records it from the new
+files; only a change that lands *while* a daemon is holding the package open can
+diverge from it. That also means `omp-conductor resume` on its own will not hold
+— the next tick re-walks, still differs, and pauses again. Put the files back, or
+restart onto the build you meant to be running.
+
+This is detection, not prevention. It catches the worker that wandered, and it
+catches the human who edited the live install "just to test something", which in
+practice is the commoner of the two.
+
 ## Limitations
 
 Known and deliberate in this version:
@@ -822,12 +936,19 @@ Known and deliberate in this version:
   (the orchestrator's) no matter how many workers are running, and no amount of
   `maxConcurrentWorkers` changes that.
 
-  The cap does work. The admission loop (`src/daemon.ts:410-448`) computes
+  The cap does work. The admission loop (`admitCandidates` in `src/daemon.ts`) computes
   `slots = maxConcurrentWorkers - live workers`, admits at most that many issues
   per tick, and dispatches them together. To see them, read `omp-conductor
   status`, which lists every occupied issue, or follow `daemon.log`.
 - **Merges, releases and deploys are human-only, by design.** The conductor
   produces green PRs and stops.
+- **Worker confinement is behavioural.** `runWorker` hands the session a `cwd` and
+  a brief; nothing stops it reading or writing elsewhere on the host, and on a
+  single-user deploy that includes the state directory and the host's `gh`
+  credentials. The [integrity tripwire](#the-boundary-is-prompt-text--and-one-tripwire)
+  turns one case of this into a paused, paged fleet after the fact; the prevention
+  half is a deployment concern — run workers as a least-privileged uid whose write
+  access ends at its worktree and mirror.
 
 ## License
 

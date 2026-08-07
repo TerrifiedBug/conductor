@@ -7,8 +7,9 @@
  * of it, so concurrency, daily volume, spend and per-issue attempts are counted
  * here and enforced before anything is claimed.
  */
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
 import { configPath, findProject, loadConfig, resolveCaps, stateDir } from "./config.ts";
 import { createEscalator } from "./escalate.ts";
 import { livingDaemon } from "./lifecycle.ts";
@@ -28,8 +29,15 @@ import type {
   Store,
   Tracker,
 } from "./types.ts";
-import { renderBrief, runWorker } from "./worker.ts";
-import { addWorktree, mirrorPathFor, removeWorktree, worktreePathFor } from "./worktree.ts";
+import { type KilledBy, renderBrief, runWorker } from "./worker.ts";
+import {
+  addWorktree,
+  mirrorPathFor,
+  removeWorktree,
+  salvageWip,
+  type SalvageOutcome,
+  worktreePathFor,
+} from "./worktree.ts";
 
 /** Long enough that the tracker is not polled raw, short enough that a human
  *  who labels an issue sees it picked up within a coffee break. */
@@ -61,6 +69,7 @@ interface Deps {
   tracker: Tracker;
   store: Store;
   escalate(e: Escalation): Promise<void>;
+  integrity: IntegrityGate;
 }
 
 // ---------------------------------------------------------------- paths & pause
@@ -88,6 +97,96 @@ export function setPaused(v: boolean): void {
   } else {
     rmSync(f, { force: true });
   }
+}
+
+// ----------------------------------------------------------- package integrity
+
+/** Enough differing paths to tell a deploy from a tamper at a glance; the full
+ *  list is on the host, and the answer is always "go look at the host". */
+const INTEGRITY_SAMPLE = 5;
+
+/**
+ * What the daemon booted with, and whether it has already paged about losing
+ * it. Lives exactly as long as one `runDaemon()` call — which is the whole
+ * trick: a restart re-records both.
+ */
+export interface IntegrityGate {
+  baseline: Map<string, string>;
+  paged: boolean;
+}
+
+export interface IntegrityVerdict {
+  /** Labelled, sorted differences; empty when the package is untouched. */
+  diff: string[];
+  /** Any difference at all stops the fleet. */
+  pause: boolean;
+  /** First divergent tick only — a page every five minutes is a page nobody reads. */
+  page: boolean;
+}
+
+/**
+ * sha256 of every source file the running package is made of, keyed by path
+ * relative to `root`.
+ *
+ * `import.meta.dir` is the installed `src/` of the code executing right now, so
+ * this is a self-portrait: what was actually deployed, not what some checkout
+ * on disk happens to contain. `.ts` and `.md` because both are executable in
+ * this package — the briefs under `src/briefs/` are the sessions' instructions,
+ * and rewriting one of those buys more than rewriting the dispatcher does.
+ * (A checkout also carries `*.test.ts`, which the published package excludes, so
+ * a daemon started from one is watching its tests too. That is the honest
+ * answer — its code did change — and it costs nothing on a real install.)
+ *
+ * Walking and hashing the ~30 files of this package measures 0.6 ms warm, once
+ * per five-minute tick, so a tick does it inline. No cache and no mtime
+ * shortcut on purpose: a cache is a second thing that can be wrong, and mtime
+ * is the first field anyone covering their tracks restores.
+ */
+export function packageManifest(root: string = import.meta.dir): Map<string, string> {
+  const out = new Map<string, string>();
+  const walk = (dir: string): void => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, e.name);
+      if (e.isDirectory()) walk(full);
+      else if (e.isFile() && (e.name.endsWith(".ts") || e.name.endsWith(".md")))
+        out.set(relative(root, full), createHash("sha256").update(readFileSync(full)).digest("hex"));
+    }
+  };
+  walk(root);
+  return out;
+}
+
+/**
+ * Labelled rather than three arrays because every consumer — the log line, the
+ * page, the test — wants one readable list of what moved.
+ */
+export function manifestDiff(before: Map<string, string>, after: Map<string, string>): string[] {
+  const out: string[] = [];
+  for (const [path, hash] of before) {
+    const now = after.get(path);
+    if (now === undefined) out.push(`removed ${path}`);
+    else if (now !== hash) out.push(`changed ${path}`);
+  }
+  for (const path of after.keys()) if (!before.has(path)) out.push(`added ${path}`);
+  return out.sort();
+}
+
+/**
+ * The tick's decision, split from its effects so the once-only page is a thing
+ * a test can hold.
+ *
+ * `pause` stays true on every divergent tick, deliberately: an operator who
+ * resumes without restarting gets re-paused, because the boundary is still
+ * broken. `page` fires once — the gate is mutated here rather than returned for
+ * the caller to store, since the one call site that forgets to store it pages
+ * every five minutes forever.
+ */
+export function checkIntegrity(gate: IntegrityGate, current: Map<string, string>): IntegrityVerdict {
+  const diff = manifestDiff(gate.baseline, current);
+  if (diff.length === 0) return { diff, pause: false, page: false };
+  const page = !gate.paged;
+  gate.paged = true;
+  return { diff, pause: true, page };
 }
 
 // ---------------------------------------------------------------------- helpers
@@ -159,12 +258,68 @@ async function swapLabel(tracker: Tracker, issue: number, from: string, to: stri
  * only records the dedup marker on success. A page that cannot be delivered
  * must not take the tick down with it — log it and let the next tick retry.
  */
-async function safeEscalate(d: Deps, e: Escalation): Promise<void> {
+async function safeEscalate(d: Pick<Deps, "escalate">, e: Escalation): Promise<void> {
   try {
     await d.escalate(e);
   } catch (err) {
     log(`escalation for #${e.issue} could not be delivered: ${errText(err)}`);
   }
+}
+
+/**
+ * What a salvage attempt contributes to the escalation: where the work went, or
+ * that it went nowhere. Split from the effects below for the same reason
+ * `checkIntegrity` is — this wording is the whole thing a human acts on, so it
+ * is worth a test holding it, and the sha in it is the only pointer to work
+ * that no longer has any other copy.
+ */
+export function salvageLines(outcome: SalvageOutcome, worktree: string): string[] {
+  const kept = `Worktree kept for inspection: ${worktree}`;
+
+  if (outcome.kind === "nothing") return [`${kept} — nothing uncommitted to salvage`];
+
+  if (outcome.kind === "failed") {
+    return [
+      `WIP SALVAGE FAILED: ${outcome.error}`,
+      `Uncommitted work in ${worktree} is the only copy of it, and the next attempt removes that tree.`,
+    ];
+  }
+
+  return [
+    `WIP committed to ${outcome.branch} @ ${outcome.sha}` +
+      (outcome.pushed
+        ? " and pushed — the work outlives this worktree"
+        : ` but NOT pushed (${outcome.pushError ?? "no reason given"}) — it lives only in this host's mirror`),
+    kept,
+  ];
+}
+
+/**
+ * Commits and pushes whatever a dead run left uncommitted, logs the outcome and
+ * returns the escalation lines that say where that work now lives.
+ *
+ * Only ever called on a non-graceful end — a cap kill, a crashed session, a
+ * dispatch error. A `blocked` run stopped on purpose, with turns still in hand
+ * and a brief that tells it to report rather than push, so nothing is committed
+ * behind its back. The rest never got the chance: the kill is external and
+ * lands mid-edit, in the tree the next attempt removes `--force`.
+ */
+async function salvage(
+  issue: number,
+  attempt: number,
+  reason: string,
+  worktree: string,
+): Promise<string[]> {
+  const lines = salvageLines(await salvageWip(worktree, issue, attempt, reason), worktree);
+  log(`#${issue} salvage: ${lines.join(" ")}`);
+  return lines;
+}
+
+/** How a run's end is named — in the salvage commit, and to whoever reads it. */
+function endedBy(killedBy: KilledBy | undefined): string {
+  if (killedBy === "turns") return "the turns cap";
+  if (killedBy === "wallclock") return "the wall-clock cap";
+  return "a failed run";
 }
 
 async function buildBrief(
@@ -202,6 +357,10 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
 
   let claimed = false;
   let run: RunRecord | undefined;
+  // Hoisted out of the try so the catch path can still name the tree: a crash
+  // mid-dispatch is one of the non-graceful ends whose uncommitted work has to
+  // be salvaged too, and it is the path least likely to have committed first.
+  let worktreePath: string | undefined;
 
   try {
     // Claim on the tracker FIRST, before any local work. The label — not the
@@ -234,7 +393,7 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
     const mirrorPath = mirrorPathFor(r.repo, project.mirrorRoot);
     await removeWorktree(mirrorPath, worktreePathFor(project.workspaceRoot, issue));
 
-    const worktreePath = await addWorktree(
+    worktreePath = await addWorktree(
       r.repo,
       project.mirrorRoot,
       project.workspaceRoot,
@@ -293,6 +452,9 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
       });
     } else if (result.state === "failed" || result.state === "killed") {
       await swapLabel(tracker, issue, inProgress, project.stateLabels.failed);
+      // Before the escalation is composed, so it can say where the work went —
+      // and long before the next attempt provisions over this tree.
+      const salvaged = await salvage(issue, attempt, endedBy(result.killedBy), worktreePath);
       await safeEscalate(d, {
         tier: 1,
         project: project.name,
@@ -307,7 +469,7 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
         detail: [
           `${r.issue.title}`,
           r.issue.url,
-          `Worktree kept for inspection: ${worktreePath}`,
+          ...salvaged,
           `Session: ${result.sessionFile ?? "(no transcript)"}`,
           "",
           result.report,
@@ -341,17 +503,106 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
         log(`#${issue} could not be relabelled: ${errText(relabelErr)}`);
       }
     }
+    // A crash lands anywhere, including mid-edit in a tree holding the only
+    // copy of real work. Nothing else on this path so much as looks at it.
+    const salvaged =
+      worktreePath === undefined
+        ? []
+        : await salvage(issue, attempt, "a dispatch error", worktreePath);
+
     await safeEscalate(d, {
       tier: 1,
       project: project.name,
       issue,
       runId: run?.id,
       summary: `#${issue} could not be dispatched on attempt ${attempt}`,
-      detail,
+      detail: salvaged.length === 0 ? detail : [detail, "", ...salvaged].join("\n"),
     });
     // The worktree, if one was created, is deliberately left in place: this is
-    // a failure path.
+    // a failure path, and whatever it still held is now a commit on the branch.
   }
+}
+
+// -------------------------------------------------------------------- admission
+
+/** A candidate cleared for dispatch, with the attempt number it will run as. */
+export interface Admission {
+  r: Routed;
+  attempt: number;
+}
+
+/**
+ * Which routed candidates get a worker this tick — in queue order, never more
+ * than `slots` of them.
+ *
+ * Exported so the admission rules can be pinned without spawning a worker.
+ * Every one of them exists because of a live incident, and each guards a
+ * different way the same issue gets worked twice.
+ *
+ * Takes the slice of `Deps` it actually reads rather than the whole thing: what
+ * admission is allowed to consult is the point of the function, and a `Deps`
+ * that grows a field has no business breaking these tests.
+ */
+export async function admitCandidates(
+  d: Pick<Deps, "project" | "caps" | "tracker" | "store" | "escalate">,
+  routed: Routed[],
+  slots: number,
+): Promise<Admission[]> {
+  const { project, caps, tracker, store } = d;
+  const busy = new Set(store.activeRuns(project.name).map((r) => r.issue));
+
+  const admitted: Admission[] = [];
+  for (const r of routed) {
+    if (admitted.length >= slots) break;
+    if (busy.has(r.issue.number)) continue;
+
+    const prior = store.attemptsFor(project.name, r.issue.number);
+    if (prior >= caps.maxAttemptsPerIssue) {
+      await safeEscalate(d, {
+        tier: 1,
+        project: project.name,
+        issue: r.issue.number,
+        summary: `#${r.issue.number} has used all ${caps.maxAttemptsPerIssue} attempts`,
+        detail: [
+          r.issue.title,
+          r.issue.url,
+          "Another attempt almost always means the issue itself is underspecified.",
+          "Rewrite the acceptance criteria, or take it off the queue.",
+        ].join("\n"),
+      });
+      continue;
+    }
+
+    // The busy set is built from run rows, so it can only speak for work this
+    // database recorded. Work pushed before this store existed — a migration, a
+    // wiped or relocated state dir, a restore onto a new host — looks exactly
+    // like fresh work, and a worker sent at it re-implements a finished PR. The
+    // tracker is the only party that remembers, so it is asked. The cost is
+    // bounded by free slots, not by queue depth: the call sits behind the two
+    // cheap local filters and the loop stops once the slots are full.
+    let closer: string | undefined;
+    try {
+      closer = await tracker.openCloserFor(r.issue.number);
+    } catch (err) {
+      // Fail closed, per candidate. An API error means "unknown whether
+      // finished work exists", and admitting on unknown recreates precisely the
+      // duplicate-work failure this guard exists to kill: the worst case of
+      // holding is a five-minute delay, the worst case of admitting is a burned
+      // attempt and a second PR on the same issue. Holding one candidate rather
+      // than aborting the loop is what keeps a transient GitHub failure from
+      // deadlocking the whole dispatcher; the next tick retries by itself.
+      log(`#${r.issue.number} held: open-PR check failed (${errText(err)}) — retrying next tick`);
+      continue;
+    }
+    if (closer !== undefined) {
+      log(`#${r.issue.number} skipped: open PR ${closer} already closes it`);
+      continue;
+    }
+
+    admitted.push({ r, attempt: prior + 1 });
+  }
+
+  return admitted;
 }
 
 // ----------------------------------------------------------------------- a tick
@@ -362,6 +613,47 @@ async function tick(d: Deps): Promise<void> {
   if (isPaused()) return;
 
   const { project, caps, store } = d;
+
+  // "Nobody patches the running conductor" is a hard boundary in both briefs —
+  // which makes it prompt text, and prompt text is a request. This is the half
+  // that does not negotiate: the package that dispatched the last worker must
+  // still be the package on disk, or nothing else this tick does is
+  // attributable. A legitimate deploy never trips it, because installing a new
+  // build and restarting the unit re-records the baseline from the new files;
+  // only an edit *underneath* a live daemon diverges from it.
+  const integrity = checkIntegrity(d.integrity, packageManifest());
+  if (integrity.pause) {
+    const shown = integrity.diff.slice(0, INTEGRITY_SAMPLE);
+    log(
+      `ERROR: the installed conductor changed under this daemon — ${integrity.diff.length} file(s) differ ` +
+        `(${shown.join(", ")}${integrity.diff.length > shown.length ? ", …" : ""}) — pausing`,
+    );
+    setPaused(true);
+    if (integrity.page) {
+      await safeEscalate(d, {
+        tier: 2,
+        project: project.name,
+        issue: NO_ISSUE,
+        // Dated for the same reason the spend cap is: the dedup key is the
+        // summary, and a second tamper months later must not be swallowed as a
+        // repeat of the first.
+        summary:
+          `Installed conductor changed under a running daemon on ${new Date().toISOString().slice(0, 10)}: ` +
+          `${integrity.diff.length} file(s) differ (first: ${integrity.diff[0]}) — ${project.name} is paused`,
+        detail: [
+          `Package root: ${import.meta.dir}`,
+          ...shown,
+          ...(integrity.diff.length > shown.length ? [`… and ${integrity.diff.length - shown.length} more`] : []),
+          "",
+          "If you deployed a new build, restart the daemon — the restart re-records the baseline.",
+          "If you did not, the host edited itself while it was dispatching work: treat every run since",
+          "the last known-good restart as unattributable before resuming.",
+          "`omp-conductor resume` alone will not hold — the next tick re-pauses while the files differ.",
+        ].join("\n"),
+      });
+    }
+    return;
+  }
 
   // route() filters the queue through isEligible() itself, so anything already
   // carrying a state label is gone before it gets here.
@@ -410,8 +702,8 @@ async function tick(d: Deps): Promise<void> {
 
   // Two different questions, deliberately two queries. Capacity counts worker
   // *processes*, so a green PR awaiting a human merge must not consume a slot —
-  // two of those would otherwise stop the fleet. The busy set protects *issues*,
-  // so that same green PR must be in it, or a second attempt lands on a live PR.
+  // two of those would otherwise stop the fleet. That same PR's *issue* must
+  // still be occupied, which is what `admitCandidates`' busy set is for.
   const live = store.liveRuns(project.name);
   const slots = caps.maxConcurrentWorkers - live.length;
   if (slots <= 0) {
@@ -419,32 +711,7 @@ async function tick(d: Deps): Promise<void> {
     return;
   }
 
-  const busy = new Set(store.activeRuns(project.name).map((r) => r.issue));
-
-  const admitted: { r: Routed; attempt: number }[] = [];
-  for (const r of routed) {
-    if (admitted.length >= slots) break;
-    if (busy.has(r.issue.number)) continue;
-
-    const prior = store.attemptsFor(project.name, r.issue.number);
-    if (prior >= caps.maxAttemptsPerIssue) {
-      await safeEscalate(d, {
-        tier: 1,
-        project: project.name,
-        issue: r.issue.number,
-        summary: `#${r.issue.number} has used all ${caps.maxAttemptsPerIssue} attempts`,
-        detail: [
-          r.issue.title,
-          r.issue.url,
-          "Another attempt almost always means the issue itself is underspecified.",
-          "Rewrite the acceptance criteria, or take it off the queue.",
-        ].join("\n"),
-      });
-      continue;
-    }
-
-    admitted.push({ r, attempt: prior + 1 });
-  }
+  const admitted = await admitCandidates(d, routed, slots);
 
   if (admitted.length === 0) return;
 
@@ -617,6 +884,15 @@ export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
   const store = openStore(dbPath());
   const tracker = makeTracker(project);
 
+  // Recorded here, before a single tick runs, so that the deploy an operator
+  // *means* to do never trips the tripwire: installing a new build and
+  // restarting the unit re-records this from the new files. What it catches is
+  // the other thing — the package changing while the daemon that dispatches
+  // work is holding it open, whether that is a worker that wandered out of its
+  // worktree or a human editing the live install "just to test something".
+  const integrity: IntegrityGate = { baseline: packageManifest(), paged: false };
+  log(`package integrity baseline: ${integrity.baseline.size} files under ${import.meta.dir}`);
+
   // Before the first tick, settle what the last process left behind — unless
   // another daemon is alive (a foreground `daemon --once` beside a running
   // daemon must not orphan that daemon's real, live workers).
@@ -692,6 +968,7 @@ export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
     tracker,
     store,
     escalate: (e) => escalator.escalate(e),
+    integrity,
   };
 
   if (o.once) {

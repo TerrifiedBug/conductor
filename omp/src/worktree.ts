@@ -269,6 +269,125 @@ export async function addWorktree(
 }
 
 /**
+ * What one salvage attempt did. A failure is a *value* rather than a throw
+ * because the only caller is a run that is already ending badly: it has to log
+ * the outcome, word it into the escalation and still close its run record, and
+ * none of that may be skipped by an exception from the last-ditch step.
+ */
+export type SalvageOutcome =
+  | { kind: "salvaged"; sha: string; branch: string; pushed: boolean; pushError?: string }
+  /** Nothing uncommitted was there to save — a clean tree, or no tree at all. */
+  | { kind: "nothing" }
+  /** There was work and git would not commit it. This is the loud one. */
+  | { kind: "failed"; error: string };
+
+/**
+ * The salvage commit is the daemon's own, made unattended in a worktree whose
+ * config it does not control. A machine with no global git identity, a global
+ * `commit.gpgsign=true` whose key needs a passphrase nobody can type, or a repo
+ * pre-commit hook that rejects half-finished code are all ordinary states — and
+ * every one of them would turn "save the work" into "lose the work". So the
+ * commit brings its own identity, signs nothing, and skips hooks: it is a
+ * snapshot for a human to sort out, never something anyone merges.
+ */
+const SALVAGE_COMMIT_CONFIG = [
+  "-c",
+  "user.name=conductor",
+  "-c",
+  "user.email=conductor@invalid",
+  "-c",
+  "commit.gpgsign=false",
+];
+
+/**
+ * Commits a dead run's uncommitted work to the run's own branch and pushes it,
+ * so that the tree the next attempt destroys is no longer the only copy.
+ *
+ * This closes a deliberate asymmetry. `addWorktree` preserves the run branch
+ * precisely because "that branch can hold the only copy of work attempt 1
+ * committed but never pushed", while `removeWorktree` runs `worktree remove
+ * --force` and `addWorktree` refuses to reuse a tree that "may hold a previous
+ * attempt's uncommitted work" — committed work is kept by design, uncommitted
+ * work is discarded by design. That trade is fair for a worker that *stops*:
+ * blocking is a decision it makes with turns left to commit first. It is not
+ * fair for one killed by the turns cap or the wall clock, or one that crashes:
+ * that end is external, unannounced, mid-sentence, and it lands hardest on the
+ * long refactors carrying the most unsaved work. So: non-graceful ends only.
+ *
+ * Never throws. Every outcome, including its own failure, comes back as a value
+ * for the caller to log and to put in front of a human.
+ *
+ * The push is best-effort and deliberately last, after the sha exists: a
+ * refused push (diverged branch, no credentials, no network) still leaves the
+ * commit in this host's mirror, which is strictly better than nothing. It is a
+ * plain fast-forward push — never a force — and if the run already had a PR
+ * open, that PR gains the WIP commit and re-runs its checks. That is the price
+ * of work outliving its host, and only a run that already failed ever pays it.
+ */
+export async function salvageWip(
+  worktree: string,
+  issue: number,
+  attempt: number,
+  reason: string,
+): Promise<SalvageOutcome> {
+  try {
+    // A tree that is not there cannot be holding work. Checked before spawning
+    // git, because a missing cwd fails at spawn time rather than as an exit
+    // code, and "no tree" is not a salvage failure worth alarming anyone with.
+    if (!existsSync(worktree)) return { kind: "nothing" };
+
+    if ((await git(["status", "--porcelain"], worktree)) === "") return { kind: "nothing" };
+
+    // The tree's own branch, not one the caller believes it should be on: this
+    // string ends up in an escalation as the place to go looking.
+    const branch = await git(["rev-parse", "--abbrev-ref", "HEAD"], worktree);
+
+    // `-A` on purpose: the losses this exists for were mostly *new* files.
+    await git(["add", "-A"], worktree);
+    await git(
+      [
+        ...SALVAGE_COMMIT_CONFIG,
+        "commit",
+        "--no-verify",
+        "-m",
+        `wip(#${issue}): attempt ${attempt} killed by ${reason} — auto-salvaged`,
+      ],
+      worktree,
+    );
+    const sha = await git(["rev-parse", "HEAD"], worktree);
+
+    if (branch === "HEAD") {
+      // Detached: the commit is real but reachable only by sha, and pushing
+      // `HEAD` from here would publish a branch literally named HEAD.
+      return {
+        kind: "salvaged",
+        sha,
+        branch,
+        pushed: false,
+        pushError: "detached HEAD — no branch to push",
+      };
+    }
+
+    const push = await runGit(["push", "origin", `HEAD:refs/heads/${branch}`], worktree);
+    if (push.code === 0) return { kind: "salvaged", sha, branch, pushed: true };
+
+    return {
+      kind: "salvaged",
+      sha,
+      branch,
+      pushed: false,
+      pushError: (
+        push.stderr.trim() ||
+        push.stdout.trim() ||
+        `git push exited ${push.code}`
+      ).replace(URL_USERINFO, "$1***@"),
+    };
+  } catch (err) {
+    return { kind: "failed", error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
  * Removes a run's worktree and its registration in the mirror. Idempotent: a
  * path that is already gone resolves, so cleanup can be retried and can run on
  * a run that never got as far as a checkout.

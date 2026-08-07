@@ -19,9 +19,11 @@
  *   channel that makes running unattended safe.
  * - **Ticks coalesce.** A tick that lands while an earlier one is still queued
  *   would stack prompts on a session that is already behind. `hasPendingMessages()`
- *   makes the tick idempotent under slow turns.
+ *   makes the tick idempotent under slow turns — and, because it is the only
+ *   signal in the process that says whether the last prompt was ever consumed,
+ *   it doubles as the wedge detector: see {@link STALL_MARKER_FILE}.
  *
- * Beyond those four gates, every tick carries the project's `reporting.scope`
+ * Beyond those three gates, every tick carries the project's `reporting.scope`
  * as one explicit constraint line, re-read from the conductor config on each
  * tick so a `/conductor setup` change binds the next heartbeat rather than
  * waiting for a session restart — and one delivery rule
@@ -33,7 +35,7 @@
  * it inside `omp-conductor` costs an ordinary session nothing.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { findProject, loadConfig } from "./config.ts";
 import { DEFAULT_REPORT_SCOPE, type ReportScope } from "./types.ts";
@@ -50,6 +52,43 @@ export const TICK_CUSTOM_TYPE = "omp-conductor.tick";
  * misconfiguration worth refusing rather than obeying.
  */
 export const MIN_INTERVAL_SECONDS = 60;
+
+/**
+ * The stall marker — written beside the activation file, in the session cwd —
+ * and the number of consecutive coalesced ticks that earn it.
+ *
+ * This detects a failure that happened. 2026-08-07: the dogfood fleet's
+ * orchestrator finished a turn, logged `ui.loop-blocked` immediately after an
+ * auto-compaction threshold decision, and never started another. The process
+ * stayed alive, so `herdr-conductor`'s recovery — agent listed AND a
+ * non-shell foreground process — read healthy, and the dispatch daemon is a
+ * different process entirely, so `/healthz` stayed green too. A tick injected
+ * two minutes later and an operator's Telegram message five minutes after that
+ * both sat unconsumed for 23 minutes, until a manual SIGTERM. This extension
+ * had the evidence and threw it away: coalescing logged `tick skipped: tick
+ * already pending`, which reads exactly like healthy backpressure.
+ *
+ * Two in a row is a full hour at the reference 1800s interval — generous by
+ * construction, because a turn that legitimately runs an hour belongs to a
+ * fleet with larger problems than one spurious marker. The escalation has to
+ * leave the session, since a wedged loop cannot report on itself: a file any
+ * out-of-process watchdog can stat, plus an error-level line a log scraper can
+ * match.
+ */
+export const STALL_MARKER_FILE = ".conductor-stalled";
+export const STALL_TICKS = 2;
+
+/**
+ * The marker's one line after its ISO timestamp, and the middle of the error
+ * log. Shared so the file and the log can never describe different failures.
+ */
+const STALL_DIAGNOSIS = `${STALL_TICKS} ticks queued unconsumed — the agent loop is not draining`;
+
+/**
+ * The one skip reason the stall counter reacts to, shared with the decision so
+ * a reworded log line cannot silently disarm the detector.
+ */
+const PENDING_REASON = "tick already pending";
 
 /**
  * The slice of the omp extension API this entry touches, mirroring
@@ -339,7 +378,7 @@ export function tickDecision(input: {
 } {
   if (!input.armed) return { send: false, reason: "not armed" };
   if (!input.channelOk) return { send: false, reason: "escalation channel down" };
-  if (input.hasPending) return { send: false, reason: "tick already pending" };
+  if (input.hasPending) return { send: false, reason: PENDING_REASON };
   return { send: true, reason: "armed, nothing pending" };
 }
 
@@ -394,16 +433,59 @@ function currentMessage(cwd: string, startup: TickConfig): string | undefined {
 }
 
 /**
+ * Marker writes are best-effort by construction. This runs inside the loop
+ * whose whole job is to keep prompting a session; a read-only filesystem, a
+ * full disk, or a cwd deleted out from under a long-lived process is not a
+ * reason to stop doing that. Both directions log their own failure and carry
+ * on — the error line stands as the record either way, and the marker is only
+ * the copy an out-of-process watchdog can see.
+ */
+function writeStallMarker(pi: TickApi, cwd: string): void {
+  const path = join(cwd, STALL_MARKER_FILE);
+  try {
+    writeFileSync(path, `${new Date().toISOString()} ${STALL_DIAGNOSIS}\n`);
+  } catch (err) {
+    pi.logger.error(`[omp-conductor] could not write ${path}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * Cleared by the first consumed tick, whether or not this process wrote it.
+ * Recovery normally arrives as a *new* session — the wedged one was SIGTERM'd
+ * and its transcript resumed — which starts with a zero counter and its
+ * predecessor's marker on disk. Gating removal on this session's own count
+ * would strand that file, and a stall marker nobody clears is a stall marker
+ * nobody believes.
+ */
+function clearStallMarker(pi: TickApi, cwd: string): void {
+  const path = join(cwd, STALL_MARKER_FILE);
+  if (!existsSync(path)) return;
+  try {
+    rmSync(path, { force: true });
+    pi.logger.info("[omp-conductor] orchestrator stall cleared: a tick was consumed");
+  } catch (err) {
+    pi.logger.error(`[omp-conductor] could not remove ${path}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** Everything one tick remembers for the next. */
+interface TickSession {
+  /**
+   * Whether the reporting-scope fallback has been logged. Without it, a host
+   * with no conductor config would repeat the same line about the same missing
+   * file every interval, for as long as the session lives.
+   */
+  scopeFallbackLogged: boolean;
+  /** Consecutive {@link PENDING_REASON} skips — see {@link STALL_MARKER_FILE}. */
+  pendingSkips: number;
+}
+
+/**
  * One tick: gather the three facts, ask `tickDecision`, log the reason either
  * way. Skips are deliberately silent in the UI — a disarmed fleet would
  * otherwise emit a notification every interval, forever.
- *
- * `session` holds the only thing one tick remembers for the next: whether the
- * scope fallback has been logged. Without it, a host with no conductor config
- * would repeat the same line about the same missing file every interval, for as
- * long as the session lives.
  */
-function tick(pi: TickApi, ctx: TickContext, config: TickConfig, session: { scopeFallbackLogged: boolean }): void {
+function tick(pi: TickApi, ctx: TickContext, config: TickConfig, session: TickSession): void {
   const decision = tickDecision({
     armed: config.armedFile === undefined || existsSync(config.armedFile),
     channelOk: config.accessFile === undefined || channelIsUp(config.accessFile),
@@ -412,6 +494,21 @@ function tick(pi: TickApi, ctx: TickContext, config: TickConfig, session: { scop
 
   if (!decision.send) {
     pi.logger.info(`[omp-conductor] tick skipped: ${decision.reason}`, { reason: decision.reason });
+    // Only a coalesced skip counts. "Not armed" and "channel down" say nothing
+    // about the queue — they are gates the operator or the bridge closed, and
+    // the session behind them may be perfectly awake.
+    if (decision.reason !== PENDING_REASON) return;
+    session.pendingSkips += 1;
+    // Only the crossing writes. A later skip refreshing the timestamp would
+    // keep moving "stalled since" forward, and how long it has been wedged is
+    // the fact the file is read for.
+    if (session.pendingSkips === STALL_TICKS) {
+      pi.logger.error(`[omp-conductor] orchestrator stalled: ${STALL_DIAGNOSIS}; see ${STALL_MARKER_FILE}`, {
+        reason: decision.reason,
+        pendingSkips: session.pendingSkips,
+      });
+      writeStallMarker(pi, ctx.cwd);
+    }
     return;
   }
 
@@ -433,6 +530,10 @@ function tick(pi: TickApi, ctx: TickContext, config: TickConfig, session: { scop
     { triggerTurn: true, deliverAs: "followUp" },
   );
   pi.logger.info(`[omp-conductor] tick sent: ${decision.reason}`, { reason: decision.reason });
+  // An empty queue at send time is the proof the previous tick was consumed, so
+  // this is the only place either the counter or the marker is cleared.
+  session.pendingSkips = 0;
+  clearStallMarker(pi, ctx.cwd);
 }
 
 export default function orchestratorTickExtension(pi: TickApi): void {
@@ -440,9 +541,10 @@ export default function orchestratorTickExtension(pi: TickApi): void {
   // `session_start` cannot install a second heartbeat on the same session.
   let armed = false;
   // Held per registration for the same reason: the "using the default reporting
-  // scope, because ..." line is logged once for this heartbeat, and a second
-  // session in the same process starts with its own count.
-  const session = { scopeFallbackLogged: false };
+  // scope, because ..." line is logged once for this heartbeat, and the stall
+  // counter is about this session's own queue. A second session in the same
+  // process starts with both at zero.
+  const session: TickSession = { scopeFallbackLogged: false, pendingSkips: 0 };
 
   pi.on("session_start", (_event, ctx) => {
     if (armed) return;
