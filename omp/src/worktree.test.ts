@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -9,6 +9,7 @@ import {
   ensureMirror,
   mirrorPathFor,
   removeWorktree,
+  salvageWip,
   worktreePathFor,
 } from "./worktree.ts";
 
@@ -215,6 +216,82 @@ describe("removeWorktree", () => {
       await removeWorktree(mirrorPath, tree);
 
       expect(existsSync(tree)).toBe(false);
+    },
+    TIMEOUT_MS,
+  );
+});
+
+describe("salvageWip", () => {
+  it(
+    "commits a killed attempt's uncommitted work to its branch and pushes it",
+    async () => {
+      const { mirrorRoot, workspaceRoot } = sandbox("salvage-dirty");
+      const branch = "conductor/issue-606";
+
+      const tree = await addWorktree(repo, mirrorRoot, workspaceRoot, 606, branch);
+      // Exactly the shape of the losses this exists for: a large new file git
+      // has never seen, plus an edit on top of a tracked one.
+      writeFileSync(join(tree, "detection_pipeline.py"), "# 696 lines of it\n");
+      writeFileSync(join(tree, SEED_FILE), "seed, rewritten\n");
+
+      const outcome = await salvageWip(tree, 606, 1, "the turns cap");
+
+      expect(outcome).toMatchObject({ kind: "salvaged", branch, pushed: true });
+      if (outcome.kind !== "salvaged") throw new Error("unreachable");
+
+      // On the branch, not merely in the object database: the branch is what
+      // survives `worktree remove --force` and what the next attempt reattaches.
+      expect(git(["rev-parse", branch], tree)).toBe(outcome.sha);
+      expect(git(["log", "-1", "--format=%s", branch], tree)).toBe(
+        "wip(#606): attempt 1 killed by the turns cap — auto-salvaged",
+      );
+      expect(git(["show", "--name-only", "--format=", outcome.sha], tree).split("\n")).toEqual([
+        SEED_FILE,
+        "detection_pipeline.py",
+      ]);
+      expect(git(["status", "--porcelain"], tree)).toBe("");
+
+      // Pushed, so the work survives the host and not just the worktree.
+      expect(git(["rev-parse", `refs/heads/${branch}`], repo.cloneUrl)).toBe(outcome.sha);
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "commits nothing when the tree is clean",
+    async () => {
+      const { mirrorRoot, workspaceRoot } = sandbox("salvage-clean");
+      const branch = "conductor/issue-707";
+
+      const tree = await addWorktree(repo, mirrorRoot, workspaceRoot, 707, branch);
+      const before = git(["rev-parse", "HEAD"], tree);
+
+      expect(await salvageWip(tree, 707, 1, "the wall-clock cap")).toEqual({ kind: "nothing" });
+      expect(git(["rev-parse", "HEAD"], tree)).toBe(before);
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "never throws, whatever state the tree is in",
+    async () => {
+      // A run that died before it had a checkout, and one whose tree a crash or
+      // a tmpdir reaper left as a directory git knows nothing about. Salvage is
+      // the last step of an already-failing run: throwing here would take the
+      // escalation and the run record down with it.
+      const gone = join(root, "salvage-missing", "808");
+      expect(await salvageWip(gone, 808, 2, "a dispatch error")).toEqual({ kind: "nothing" });
+
+      const notARepo = join(root, "salvage-not-a-repo");
+      mkdirSync(notARepo, { recursive: true });
+      writeFileSync(join(notARepo, "work.txt"), "unsaved\n");
+
+      const outcome = await salvageWip(notARepo, 909, 1, "the turns cap");
+
+      expect(outcome.kind).toBe("failed");
+      // The reason has to reach the escalation, or the operator learns only
+      // that something did not happen.
+      if (outcome.kind === "failed") expect(outcome.error).toContain("git status");
     },
     TIMEOUT_MS,
   );

@@ -9,7 +9,7 @@
  */
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { configPath, stateDir } from "./config.ts";
@@ -17,6 +17,8 @@ import { setPaused } from "./daemon.ts";
 import orchestratorTickExtension, {
   MIN_INTERVAL_SECONDS,
   readTickConfig,
+  STALL_MARKER_FILE,
+  STALL_TICKS,
   TICK_CONFIG_FILE,
   TICK_CUSTOM_TYPE,
   TICK_DELIVERY_RULE,
@@ -65,6 +67,7 @@ interface SentMessage {
  */
 function fakeHost(options: { pending?: boolean; hasUI?: boolean; activeTools?: string[] } = {}) {
   const logs: string[] = [];
+  const errors: string[] = [];
   const notices: { message: string; type?: string }[] = [];
   const sent: SentMessage[] = [];
   const intervals: { ms?: number; callback: () => void }[] = [];
@@ -89,8 +92,14 @@ function fakeHost(options: { pending?: boolean; hasUI?: boolean; activeTools?: s
 
   const pi = {
     logger: {
+      // `errors` is the subset logged at error level. The stall detector's line
+      // has to be one a log scraper can match on level alone, so the level is
+      // part of the contract rather than an incidental of the message text.
       info: (message: string) => logs.push(message),
-      error: (message: string) => logs.push(message),
+      error: (message: string) => {
+        logs.push(message);
+        errors.push(message);
+      },
     },
     getActiveTools: () => options.activeTools ?? [],
     on(_event: "session_start", h: (event: { type: "session_start" }, c: typeof ctx) => void) {
@@ -101,6 +110,7 @@ function fakeHost(options: { pending?: boolean; hasUI?: boolean; activeTools?: s
     },
     ctx,
     logs,
+    errors,
     notices,
     sent,
     intervals,
@@ -461,6 +471,95 @@ test("a tick that is still queued suppresses the next one, no UI noise either wa
   pi.fire();
   expect(pi.sent).toHaveLength(1);
   expect(pi.notices).toHaveLength(0);
+});
+
+// ------------------------------------------------------------ stall detector
+
+/** An armed session whose queue never drains — the wedge of 2026-08-07. */
+function stallHost() {
+  writeTickConfig({ intervalSeconds: 1800 });
+  const pi = fakeHost({ pending: true });
+  orchestratorTickExtension(pi);
+  pi.start();
+  return pi;
+}
+
+/** The marker the detector writes, under this test's own temp cwd. */
+const marker = () => join(cwd, STALL_MARKER_FILE);
+
+test("two consecutive queued ticks write the stall marker and say so at error level", () => {
+  const pi = stallHost();
+
+  // One skip is ordinary backpressure: a turn that outran the interval.
+  pi.fire();
+  expect(existsSync(marker())).toBe(false);
+  expect(pi.errors).toHaveLength(0);
+
+  pi.fire();
+  const written = readFileSync(marker(), "utf8").trim();
+  const [stamp, ...diagnosis] = written.split(" ");
+  expect(Number.isNaN(Date.parse(stamp ?? ""))).toBe(false);
+  expect(diagnosis.join(" ")).toBe(`${STALL_TICKS} ticks queued unconsumed — the agent loop is not draining`);
+  expect(pi.errors.join("\n")).toContain(
+    `[omp-conductor] orchestrator stalled: ${STALL_TICKS} ticks queued unconsumed — ` +
+      `the agent loop is not draining; see ${STALL_MARKER_FILE}`,
+  );
+  // Still no prompt and still no UI noise: the point of the marker is that the
+  // wedged session cannot be the one to report on itself.
+  expect(pi.sent).toHaveLength(0);
+  expect(pi.notices).toHaveLength(0);
+
+  // A third skip must not rewrite it. "STALLED since" walking forward every
+  // interval would hide exactly the duration a watchdog reads the file for.
+  writeFileSync(marker(), "SENTINEL\n");
+  pi.fire();
+  expect(readFileSync(marker(), "utf8")).toBe("SENTINEL\n");
+  expect(pi.errors).toHaveLength(1);
+});
+
+test("a consumed tick resets the counter, so alternating skips never trip the detector", () => {
+  const pi = stallHost();
+
+  pi.fire();
+  pi.state.pending = false;
+  pi.fire();
+  pi.state.pending = true;
+  pi.fire();
+
+  // Two skips, but not two in a row: the queue drained in between, which is a
+  // slow orchestrator rather than a stopped one.
+  expect(pi.sent).toHaveLength(1);
+  expect(existsSync(marker())).toBe(false);
+  expect(pi.errors).toHaveLength(0);
+});
+
+test("the first consumed tick after a stall clears the marker", () => {
+  const pi = stallHost();
+  pi.fire();
+  pi.fire();
+  expect(existsSync(marker())).toBe(true);
+
+  pi.state.pending = false;
+  pi.fire();
+
+  expect(pi.sent).toHaveLength(1);
+  expect(existsSync(marker())).toBe(false);
+  expect(pi.logs.join("\n")).toContain("orchestrator stall cleared");
+});
+
+test("a marker left by a wedged predecessor is cleared by the first tick this session sends", () => {
+  // The real recovery shape: the wedged process was killed and its transcript
+  // resumed, so the session that clears the marker is never the one that wrote
+  // it and starts with a zero counter.
+  writeTickConfig({ intervalSeconds: 1800 });
+  writeFileSync(marker(), "2026-08-07T06:27:55.000Z 2 ticks queued unconsumed — the agent loop is not draining\n");
+  const pi = fakeHost();
+  orchestratorTickExtension(pi);
+  pi.start();
+
+  pi.fire();
+  expect(pi.sent).toHaveLength(1);
+  expect(existsSync(marker())).toBe(false);
 });
 
 // ------------------------------------------------------- escalation channel

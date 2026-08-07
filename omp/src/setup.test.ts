@@ -219,6 +219,21 @@ test("Duty 1's green-PR branch is worded from the same grant as the standing ord
   expect(delegated).not.toContain("waiting on a human merge");
 });
 
+test("Duty 1's answered-block branch names the verb, so the never-hand-edit rule stays absolute", () => {
+  const text = renderOrchestratorBrief(answers());
+  const banner = text.indexOf("YOURS TO EDIT");
+  const fixed = text.slice(0, banner);
+
+  // The contradiction this pins shut: the Coordinates rule forbids hand-editing
+  // a state label, and the only other exit from `agent:blocked` used to be
+  // exactly that hand-edit. A brief shipping both strands the first issue an
+  // orchestrator successfully answers — silently, because an ineligible issue
+  // does not fail, it just stops being dispatched.
+  expect(fixed).toContain("hand-edit them");
+  expect(fixed).toContain("run `omp-conductor unblock <n>`");
+  expect(fixed).not.toContain("remove the blocked label");
+});
+
 test("a worker's release prohibition is fixed, while the orchestrator's is policy", () => {
   const text = renderOrchestratorBrief(answers());
   const banner = text.indexOf("YOURS TO EDIT");

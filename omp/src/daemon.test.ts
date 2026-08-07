@@ -1,19 +1,55 @@
 /**
- * The two restart deadlocks, as contracts.
+ * Daemon invariants that were paid for.
  *
- * Found live, in one incident: a host restart killed two workers mid-run, and
- * the fleet then sat "at capacity" forever. Two separate mechanisms conspired —
- * dead `running` rows stayed in the active set because nothing reconciled them
- * at startup, and `pushed-green` rows consumed worker slots even though their
- * workers were finished. These tests pin the fixes independently, against a
- * real store, because the failure was a disagreement between what the store
- * persisted and what the dispatcher believed it meant.
+ * The first describes the restart deadlocks. Found live, in one incident: a
+ * host restart killed two workers mid-run, and the fleet then sat "at capacity"
+ * forever. Two separate mechanisms conspired — dead `running` rows stayed in
+ * the active set because nothing reconciled them at startup, and `pushed-green`
+ * rows consumed worker slots even though their workers were finished. These
+ * tests pin the fixes independently, against a real store, because the failure
+ * was a disagreement between what the store persisted and what the dispatcher
+ * believed it meant.
+ *
+ * The other two describe the integrity tripwire, whose whole job is to notice a
+ * disagreement of the same shape one layer down: the package the daemon booted
+ * with versus the package on disk.
+ *
+ * The next describes admission, whose failure was the mirror image of the
+ * first: a store that is right about every row it holds and simply has no row
+ * for work that already exists on the tracker.
+ *
+ * The last describes what a non-graceful end tells a human. Two turns-cap kills
+ * left ~1,600 lines of work as uncommitted edits in trees the next attempt is
+ * built to destroy, under an escalation that said only "Worktree kept for
+ * inspection"; the sha these lines carry is now the only pointer to work that
+ * has no other copy, so the wording is a contract, not prose.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { reconcileOrphanedRuns } from "./daemon.ts";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import {
+  admitCandidates,
+  checkIntegrity,
+  manifestDiff,
+  packageManifest,
+  reconcileOrphanedRuns,
+  salvageLines,
+} from "./daemon.ts";
+import type { IntegrityGate } from "./daemon.ts";
+import type { Routed } from "./routing.ts";
 import { openStore } from "./store.ts";
-import type { RunRecord, Store } from "./types.ts";
+import { DEFAULT_AUTHORITY, DEFAULT_CAPS } from "./types.ts";
+import type {
+  Caps,
+  Escalation,
+  ProjectConfig,
+  RepoTarget,
+  RunRecord,
+  Store,
+  Tracker,
+} from "./types.ts";
 
 const PROJECT = "demo";
 
@@ -94,5 +130,364 @@ describe("reconcileOrphanedRuns", () => {
     // that keeps failing on it: the cap must escalate it to a human rather than
     // let a crash loop redispatch forever.
     expect(store.attemptsFor(PROJECT, 9)).toBe(2);
+  });
+});
+
+/** A miniature of the package's own `src/`: a module, and the briefs that are
+ *  every bit as executable as the module is. */
+const BASE: Record<string, string> = {
+  "daemon.ts": "export const dispatch = 1;\n",
+  "briefs/worker.md": "# worker\n\nIt must not touch any path outside its worktree.\n",
+  "briefs/orchestrator.md": "# orchestrator\n",
+};
+
+function writeTree(root: string, files: Record<string, string>): void {
+  for (const [path, body] of Object.entries(files)) {
+    const full = join(root, path);
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, body);
+  }
+}
+
+describe("packageManifest", () => {
+  let root!: string;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "conductor-integrity-"));
+    writeTree(root, BASE);
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("hashes an unchanged tree to the same manifest twice", () => {
+    const first = packageManifest(root);
+
+    // The baseline is compared against a fresh walk every five minutes for as
+    // long as the daemon lives. Anything unstable in here — iteration order,
+    // absolute paths, a timestamp — is a tripwire that pages about nothing.
+    expect(Object.fromEntries(first)).toEqual(Object.fromEntries(packageManifest(root)));
+    expect([...first.keys()].sort()).toEqual(["briefs/orchestrator.md", "briefs/worker.md", "daemon.ts"]);
+    expect(manifestDiff(first, packageManifest(root))).toEqual([]);
+  });
+
+  it("sees a rewritten brief", () => {
+    const before = packageManifest(root);
+    writeTree(root, { "briefs/worker.md": "# worker\n\nIt may touch anything it likes.\n" });
+
+    // Same path, same length of file, different instructions to a session with
+    // the host's credentials: the case the whole tripwire exists for.
+    expect(manifestDiff(before, packageManifest(root))).toEqual(["changed briefs/worker.md"]);
+  });
+
+  it("sees a new module", () => {
+    const before = packageManifest(root);
+    writeTree(root, { "helper.ts": "export const extra = 1;\n" });
+
+    expect(manifestDiff(before, packageManifest(root))).toEqual(["added helper.ts"]);
+  });
+
+  it("sees a deleted file", () => {
+    const before = packageManifest(root);
+    rmSync(join(root, "briefs", "orchestrator.md"));
+
+    expect(manifestDiff(before, packageManifest(root))).toEqual(["removed briefs/orchestrator.md"]);
+  });
+
+  it("ignores everything that is not source", () => {
+    const before = packageManifest(root);
+    writeTree(root, { "conductor.db-wal": "junk", "notes.txt": "junk" });
+
+    // The manifest covers what the package *runs*. A daemon that paged because
+    // something dropped a log file beside it would be turned off within a week.
+    expect(manifestDiff(before, packageManifest(root))).toEqual([]);
+  });
+});
+
+describe("checkIntegrity", () => {
+  const baseline = (): Map<string, string> => new Map([["daemon.ts", "aaa"]]);
+
+  it("lets an untouched package through", () => {
+    const gate: IntegrityGate = { baseline: baseline(), paged: false };
+
+    expect(checkIntegrity(gate, baseline())).toEqual({ diff: [], pause: false, page: false });
+    expect(gate.paged).toBe(false);
+  });
+
+  it("pauses every divergent tick but pages on only the first", () => {
+    const gate: IntegrityGate = { baseline: baseline(), paged: false };
+    const tampered = new Map([["daemon.ts", "bbb"]]);
+
+    expect(checkIntegrity(gate, tampered)).toEqual({ diff: ["changed daemon.ts"], pause: true, page: true });
+
+    // Pause is idempotent and unconditional — an operator who resumes without
+    // restarting is re-paused, because the files still differ. The page is not:
+    // one every five minutes until someone looks is a page nobody reads.
+    expect(checkIntegrity(gate, tampered)).toEqual({ diff: ["changed daemon.ts"], pause: true, page: false });
+    expect(checkIntegrity(gate, tampered).page).toBe(false);
+  });
+
+  it("compares against the boot baseline, not the previous tick", () => {
+    const gate: IntegrityGate = { baseline: baseline(), paged: false };
+    checkIntegrity(gate, new Map([["daemon.ts", "bbb"]]));
+
+    // Restoring the file is not enough to un-ring the bell, but it does stop
+    // the pausing: the baseline is what boot recorded, so a daemon whose
+    // package is put back exactly as it was can be resumed without a restart.
+    expect(checkIntegrity(gate, baseline()).pause).toBe(false);
+  });
+});
+
+const REPO: RepoTarget = {
+  name: "api",
+  cloneUrl: "https://example.invalid/acme/api.git",
+  defaultBranch: "main",
+  gates: [],
+};
+
+function candidate(number: number): Routed {
+  return {
+    issue: {
+      number,
+      title: `Ship widget ${number}`,
+      body: "Acceptance: it ships.",
+      labels: ["ready-for-agent", "repo:api"],
+      url: `https://example.invalid/acme/planning/issues/${number}`,
+      updatedAt: "2026-08-06T21:22:22Z",
+    },
+    repo: REPO,
+  };
+}
+
+function project(): ProjectConfig {
+  return {
+    name: PROJECT,
+    tracker: { kind: "github", repo: "acme/planning" },
+    queueLabel: "ready-for-agent",
+    stateLabels: {
+      inProgress: "agent:in-progress",
+      blocked: "agent:blocked",
+      failed: "agent:failed",
+    },
+    routing: { labelPrefix: "repo:", repos: { api: REPO } },
+    caps: {},
+    escalation: { fallbackToIssueComment: true, orchestrator: "embedded" },
+    authority: { ...DEFAULT_AUTHORITY },
+    workspaceRoot: "/tmp/conductor/work",
+    mirrorRoot: "/tmp/conductor/mirrors",
+  };
+}
+
+/** Admission consults exactly one tracker method. Every other one throws, so a
+ *  claim path that starts reaching for the network fails loudly here first. */
+function fakeTracker(openCloserFor: Tracker["openCloserFor"]): Tracker {
+  const off = (name: string) => async (): Promise<never> => {
+    throw new Error(`${name} is not part of admission`);
+  };
+  return {
+    listReady: off("listReady"),
+    addLabel: off("addLabel"),
+    removeLabel: off("removeLabel"),
+    comment: off("comment"),
+    close: off("close"),
+    linkParent: off("linkParent"),
+    openCloserFor,
+  };
+}
+
+function deps(store: Store, tracker: Tracker, caps: Partial<Caps> = {}) {
+  const escalated: Escalation[] = [];
+  return {
+    d: {
+      project: project(),
+      caps: { ...DEFAULT_CAPS, ...caps },
+      tracker,
+      store,
+      escalate: async (e: Escalation): Promise<void> => {
+        escalated.push(e);
+      },
+    },
+    escalated,
+  };
+}
+
+/** The decisions are only half the contract: an operator reading the log is how
+ *  a held or skipped issue gets explained, so the lines are asserted too. */
+async function captureLog<T>(fn: () => Promise<T>): Promise<{ value: T; log: string }> {
+  const chunks: string[] = [];
+  const real = process.stderr.write;
+  process.stderr.write = ((chunk: unknown) => {
+    chunks.push(String(chunk));
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    return { value: await fn(), log: chunks.join("") };
+  } finally {
+    process.stderr.write = real;
+  }
+}
+
+describe("admitCandidates", () => {
+  let store!: Store;
+
+  beforeEach(() => {
+    store = openStore(":memory:");
+  });
+
+  afterEach(() => {
+    store.close();
+  });
+
+  it("holds an issue whose work is already pushed, naming the PR", async () => {
+    const { d } = deps(
+      store,
+      fakeTracker(async () => "https://github.com/acme/api/pull/419"),
+    );
+
+    const { value, log } = await captureLog(() => admitCandidates(d, [candidate(288)], 2));
+
+    // The store holds no row for #288 — the database was created after the PR
+    // was pushed — so the busy set cannot possibly object. Only the tracker
+    // knows, and a worker sent here re-implements a finished PR, burns an
+    // attempt, and opens a second PR on the same issue.
+    expect(value).toEqual([]);
+    expect(log).toContain(
+      "#288 skipped: open PR https://github.com/acme/api/pull/419 already closes it",
+    );
+  });
+
+  it("admits an issue whose closers are all merged or closed", async () => {
+    const { d } = deps(
+      store,
+      fakeTracker(async () => undefined),
+    );
+
+    // A merged reference means the work landed and the issue was reopened for
+    // more; a closed-unmerged one means it was abandoned. Either way there is no
+    // live PR to collide with. (That MERGED and CLOSED read as "no closer" is
+    // the adapter's contract, pinned in tracker/github.test.ts.)
+    const admitted = await admitCandidates(d, [candidate(260)], 2);
+
+    expect(admitted.map((a) => a.r.issue.number)).toEqual([260]);
+    expect(admitted[0]?.attempt).toBe(1);
+  });
+
+  it("holds only the candidate whose check failed, and keeps evaluating the rest", async () => {
+    const { d } = deps(
+      store,
+      fakeTracker(async (issue) => {
+        if (issue === 288) throw new Error("HTTP 502: Bad gateway");
+        return undefined;
+      }),
+    );
+
+    const { value, log } = await captureLog(() =>
+      admitCandidates(d, [candidate(288), candidate(289)], 2),
+    );
+
+    // A failed check means "unknown whether finished work exists", and admitting
+    // on unknown is the duplicate-work failure this guard exists to kill: the
+    // worst case of holding is a five-minute delay, the worst case of admitting
+    // is a burned attempt and a second PR. Holding one candidate rather than
+    // aborting is what stops a flaky API from deadlocking the whole dispatcher.
+    expect(value.map((a) => a.r.issue.number)).toEqual([289]);
+    expect(log).toContain("#288 held: open-PR check failed");
+    expect(log).toContain("retrying next tick");
+  });
+
+  it("asks the tracker once per free slot, not once per queued issue", async () => {
+    const asked: number[] = [];
+    const { d } = deps(
+      store,
+      fakeTracker(async (issue) => {
+        asked.push(issue);
+        return undefined;
+      }),
+    );
+
+    const admitted = await admitCandidates(d, [candidate(1), candidate(2), candidate(3)], 1);
+
+    // One call per admitted candidate is the entire cost of the guard. Per
+    // queued issue it would scale with the backlog instead: two dozen API calls
+    // every five minutes, to admit two.
+    expect(admitted.map((a) => a.r.issue.number)).toEqual([1]);
+    expect(asked).toEqual([1]);
+  });
+
+  it("spends no API call on an issue the store already answers for", async () => {
+    store.createRun(draft({ issue: 500, state: "running" }));
+    store.createRun(draft({ issue: 600, attempt: 1, state: "failed" }));
+    store.createRun(draft({ issue: 600, attempt: 2, state: "failed", startedAt: 2_000 }));
+
+    const asked: number[] = [];
+    const { d, escalated } = deps(
+      store,
+      fakeTracker(async (issue) => {
+        asked.push(issue);
+        return undefined;
+      }),
+    );
+
+    const admitted = await admitCandidates(d, [candidate(500), candidate(600)], 2);
+
+    // #500 has a live run and #600 has spent both attempts: the store settles
+    // both without leaving the process. Order matters for more than cost — an
+    // exhausted issue has to escalate to a human, not be silently held.
+    expect(admitted).toEqual([]);
+    expect(asked).toEqual([]);
+    expect(escalated.map((e) => e.issue)).toEqual([600]);
+  });
+});
+
+describe("salvageLines", () => {
+  const TREE = "/root/.omp/conductor/workspace/140";
+
+  it("names the branch and sha a killed run's work was committed to", () => {
+    const lines = salvageLines(
+      { kind: "salvaged", sha: "9f2c1ab", branch: "conductor/issue-140", pushed: true },
+      TREE,
+    );
+
+    // The sha is the whole point: it is what turns "kept for inspection" into
+    // something an operator can `git show` next week instead of tonight.
+    expect(lines[0]).toBe(
+      "WIP committed to conductor/issue-140 @ 9f2c1ab and pushed — the work outlives this worktree",
+    );
+    expect(lines[1]).toBe(`Worktree kept for inspection: ${TREE}`);
+  });
+
+  it("still reports the sha when the push was refused, and says it is local", () => {
+    const lines = salvageLines(
+      {
+        kind: "salvaged",
+        sha: "9f2c1ab",
+        branch: "conductor/issue-140",
+        pushed: false,
+        pushError: "non-fast-forward",
+      },
+      TREE,
+    );
+
+    // A refused push does not lose the commit, and must not read as if it did.
+    expect(lines[0]).toContain("@ 9f2c1ab");
+    expect(lines[0]).toContain("NOT pushed (non-fast-forward)");
+    expect(lines[0]).toContain("this host's mirror");
+  });
+
+  it("says plainly when there was nothing to salvage", () => {
+    expect(salvageLines({ kind: "nothing" }, TREE)).toEqual([
+      `Worktree kept for inspection: ${TREE} — nothing uncommitted to salvage`,
+    ]);
+  });
+
+  it("is loud when the salvage itself failed, naming the only copy", () => {
+    const lines = salvageLines({ kind: "failed", error: "git commit exited 128" }, TREE);
+
+    expect(lines[0]).toBe("WIP SALVAGE FAILED: git commit exited 128");
+    // The one case where a human has to act tonight: the tree is the only copy
+    // and the next attempt removes it.
+    expect(lines[1]).toContain(TREE);
+    expect(lines[1]).toContain("only copy");
   });
 });

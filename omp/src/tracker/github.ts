@@ -10,7 +10,7 @@
  * ~200-400ms) and failure classification by matching human-readable stderr
  * instead of reading a status code. Upgrade path when either bites: replace the
  * body of `gh()` with `fetch("https://api.github.com/...")` using a token from
- * `gh auth token`; the six Tracker methods above it stay untouched.
+ * `gh auth token`; the seven Tracker methods above it stay untouched.
  */
 
 import type { ProjectConfig, ReadyIssue, Tracker } from "../types.ts";
@@ -24,6 +24,47 @@ interface GhIssue {
   labels: { name: string }[] | null;
   url: string;
   updatedAt: string;
+}
+
+/**
+ * Pull requests that would close an issue, with the one field that decides it.
+ *
+ * `gh issue view <n> --json closedByPullRequestsReferences` returns `id`,
+ * `number`, `repository` and `url` and no state, so a guard built on it holds an
+ * issue forever on a reference that is merged or closed-unmerged — which is
+ * exactly what a reopened issue looks like. GraphQL is the only spelling that
+ * yields `state`, so it is the spelling used.
+ *
+ * `includeClosedPrs:false` is deliberately not passed: it is not the filter it
+ * sounds like. Measured on gh 2.86.0 (2026-08-06), `veltro#260` returned a
+ * MERGED reference with the argument both true and false. The state is filtered
+ * in this consumer instead.
+ *
+ * ponytail: one page of ten. An issue closed by more than ten PRs is not a
+ * dispatch problem, and the first OPEN one already answers the question.
+ */
+const CLOSERS_QUERY = `query($owner:String!,$repo:String!,$n:Int!){
+  repository(owner:$owner,name:$repo){
+    issue(number:$n){
+      closedByPullRequestsReferences(first:10){
+        nodes{ number state isDraft url repository{ nameWithOwner } }
+      }
+    }
+  }
+}`;
+
+/** The `gh api graphql` envelope for {@link CLOSERS_QUERY}. Every level is
+ *  nullable: a deleted or wrong-numbered issue answers `null`, not an error. */
+interface ClosersResponse {
+  data?: {
+    repository?: {
+      issue?: {
+        closedByPullRequestsReferences?: {
+          nodes?: ({ state: string; isDraft: boolean; url: string } | null)[] | null;
+        } | null;
+      } | null;
+    } | null;
+  } | null;
 }
 
 /** Carries the captured stderr so callers can classify a failure without
@@ -74,15 +115,43 @@ async function gh(argv: string[], stdin?: string): Promise<string> {
  * True when a label edit failed only because the requested end state already
  * holds. Adding a label is idempotent server-side, but removing one that is not
  * present is a 404, and a concurrent daemon restart can easily race into both.
+ *
+ * The quoted form is gh's own, and it is why the two operations are classified
+ * separately: `gh issue edit --remove-label x` on a label the *repository* does
+ * not define exits 1 with `'x' not found` (2.97.0), which for a removal is the
+ * end state already holding — a label nobody defined cannot be on an issue —
+ * while for an add it is a genuine failure. Removing a label the repo defines
+ * but the issue does not carry is already a silent success, so this path is
+ * reached only by the undefined-label case, most often a state label an
+ * operator declined to create at setup.
  */
 function isLabelNoop(err: unknown, op: "add" | "remove"): boolean {
   if (!(err instanceof GhError)) return false;
   const stderr = err.stderr;
   return op === "add"
     ? /already (?:has|had|exists|applied|added)|label .* already/i.test(stderr)
-    : /label does not exist|not labeled|does not have (?:that|the|this) label|label .* not found|not found on (?:this )?issue/i.test(
+    : /label does not exist|not labeled|does not have (?:that|the|this) label|label .* not found|not found on (?:this )?issue|'[^']+' not found/i.test(
         stderr,
       );
+}
+
+/**
+ * The URL of the first OPEN closer in a `gh api graphql` reply, if any.
+ *
+ * Split from the call so the state filter — the only real logic in this file —
+ * is pinned against recorded payloads instead of a live repo.
+ *
+ * A draft counts. `isDraft` is selected because the API offers it, not because
+ * it changes the answer: draft means "not ready to review", not "not pushed",
+ * and the branch behind a draft still holds the only copy of the work. Sending
+ * a second worker at it duplicates that work exactly as much as a ready PR
+ * would, so OPEN is the whole test.
+ */
+export function firstOpenCloser(raw: string): string | undefined {
+  const nodes =
+    (JSON.parse(raw) as ClosersResponse).data?.repository?.issue?.closedByPullRequestsReferences
+      ?.nodes ?? [];
+  return nodes.find((n) => n !== null && n.state === "OPEN")?.url;
 }
 
 export function makeTracker(p: ProjectConfig): Tracker {
@@ -155,6 +224,29 @@ export function makeTracker(p: ProjectConfig): Tracker {
       // repo's own epic rollups read, so a human sees the split without us
       // maintaining a second index of it.
       await gh(["issue", "edit", String(parent), "--repo", repo, "--add-sub-issue", String(child)]);
+    },
+
+    async openCloserFor(issue: number): Promise<string | undefined> {
+      // GraphQL wants the halves of `owner/repo` separately. Config validates
+      // that spelling, so an empty half means a hand-edited config: `gh` then
+      // errors and the caller holds the candidate rather than guessing.
+      const [owner = "", name = ""] = repo.split("/");
+      const raw = await gh([
+        "api",
+        "graphql",
+        "-f",
+        `query=${CLOSERS_QUERY}`,
+        "-F",
+        `owner=${owner}`,
+        "-F",
+        `repo=${name}`,
+        // -F, not -f: the query declares $n as Int! and a string would be a
+        // type error rather than a coerced number.
+        "-F",
+        `n=${issue}`,
+      ]);
+
+      return firstOpenCloser(raw);
     },
   };
 }

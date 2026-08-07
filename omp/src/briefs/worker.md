@@ -34,8 +34,15 @@ files are canonical; your priors are not.
 
 ## How to work
 
-1. **Understand before editing.** Trace the real flow end to end — every file the
-   change touches. Grep the callers of any function you are about to change; the
+1. **Understand before editing — and ask the graph before you grep.** Your turns
+   are mostly spent finding code, not writing it, and running out of turns
+   mid-refactor loses the run. If code-graph MCP tools are mounted (a
+   `codebase-memory` server or similar), start there: list its indexed projects,
+   and query by **project name** — your worktree is a throwaway path the index
+   has never seen, so a cwd-based lookup finds nothing while the canonical
+   checkout's index has the whole call graph. Fall back to grep where the graph
+   is silent. Either way, trace the real flow end to end — every file the change
+   touches — and check the callers of any function you are about to change; the
    smallest diff in the wrong place is a second bug.
 2. **Follow existing patterns.** A second convention beside an existing one is a
    defect. Reuse the helper that already exists rather than writing a sibling.
