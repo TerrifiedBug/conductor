@@ -109,9 +109,10 @@ session is carrying two versions of your policy.
 exactly one value, `"github"`, and every tracker operation shells out to your
 already-authenticated `gh` CLI — the conductor never stores a token of its own.
 Gitea, Jira, and file-based trackers are not supported yet; the seam for them is
-`src/tracker/github.ts`, which implements the whole six-method `Tracker`
+`src/tracker/github.ts`, which implements the whole nine-method `Tracker`
 interface in `src/types.ts` (`listReady`, `addLabel`, `removeLabel`, `comment`,
-`close`, `linkParent`) that a future backend would swap in.
+`close`, `linkParent`, `parentOf`, `openCloserFor`, `prState`) that a future
+backend would swap in.
 
 You tell the conductor where to look with three keys, all in
 `~/.omp/conductor/config.json` (the [Configuration](#configuration) section has

@@ -84,6 +84,7 @@ function makeTracker(opts: { commentThrows?: boolean } = {}) {
     },
     close: async () => {},
     linkParent: async () => {},
+    parentOf: async () => undefined,
     openCloserFor: async () => undefined,
     prState: async () => undefined,
   };

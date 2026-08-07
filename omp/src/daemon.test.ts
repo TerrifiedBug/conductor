@@ -360,10 +360,22 @@ function fakeTracker(over: Partial<Tracker>): Tracker {
     comment: off("comment"),
     close: off("close"),
     linkParent: off("linkParent"),
+    parentOf: off("parentOf"),
     openCloserFor: off("openCloserFor"),
     prState: off("prState"),
     ...over,
   };
+}
+
+/** Admission fakes: no parent and no open closer unless a test overrides them.
+ *  Epic serialization and the open-PR guard are the path under test; everything
+ *  else stays on the loud `off()` stubs. */
+function admissionTracker(over: Partial<Tracker> = {}): Tracker {
+  return fakeTracker({
+    parentOf: async () => undefined,
+    openCloserFor: async () => undefined,
+    ...over,
+  });
 }
 
 function deps(store: Store, tracker: Tracker, caps: Partial<Caps> = {}) {
@@ -412,7 +424,7 @@ describe("admitCandidates", () => {
   it("holds an issue whose work is already pushed, naming the PR", async () => {
     const { d } = deps(
       store,
-      fakeTracker({ openCloserFor: async () => "https://github.com/acme/api/pull/419" }),
+      admissionTracker({ openCloserFor: async () => "https://github.com/acme/api/pull/419" }),
     );
 
     const { value, log } = await captureLog(() => admitCandidates(d, [candidate(288)], 2));
@@ -428,7 +440,7 @@ describe("admitCandidates", () => {
   });
 
   it("admits an issue whose closers are all merged or closed", async () => {
-    const { d } = deps(store, fakeTracker({ openCloserFor: async () => undefined }));
+    const { d } = deps(store, admissionTracker());
 
     // A merged reference means the work landed and the issue was reopened for
     // more; a closed-unmerged one means it was abandoned. Either way there is no
@@ -443,7 +455,7 @@ describe("admitCandidates", () => {
   it("holds only the candidate whose check failed, and keeps evaluating the rest", async () => {
     const { d } = deps(
       store,
-      fakeTracker({
+      admissionTracker({
         openCloserFor: async (issue) => {
           if (issue === 288) throw new Error("HTTP 502: Bad gateway");
           return undefined;
@@ -469,7 +481,7 @@ describe("admitCandidates", () => {
     const asked: number[] = [];
     const { d } = deps(
       store,
-      fakeTracker({
+      admissionTracker({
         openCloserFor: async (issue) => {
           asked.push(issue);
           return undefined;
@@ -494,7 +506,7 @@ describe("admitCandidates", () => {
     const asked: number[] = [];
     const { d, escalated } = deps(
       store,
-      fakeTracker({
+      admissionTracker({
         openCloserFor: async (issue) => {
           asked.push(issue);
           return undefined;
@@ -510,6 +522,127 @@ describe("admitCandidates", () => {
     expect(admitted).toEqual([]);
     expect(asked).toEqual([]);
     expect(escalated.map((e) => e.issue)).toEqual([600]);
+  });
+
+  it("admits only the first of two ready siblings under the same epic", async () => {
+    const { d } = deps(
+      store,
+      admissionTracker({
+        parentOf: async (issue) => (issue === 305 || issue === 306 ? 300 : undefined),
+      }),
+    );
+
+    const { value, log } = await captureLog(() =>
+      admitCandidates(d, [candidate(305), candidate(306)], 2),
+    );
+
+    expect(value.map((a) => a.r.issue.number)).toEqual([305]);
+    expect(log).toContain("#306 skipped: sibling #305 in flight under epic #300");
+  });
+
+  it("holds a sibling while another child is active, and still fills the slot with unrelated work", async () => {
+    store.createRun(draft({ issue: 305, state: "pushed-green" }));
+    const { d } = deps(
+      store,
+      admissionTracker({
+        parentOf: async (issue) => {
+          if (issue === 305 || issue === 306) return 300;
+          return undefined;
+        },
+      }),
+    );
+
+    const { value, log } = await captureLog(() =>
+      admitCandidates(d, [candidate(306), candidate(400)], 2),
+    );
+
+    expect(value.map((a) => a.r.issue.number)).toEqual([400]);
+    expect(log).toContain("#306 skipped: sibling #305 in flight under epic #300");
+  });
+
+  it("admits the waiting sibling after the active child leaves the busy set", async () => {
+    const parents = async (issue: number) => (issue === 305 || issue === 306 ? 300 : undefined);
+
+    // Tick 1: #305 occupies the epic.
+    store.createRun(draft({ issue: 305, state: "running" }));
+    const first = await admitCandidates(
+      deps(store, admissionTracker({ parentOf: parents })).d,
+      [candidate(306)],
+      1,
+    );
+    expect(first).toEqual([]);
+
+    // Tick 2: #305 settled out of the active set — #306 is free to go.
+    for (const run of store.activeRuns(PROJECT)) {
+      store.updateRun(run.id, { state: "merged", endedAt: Date.now() });
+    }
+    const second = await admitCandidates(
+      deps(store, admissionTracker({ parentOf: parents })).d,
+      [candidate(306)],
+      1,
+    );
+    expect(second.map((a) => a.r.issue.number)).toEqual([306]);
+  });
+
+  it("lets issues with no parent admit concurrently up to the slot count", async () => {
+    const { d } = deps(store, admissionTracker());
+
+    const admitted = await admitCandidates(d, [candidate(10), candidate(11)], 2);
+
+    expect(admitted.map((a) => a.r.issue.number)).toEqual([10, 11]);
+  });
+
+  it("holds only the candidate whose parent lookup failed, and keeps evaluating the rest", async () => {
+    const { d } = deps(
+      store,
+      admissionTracker({
+        parentOf: async (issue) => {
+          if (issue === 305) throw new Error("HTTP 502: Bad gateway");
+          return undefined;
+        },
+      }),
+    );
+
+    const { value, log } = await captureLog(() =>
+      admitCandidates(d, [candidate(305), candidate(400)], 2),
+    );
+
+    expect(value.map((a) => a.r.issue.number)).toEqual([400]);
+    expect(log).toContain("#305 held: parent check failed");
+    expect(log).toContain("retrying next tick");
+  });
+
+  it("still refuses a sibling that already has an open closer", async () => {
+    const { d } = deps(
+      store,
+      admissionTracker({
+        parentOf: async (issue) => (issue === 305 || issue === 306 ? 300 : undefined),
+        openCloserFor: async (issue) =>
+          issue === 306 ? "https://github.com/acme/api/pull/420" : undefined,
+      }),
+    );
+
+    // #305 admits and occupies the epic; #306 would be sibling-held anyway, but
+    // give it an open closer and confirm that guard's skip line still fires when
+    // the epic is free — here by considering #306 alone.
+    const alone = await captureLog(() => admitCandidates(d, [candidate(306)], 1));
+    expect(alone.value).toEqual([]);
+    expect(alone.log).toContain(
+      "#306 skipped: open PR https://github.com/acme/api/pull/420 already closes it",
+    );
+  });
+
+  it("never admits two siblings in one pass even when slots remain", async () => {
+    const { d } = deps(
+      store,
+      admissionTracker({
+        parentOf: async (issue) => (issue === 305 || issue === 306 ? 300 : undefined),
+      }),
+    );
+
+    const admitted = await admitCandidates(d, [candidate(305), candidate(306)], 2);
+
+    expect(admitted.map((a) => a.r.issue.number)).toEqual([305]);
   });
 });
 

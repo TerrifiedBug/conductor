@@ -10,7 +10,7 @@
  * ~200-400ms) and failure classification by matching human-readable stderr
  * instead of reading a status code. Upgrade path when either bites: replace the
  * body of `gh()` with `fetch("https://api.github.com/...")` using a token from
- * `gh auth token`; the eight Tracker methods above it stay untouched.
+ * `gh auth token`; the nine Tracker methods above it stay untouched.
  */
 
 import type { PrState, ProjectConfig, ReadyIssue, Tracker } from "../types.ts";
@@ -189,6 +189,22 @@ export function prStateFrom(raw: string): PrState | undefined {
   }
 }
 
+/**
+ * Parent number from a `gh issue view --json parent` payload, or undefined
+ * when the issue has no parent. Throws on a payload that claims a parent but
+ * does not carry a usable number — admission would otherwise treat garbage as
+ * "no parent" and skip the epic soft-cap.
+ */
+export function parentNumberFrom(raw: string): number | undefined {
+  const parsed = JSON.parse(raw) as { parent: { number?: unknown } | null };
+  if (parsed.parent == null) return undefined;
+  const n = parsed.parent.number;
+  if (typeof n !== "number" || !Number.isInteger(n) || n <= 0) {
+    throw new Error(`unexpected parent number ${JSON.stringify(n)}`);
+  }
+  return n;
+}
+
 export function makeTracker(p: ProjectConfig): Tracker {
   const repo = p.tracker.repo;
 
@@ -259,6 +275,14 @@ export function makeTracker(p: ProjectConfig): Tracker {
       // repo's own epic rollups read, so a human sees the split without us
       // maintaining a second index of it.
       await gh(["issue", "edit", String(parent), "--repo", repo, "--add-sub-issue", String(child)]);
+    },
+
+    async parentOf(issue: number): Promise<number | undefined> {
+      // Native sub-issue parent, not a body scrape. Verified on gh 2.97.0:
+      // `parent` is null with no link, otherwise `{ number, title, url, ... }`.
+      return parentNumberFrom(
+        await gh(["issue", "view", String(issue), "--repo", repo, "--json", "parent"]),
+      );
     },
 
     async openCloserFor(issue: number): Promise<string | undefined> {

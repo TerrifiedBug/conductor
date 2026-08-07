@@ -231,6 +231,16 @@ export interface Tracker {
    *  to the request that spawned it. */
   linkParent(child: number, parent: number): Promise<void>;
   /**
+   * The parent epic/issue number when `issue` is a linked sub-issue, or
+   * undefined when it has no parent.
+   *
+   * Admission serializes siblings under one parent (at most one in flight). A
+   * missing parent means "not epic-serialized" and keeps today's concurrent
+   * admission. A thrown error is fail-closed for that candidate — same posture
+   * as {@link Tracker.openCloserFor}.
+   */
+  parentOf(issue: number): Promise<number | undefined>;
+  /**
    * The URL of an OPEN pull request that already closes `issue`, or undefined
    * when none does.
    *
