@@ -593,7 +593,7 @@ try {
 
       if (argv.includes("--migrate")) {
         if (layout.kind === "overlay") {
-          process.stdout.write(`${formatBriefStatus(path, { kind: "overlay", ...layout })}\n`);
+          process.stdout.write(`${formatBriefStatus(path, layout)}\n`);
           break;
         }
         if (layout.kind === "missing") {
