@@ -17,13 +17,16 @@ import {
   formatBriefStatus,
   inspectBriefLayout,
   formatRetrofitRefusal,
+  COMPOSE_BANNER,
   migrateToPolicy,
   missingSections,
   proposeRetrofit,
   refreshComposedBrief,
+  repairPolicyBannerCrumbs,
   sectionText,
   shippedDiff,
   splitBrief,
+  stripLeadingHtmlComments,
   writeMergedBrief,
 } from "./brief-upgrade.ts";
 
@@ -47,6 +50,114 @@ test("splitBrief cuts at the banner and loses nothing", () => {
   expect(halves?.shipped).toContain(BANNER);
   expect(halves?.owned).toContain("## Releases");
   expect(halves?.owned).not.toContain("## Duty 1");
+});
+
+test("splitBrief consumes the full legacy multi-line banner block", () => {
+  // Hermes-shaped legacy banner: YOURS TO EDIT is not the last comment line.
+  // Cutting only after that line used to leave the footer comments in owned,
+  // which migrate then wrote into POLICY.md.
+  const legacyBanner = [
+    "<!-- ==================================================================== -->",
+    "<!-- YOURS TO EDIT — everything below is your policy, not the package's.   -->",
+    "<!-- The conductor never reads this file back, so edit freely.             -->",
+    "<!-- ==================================================================== -->",
+  ].join("\n");
+  const text = [
+    "# Orchestrator brief — fleet",
+    "",
+    "## Duty 1 — drain",
+    "loop.",
+    "",
+    legacyBanner,
+    "",
+    "## Releases",
+    "humans release.",
+    "",
+  ].join("\n");
+
+  const halves = splitBrief(text);
+  expect(halves).toBeDefined();
+  expect(`${halves!.shipped}${halves!.owned}`).toBe(text);
+  expect(halves!.shipped).toContain("never reads this file back");
+  expect(halves!.shipped).toContain("====================================================================");
+  expect(halves!.owned.trimStart()).toMatch(/^## Releases/);
+  expect(halves!.owned).not.toContain("never reads this file back");
+  expect(halves!.owned).not.toContain("<!--");
+});
+
+test("splitBrief consumes the compose banner block the same way", () => {
+  const text = composeOrchestrator(
+    "# Floor\n\n## Duty 1\nx.\n",
+    "## Releases\npolicy.\n",
+  );
+  const halves = splitBrief(text);
+  expect(halves).toBeDefined();
+  expect(halves!.shipped).toContain(COMPOSE_BANNER);
+  expect(halves!.owned.trimStart()).toMatch(/^## Releases/);
+  expect(halves!.owned).not.toContain("YOURS TO EDIT");
+  expect(halves!.owned).not.toContain("<!--");
+});
+
+test("migrateToPolicy strips leftover banner crumbs from owned", () => {
+  const dir = mkdtempSync(join(tmpdir(), "brief-crumbs-"));
+  try {
+    const orchestratorPath = join(dir, "ORCHESTRATOR.md");
+    const policyPath = join(dir, "POLICY.md");
+    // Simulate a pre-fix owned half that still carries banner footers.
+    const crumbOwned = [
+      "<!-- The conductor never reads this file back, so edit freely.             -->",
+      "<!-- ==================================================================== -->",
+      "",
+      "## Releases",
+      "MY POLICY.",
+      "",
+    ].join("\n");
+    writeFileSync(orchestratorPath, `# Floor\n\n${COMPOSE_BANNER}\n\n${crumbOwned}`);
+    migrateToPolicy({
+      orchestratorPath,
+      policyPath,
+      floor: "# Floor\n\n## Duty 1\nnew.\n",
+      owned: crumbOwned,
+    });
+    const policy = readFileSync(policyPath, "utf8");
+    expect(policy.trimStart()).toMatch(/^## Releases/);
+    expect(policy).not.toContain("<!--");
+    expect(policy).toContain("MY POLICY.");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("repairPolicyBannerCrumbs cleans an already-migrated POLICY.md", () => {
+  const dir = mkdtempSync(join(tmpdir(), "brief-repair-"));
+  try {
+    const orchestratorPath = join(dir, "ORCHESTRATOR.md");
+    const policyPath = join(dir, "POLICY.md");
+    writeFileSync(
+      policyPath,
+      [
+        "<!-- The conductor never reads this file back, so edit freely.             -->",
+        "<!-- ==================================================================== -->",
+        "",
+        "## Releases",
+        "live policy.",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(orchestratorPath, "stale\n");
+    const result = repairPolicyBannerCrumbs({
+      orchestratorPath,
+      policyPath,
+      floor: "# Floor\n\n## Duty 1\nx.\n",
+    });
+    expect(result).toBeDefined();
+    const policy = readFileSync(policyPath, "utf8");
+    expect(policy.trimStart()).toMatch(/^## Releases/);
+    expect(policy).not.toContain("<!--");
+    expect(readFileSync(orchestratorPath, "utf8")).toContain("live policy.");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("splitBrief reports no banner rather than guessing a boundary", () => {

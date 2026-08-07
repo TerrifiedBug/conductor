@@ -17,6 +17,7 @@ import {
   inspectBriefLayout,
   migrateToPolicy,
   proposeRetrofit,
+  repairPolicyBannerCrumbs,
   writeMergedBrief,
 } from "./brief-upgrade.ts";
 import { findProject, loadConfig, resolveCaps, stateDir } from "./config.ts";
@@ -593,7 +594,32 @@ try {
 
       if (argv.includes("--migrate")) {
         if (layout.kind === "overlay") {
-          process.stdout.write(`${formatBriefStatus(path, layout)}\n`);
+          if (!argv.includes("--apply")) {
+            process.stdout.write(
+              `${formatBriefStatus(path, layout)}\n\n` +
+                "POLICY.md already present. --migrate --apply will strip any leading\n" +
+                "banner-comment crumbs from POLICY.md and recompose ORCHESTRATOR.md.\n",
+            );
+            break;
+          }
+          if (project === undefined) {
+            process.stderr.write(
+              "omp-conductor: repairing an overlay needs --project (or a config) so the floor renders.\n",
+            );
+            process.exit(1);
+          }
+          const repaired = repairPolicyBannerCrumbs({
+            orchestratorPath: layout.orchestratorPath,
+            policyPath: layout.policyPath,
+            floor: renderFloorForProject(project),
+          });
+          if (repaired === undefined) {
+            process.stdout.write(
+              `${formatBriefStatus(path, layout)}\n\nrecomposed ORCHESTRATOR.md — POLICY.md needed no crumb strip.\n`,
+            );
+          } else {
+            process.stdout.write(`${formatMigrateResult(repaired)}\n`);
+          }
           break;
         }
         if (layout.kind === "missing") {
