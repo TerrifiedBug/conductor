@@ -443,6 +443,24 @@ test("the report tells the operator which command applies it, and only when it c
   expect(current).not.toContain("--apply");
 });
 
+test("overlay status does not steer operators into npm install", () => {
+  // Hermes dogfood: hard-coding `npm install omp-conductor@…` sent the fleet
+  // into the wrong package tree / package manager and broke `omp`. Guidance
+  // must stay install-root / package-manager neutral.
+  const report = formatBriefStatus("/x/ORCHESTRATOR.md", {
+    kind: "overlay",
+    policyPath: "/x/POLICY.md",
+    orchestratorPath: "/x/ORCHESTRATOR.md",
+  });
+  expect(report).toContain("brief overlay active");
+  expect(report).toContain("/x/POLICY.md");
+  expect(report).toContain("existing install root");
+  expect(report).toContain("no brief-upgrade --apply");
+  expect(report).not.toContain("npm install");
+  expect(report).not.toContain("bun add");
+  expect(report).not.toContain("npm ");
+});
+
 test("migrateToPolicy lifts owned half into POLICY.md and recomposes", () => {
   const dir = mkdtempSync(join(tmpdir(), "brief-migrate-"));
   try {

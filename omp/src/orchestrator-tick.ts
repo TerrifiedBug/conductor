@@ -334,7 +334,7 @@ export function resolveTickScope(): {
  * live `POLICY.md`.
  *
  * Runs on **every** successful send — including ticks that use a custom
- * `message` — so protocol updates land after `npm install` without waiting for
+ * `message` — so protocol updates land after a package upgrade without waiting for
  * the default prompt path. Failures (no config, no `POLICY.md`, unreadable
  * overlay) are silent: the tick still goes out.
  */
