@@ -162,6 +162,11 @@ export async function createSession(opts: {
     // sharing it fails to start. The daemon runs `maxConcurrentWorkers`
     // (2 by default) workers at once, which makes this the normal path.
     agentRegistry: new mod.AgentRegistry(),
+    // Default true in the SDK, but pass it explicitly so a harness change
+    // cannot silently strip MCP from workers. Discovery walks cwd + user
+    // agentDir (~/.omp/agent/mcp.json) — without this, workers grep-only and
+    // burn the turns cap on discovery (#29).
+    enableMCP: true,
   });
   const raw = asRawSession(created);
   // Surfaced rather than swallowed: this is how a quiet downgrade to a weaker

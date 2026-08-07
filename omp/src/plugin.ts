@@ -194,6 +194,30 @@ async function askNumber(ctx: CommandContext, title: string, fallback: number): 
 }
 
 /**
+ * Daily spend ceiling. Blank / "none" / "off" → null (no gate). Unparseable
+ * non-empty input keeps the current value. Distinct from askNumber so operators
+ * can turn the money brake off without writing a magic 0 (which is a hard stop).
+ */
+async function askSpendCap(
+  ctx: CommandContext,
+  title: string,
+  fallback: number | null,
+): Promise<number | null> {
+  const seed = fallback === null ? "" : String(fallback);
+  const raw = (await ask(ctx, title, seed)).trim().toLowerCase();
+  if (raw === "" || raw === "none" || raw === "off" || raw === "null") return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) {
+    ctx.ui.notify(
+      `"${raw}" is not a non-negative number or blank — keeping ${fallback === null ? "no cap" : fallback}.`,
+      "warning",
+    );
+    return fallback;
+  }
+  return value;
+}
+
+/**
  * Pre-push gates as one comma-separated line, `cmd @ cwd` for a subdirectory:
  * `bun run check, bun test @ server`. Shown through `formatGates`, the same
  * spelling the amend menu reads a repo's current gates back with.
@@ -500,10 +524,12 @@ const askGraph: AreaAsker = async (ctx, a) => {
  *  answer for anyone who has not measured their own runners. */
 const askCaps: AreaAsker = async (ctx, a) => {
   const caps: Partial<Caps> = { ...a.caps };
+  const spendLabel =
+    DEFAULT_CAPS.dailySpendUsd === null ? "no spend cap" : `$${DEFAULT_CAPS.dailySpendUsd}/day`;
   const tuneCaps = await ctx.ui.confirm(
     "Caps",
     `Defaults: ${DEFAULT_CAPS.maxConcurrentWorkers} workers, ` +
-      `$${DEFAULT_CAPS.dailySpendUsd}/day, ${DEFAULT_CAPS.workerMaxTurns} turns and ` +
+      `${spendLabel}, ${DEFAULT_CAPS.workerMaxTurns} turns and ` +
       `${Math.round(DEFAULT_CAPS.workerWallClockMs / 60000)} min per worker, ` +
       `${DEFAULT_CAPS.maxAttemptsPerIssue} attempts per issue. Change them?`,
   );
@@ -516,7 +542,11 @@ const askCaps: AreaAsker = async (ctx, a) => {
     "Max concurrent workers",
     caps.maxConcurrentWorkers ?? DEFAULT_CAPS.maxConcurrentWorkers,
   );
-  caps.dailySpendUsd = await askNumber(ctx, "Spend ceiling per rolling day (USD)", caps.dailySpendUsd ?? DEFAULT_CAPS.dailySpendUsd);
+  caps.dailySpendUsd = await askSpendCap(
+    ctx,
+    "Spend ceiling per rolling day (USD) — blank = no spend cap",
+    caps.dailySpendUsd !== undefined ? caps.dailySpendUsd : DEFAULT_CAPS.dailySpendUsd,
+  );
   caps.workerMaxTurns = await askNumber(ctx, "Turn ceiling per worker", caps.workerMaxTurns ?? DEFAULT_CAPS.workerMaxTurns);
   caps.workerWallClockMs = await askNumber(
     ctx,

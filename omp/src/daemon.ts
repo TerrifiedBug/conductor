@@ -444,10 +444,35 @@ export async function buildBrief(
   r: Routed,
   branch: string,
   worktree: string,
+  opts: { continuation?: boolean; defaultBranch?: string } = {},
 ): Promise<string> {
   // Read per dispatch rather than caching: editing the brief then takes effect
   // on the next issue instead of needing a daemon restart.
   const template = await Bun.file(BRIEF_TEMPLATE_PATH).text();
+  const defaultBranch = opts.defaultBranch ?? r.repo.defaultBranch;
+  const continuation =
+    opts.continuation === true
+      ? [
+          "",
+          "## Continuation — do not start from zero",
+          "",
+          `You are **resuming** issue #${r.issue.number}. Branch \`${branch}\` already exists`,
+          "and was reattached with prior commits (and possibly a salvaged WIP tip).",
+          "Before writing anything:",
+          "",
+          "```bash",
+          "git log --oneline origin/" + defaultBranch + "..HEAD",
+          "git diff --stat origin/" + defaultBranch + "...HEAD",
+          "git status --porcelain",
+          "```",
+          "",
+          "Read that history. **Do not recreate work that already exists.** Finish",
+          "what remains against the same acceptance criteria. If a prior attempt",
+          "left a `wip(#…): … auto-salvaged` commit, treat it as your starting",
+          "point, not as trash to rewrite from scratch.",
+          "",
+        ].join("\n")
+      : "";
   return renderBrief(template, {
     ISSUE_NUMBER: String(r.issue.number),
     ISSUE_TITLE: r.issue.title,
@@ -461,6 +486,7 @@ export async function buildBrief(
     // placeholder sits flush against the next list item in the template, so an
     // unconfigured render leaves no blank line where a hint would have gone.
     GRAPH_HINT: graphHint(r.repo),
+    CONTINUATION: continuation,
   });
 }
 
@@ -513,14 +539,14 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
     // would cost a second network fetch per attempt.
     const mirrorPath = mirrorPathFor(r.repo, project.mirrorRoot);
     await removeWorktree(mirrorPath, worktreePathFor(project.workspaceRoot, issue));
-
-    worktreePath = await addWorktree(
+    const provisioned = await addWorktree(
       r.repo,
       project.mirrorRoot,
       project.workspaceRoot,
       issue,
       branch,
     );
+    worktreePath = provisioned.path;
 
     // The SDK names the transcript itself, so the daemon supplies the parent
     // directory and learns the real path back from the result. Inventing one
@@ -529,10 +555,16 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
     mkdirSync(sessionDir, { recursive: true });
     store.updateRun(runId, { worktree: worktreePath, state: "running" });
 
-    log(`#${issue} attempt ${attempt} → ${r.repo.name} ${branch}`);
+    log(
+      `#${issue} attempt ${attempt} → ${r.repo.name} ${branch}` +
+        (provisioned.reattached ? " (continuation: reattached existing branch)" : ""),
+    );
 
     const result = await runWorker({
-      brief: await buildBrief(project, r, branch, worktreePath),
+      brief: await buildBrief(project, r, branch, worktreePath, {
+        continuation: provisioned.reattached,
+        defaultBranch: r.repo.defaultBranch,
+      }),
       cwd: worktreePath,
       caps,
       sessionDir,
@@ -572,30 +604,61 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
         detail: [`${r.issue.title}`, r.issue.url, "", result.report].join("\n"),
       });
     } else if (result.state === "failed" || result.state === "killed") {
-      await swapLabel(tracker, issue, inProgress, project.stateLabels.failed);
-      // Before the escalation is composed, so it can say where the work went —
-      // and long before the next attempt provisions over this tree.
+      // Turns-cap with attempts left: salvage, put the issue back on the queue,
+      // and skip the failed label so the next tick reclaims as a continuation
+      // instead of burning a human triage cycle (#50 / #21).
+      const continueTurns =
+        result.killedBy === "turns" && attempt < caps.maxAttemptsPerIssue;
       const salvaged = await salvage(issue, attempt, endedBy(result.killedBy), worktreePath);
-      await safeEscalate(d, {
-        tier: 1,
-        project: project.name,
-        issue,
-        runId,
-        // The dedup key includes the summary, so the attempt number is what
-        // lets a genuine second failure page again while a tick that keeps
-        // seeing the same dead issue stays quiet.
-        summary: result.killedBy
-          ? `#${issue} was killed on attempt ${attempt} by the ${result.killedBy} cap`
-          : `#${issue} failed on attempt ${attempt}`,
-        detail: [
-          `${r.issue.title}`,
-          r.issue.url,
-          ...salvaged,
-          `Session: ${result.sessionFile ?? "(no transcript)"}`,
-          "",
-          result.report,
-        ].join("\n"),
-      });
+
+      if (continueTurns) {
+        await tracker.removeLabel(issue, inProgress);
+        await tracker.addLabel(issue, project.queueLabel);
+        log(
+          `#${issue} turns-cap on attempt ${attempt}/${caps.maxAttemptsPerIssue} — ` +
+            `salvaged and re-queued for continuation`,
+        );
+        await safeEscalate(d, {
+          tier: 1,
+          project: project.name,
+          issue,
+          runId,
+          summary: `#${issue} hit the turns cap on attempt ${attempt} — auto-requeued for continuation`,
+          detail: [
+            `${r.issue.title}`,
+            r.issue.url,
+            ...salvaged,
+            `Session: ${result.sessionFile ?? "(no transcript)"}`,
+            "",
+            "The queue label is back on; the next tick should reattach the branch",
+            "and open a continuation brief. No failed label was applied.",
+            "",
+            result.report,
+          ].join("\n"),
+        });
+      } else {
+        await swapLabel(tracker, issue, inProgress, project.stateLabels.failed);
+        await safeEscalate(d, {
+          tier: 1,
+          project: project.name,
+          issue,
+          runId,
+          // The dedup key includes the summary, so the attempt number is what
+          // lets a genuine second failure page again while a tick that keeps
+          // seeing the same dead issue stays quiet.
+          summary: result.killedBy
+            ? `#${issue} was killed on attempt ${attempt} by the ${result.killedBy} cap`
+            : `#${issue} failed on attempt ${attempt}`,
+          detail: [
+            `${r.issue.title}`,
+            r.issue.url,
+            ...salvaged,
+            `Session: ${result.sessionFile ?? "(no transcript)"}`,
+            "",
+            result.report,
+          ].join("\n"),
+        });
+      }
     } else {
       // pushed-green: the PR belongs to a human now. The in-progress label
       // stays on until the merge closes the issue, which is also what keeps
@@ -923,9 +986,10 @@ async function tick(d: Deps): Promise<void> {
 
   // Spend is the one cap that stops the fleet instead of merely deferring work.
   // A loop that is burning money has to halt itself; waiting for a human to
-  // notice tomorrow is how a runaway becomes expensive.
+  // notice tomorrow is how a runaway becomes expensive. `null` means the
+  // operator opted out — turns and wall-clock still brake every run (#46).
   const spent = store.spendSince(project.name, since);
-  if (spent >= caps.dailySpendUsd) {
+  if (caps.dailySpendUsd !== null && spent >= caps.dailySpendUsd) {
     setPaused(true);
     await safeEscalate(d, {
       tier: 2,
@@ -1011,7 +1075,9 @@ export function formatStatus(s: StatusSnapshot): string {
     "caps",
     `  workers            ${s.liveWorkers} / ${s.caps.maxConcurrentWorkers}`,
     `  issues today       ${s.runsToday}`,
-    `  spend today        $${s.spendTodayUsd.toFixed(2)} / $${s.caps.dailySpendUsd.toFixed(2)}`,
+    s.caps.dailySpendUsd === null
+      ? `  spend today        $${s.spendTodayUsd.toFixed(2)} (no daily cap)`
+      : `  spend today        $${s.spendTodayUsd.toFixed(2)} / $${s.caps.dailySpendUsd.toFixed(2)}`,
     `  worker max turns   ${s.caps.workerMaxTurns}`,
     `  worker wall clock  ${Math.round(s.caps.workerWallClockMs / 60_000)}m`,
     `  attempts per issue ${s.caps.maxAttemptsPerIssue}`,

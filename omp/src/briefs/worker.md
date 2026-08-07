@@ -28,7 +28,7 @@ Then read the repo's own guidance before writing anything: `AGENTS.md`,
 `CLAUDE.md`, `CONTEXT.md`, and any `docs/adr/` entry the issue touches. Those
 files are canonical; your priors are not.
 
-## Acceptance criteria
+{{CONTINUATION}}## Acceptance criteria
 
 {{ACCEPTANCE_CRITERIA}}
 

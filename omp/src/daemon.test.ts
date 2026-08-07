@@ -781,6 +781,7 @@ describe("buildBrief", () => {
     expect(brief).toContain("smallest diff in the wrong place is a second bug.\n2. **One read per file");
     expect(brief).not.toContain("{{");
     expect(brief).not.toContain("list_projects");
+    expect(brief).not.toContain("Continuation");
     expect(brief.split("\n").length).toBe(template.split("\n").length);
   });
 
@@ -800,6 +801,18 @@ describe("buildBrief", () => {
     expect(brief).toContain("never pass your own cwd");
     // Still one list, still no orphaned placeholder.
     expect(brief).toContain("\n2. **One read per file");
+    expect(brief).not.toContain("{{");
+  });
+
+  it("injects a continuation section when the branch was reattached", async () => {
+    const brief = await buildBrief(project(), routed, "feat/widget", "/tmp/conductor/work/42", {
+      continuation: true,
+      defaultBranch: "main",
+    });
+
+    expect(brief).toContain("## Continuation — do not start from zero");
+    expect(brief).toContain("git log --oneline origin/main..HEAD");
+    expect(brief).toContain("Do not recreate work that already exists");
     expect(brief).not.toContain("{{");
   });
 });

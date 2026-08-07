@@ -423,3 +423,12 @@ test("findProject rejects an unknown name and lists what exists", () => {
   expect(() => findProject(c, "nope")).toThrow(/demo, homelab/);
   expect(findProject(c, "homelab").name).toBe("homelab");
 });
+
+test("dailySpendUsd null means no spend gate", () => {
+  const p = project("demo");
+  p.caps = { dailySpendUsd: null };
+  saveConfig(config(p));
+  const cfg = loadConfig();
+  expect(cfg.projects[0]?.caps?.dailySpendUsd).toBeNull();
+  expect(resolveCaps(cfg.projects[0]!, DEFAULT_CAPS).dailySpendUsd).toBeNull();
+});

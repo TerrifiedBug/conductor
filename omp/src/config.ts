@@ -139,15 +139,16 @@ export function saveConfig(c: ConductorConfig): void {
 /**
  * Layers a project's overrides on the global defaults, field by field, so a
  * project that pins one cap still inherits the other five. `??` not `||`: a
- * deliberate `dailySpendUsd: 0` is a hard stop, not "unset". Spelled out per
- * field so adding a `Caps` member fails to compile here instead of resolving
- * to `undefined` at a call site.
+ * deliberate `dailySpendUsd: 0` is a hard stop, not "unset", and `null` is a
+ * deliberate "no spend gate" that must not fall through to the default.
+ * Spelled out per field so adding a `Caps` member fails to compile here.
  */
 export function resolveCaps(p: ProjectConfig, defaults: Caps): Caps {
   const o: Partial<Caps> = p.caps ?? {};
   return {
     maxConcurrentWorkers: o.maxConcurrentWorkers ?? defaults.maxConcurrentWorkers,
-    dailySpendUsd: o.dailySpendUsd ?? defaults.dailySpendUsd,
+    // nullish only — `null` means off; do not coalesce it to the default.
+    dailySpendUsd: o.dailySpendUsd !== undefined ? o.dailySpendUsd : defaults.dailySpendUsd,
     workerMaxTurns: o.workerMaxTurns ?? defaults.workerMaxTurns,
     workerWallClockMs: o.workerWallClockMs ?? defaults.workerWallClockMs,
     maxAttemptsPerIssue: o.maxAttemptsPerIssue ?? defaults.maxAttemptsPerIssue,
@@ -520,8 +521,18 @@ function coerceCaps(parsed: unknown, label: string, problems: string[], legacy: 
   for (const key of CAP_KEYS) {
     const v = raw[key];
     if (v === undefined) continue;
+    // Spend is the only cap that may be null (= no gate). Every other ceiling
+    // is a non-negative number; 0 remains a hard stop where it already was.
+    if (key === "dailySpendUsd" && v === null) {
+      out.dailySpendUsd = null;
+      continue;
+    }
     if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
-      problems.push(`${label}.${key} must be a non-negative finite number, found ${JSON.stringify(v)}`);
+      problems.push(
+        key === "dailySpendUsd"
+          ? `${label}.${key} must be a non-negative finite number or null (no cap), found ${JSON.stringify(v)}`
+          : `${label}.${key} must be a non-negative finite number, found ${JSON.stringify(v)}`,
+      );
       continue;
     }
     out[key] = v;

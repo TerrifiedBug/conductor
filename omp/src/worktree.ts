@@ -285,7 +285,7 @@ export async function addWorktree(
   workspaceRoot: string,
   issue: number,
   branch: string,
-): Promise<string> {
+): Promise<{ path: string; reattached: boolean }> {
   const mirrorPath = await ensureMirror(repo, mirrorRoot);
   mkdirSync(workspaceRoot, { recursive: true });
 
@@ -369,7 +369,7 @@ export async function addWorktree(
     }
   }
 
-  return worktreePath;
+  return { path: worktreePath, reattached: branchExists };
 }
 
 /**
