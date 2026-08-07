@@ -11,7 +11,7 @@
  * worth protecting is on `setup()` below — nothing is written before the confirm.
  */
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, isAbsolute } from "node:path";
+import { isAbsolute } from "node:path";
 import { checkBrief, formatBriefStatus, writeMergedBrief } from "./brief-upgrade.ts";
 import { configPath, expandHome, findProject, loadConfig, saveConfig } from "./config.ts";
 import {
@@ -25,24 +25,30 @@ import {
 } from "./daemon.ts";
 import { defaultGraphRoot } from "./graph.ts";
 import {
+  AMEND_AREAS,
   ORCHESTRATOR_BRIEF_NAME,
   REPORT_SCOPE_CHOICES,
   SETUP_DEFAULTS,
+  amendChoices,
+  answersFromProject,
   briefPathForProject,
   buildConfig,
   checkTokenScopes,
   createMissingLabels,
+  defaultAnswers,
   detectTelegram,
+  formatGates,
   orchestratorBriefPath,
   planLabels,
   renderBriefForProject,
+  summariseAmend,
   summarisePlan,
   writeOrchestratorBrief,
+  type AmendAreaId,
   type SetupAnswers,
 } from "./setup.ts";
 import {
   DEFAULT_CAPS,
-  DEFAULT_REPORT_SCOPE,
   type Caps,
   type ConductorConfig,
   type OrchestratorMode,
@@ -102,7 +108,11 @@ interface PluginApi {
 }
 
 const SUBCOMMANDS: Completion[] = [
-  { value: "setup", label: "setup", description: "onboarding wizard: config, labels, dry run, then arm" },
+  {
+    value: "setup",
+    label: "setup",
+    description: "wizard: config, labels, dry run, then arm — or amend one area of a configured project",
+  },
   { value: "status", label: "status", description: "pause state, caps, active runs, today's usage" },
   { value: "pause", label: "pause", description: "stop claiming new work" },
   { value: "resume", label: "resume", description: "allow claiming again" },
@@ -114,7 +124,7 @@ const SUBCOMMANDS: Completion[] = [
 ];
 
 const USAGE = [
-  "/conductor setup [project]         create or update a project, then arm after you confirm",
+  "/conductor setup [project]         create a project, or amend one area of one you already have",
   "/conductor status [project]        pause state, caps, active runs, today's usage",
   "/conductor pause                   stop claiming new work",
   "/conductor resume                  allow claiming again",
@@ -185,7 +195,8 @@ async function askNumber(ctx: CommandContext, title: string, fallback: number): 
 
 /**
  * Pre-push gates as one comma-separated line, `cmd @ cwd` for a subdirectory:
- * `bun run check, bun test @ server`.
+ * `bun run check, bun test @ server`. Shown through `formatGates`, the same
+ * spelling the amend menu reads a repo's current gates back with.
  *
  * ponytail: the ceiling is a command containing a comma or a literal " @ ",
  * which this would split wrongly. Rare in a lint or test invocation, and the
@@ -197,8 +208,11 @@ async function askGates(
   repoName: string,
   seed: { cmd: string; cwd: string }[],
 ): Promise<{ cmd: string; cwd: string }[]> {
-  const shown = seed.map((g) => (g.cwd === "." ? g.cmd : `${g.cmd} @ ${g.cwd}`)).join(", ");
-  const raw = await ask(ctx, `Pre-push gates for ${repoName} — exactly what CI runs, comma separated`, shown);
+  const raw = await ask(
+    ctx,
+    `Pre-push gates for ${repoName} — exactly what CI runs, comma separated`,
+    formatGates(seed),
+  );
 
   const gates: { cmd: string; cwd: string }[] = [];
   for (const chunk of raw.split(",")) {
@@ -359,40 +373,40 @@ function priorProject(existing: ConductorConfig | undefined, name: string | unde
 }
 
 /**
- * The conversation. Reads only — every answer is collected before anything is
- * checked against GitHub, and long before anything is written.
+ * One area's questions, over the answers everything else is carried through in.
+ *
+ * Every asker takes the whole answer set and returns the whole answer set with
+ * only its own fields replaced. That is what lets the full interview fold them in
+ * order while an amend applies exactly one, with no second spelling of either the
+ * prompts or the defaults they pre-fill from: the value shown is always the value
+ * that would otherwise be carried through.
  */
-async function collectAnswers(
-  ctx: CommandContext,
-  existing: ConductorConfig | undefined,
-  projectArg: string | undefined,
-): Promise<SetupAnswers> {
-  const prior = priorProject(existing, projectArg);
+type AreaAsker = (ctx: CommandContext, a: SetupAnswers) => Promise<SetupAnswers>;
 
-  const projectName = await askValid(
-    ctx,
-    "Project name",
-    projectArg ?? prior?.name ?? "",
-    (v) => (v.length > 0 ? undefined : "A name is required — it is how `/conductor status <name>` finds this project."),
-  );
-
+/**
+ * Where work comes from and where it lands: tracker, labels, routing prefix, and
+ * every repo an issue can be routed to, each with its gates. One area because it
+ * is one fact — the identity of the queue — and changing any part of it without
+ * seeing the rest is how a routing prefix stops matching its labels.
+ */
+const askTrackerAndRepos: AreaAsker = async (ctx, a) => {
   const trackerRepo = await askValid(
     ctx,
     "Tracker repo (owner/repo) — where ready issues live",
-    prior?.tracker.repo ?? "",
+    a.trackerRepo,
     (v) => (REPO_RE.test(v) ? undefined : `"${v}" is not owner/repo — e.g. acme/planning.`),
   );
 
   const queueLabel = await ask(
     ctx,
     "Queue label — the human sign-off that makes an issue claimable",
-    prior?.queueLabel ?? SETUP_DEFAULTS.queueLabel,
+    a.queueLabel,
   );
 
   // One confirm instead of three prompts: the namespaced defaults are right for
   // almost everyone, and three dialogs of Enter-to-accept is how a wizard earns
   // its reputation.
-  const stateLabels: SetupAnswers["stateLabels"] = { ...(prior?.stateLabels ?? SETUP_DEFAULTS.stateLabels) };
+  const stateLabels: SetupAnswers["stateLabels"] = { ...a.stateLabels };
   const customiseStates = await ctx.ui.confirm(
     "State labels",
     `The conductor writes back "${stateLabels.inProgress}", "${stateLabels.blocked}" and ` +
@@ -407,13 +421,12 @@ async function collectAnswers(
   const routingLabelPrefix = await ask(
     ctx,
     "Routing label prefix — an issue picks its checkout with <prefix><repo>",
-    prior?.routing.labelPrefix ?? SETUP_DEFAULTS.routingLabelPrefix,
+    a.routingLabelPrefix,
   );
 
   const targetRepos: SetupAnswers["targetRepos"] = [];
-  const seeds = Object.values(prior?.routing.repos ?? {});
   for (let i = 0; ; i++) {
-    const seed = seeds[i];
+    const seed = a.targetRepos[i];
     const name = await askValid(
       ctx,
       `Routing key for repo ${i + 1} — the "${routingLabelPrefix}<key>" label an issue carries`,
@@ -440,18 +453,53 @@ async function collectAnswers(
     if (!more) break;
   }
 
-  // Straight after the repos, because it is a fact about them: one clone per
-  // routed repo, under one root. Seeded from whichever prior repo already had
-  // one — the wizard writes them as siblings, so any one of them names the root.
-  const priorGraph = Object.values(prior?.routing.repos ?? {}).find((r) => r.graphProject !== undefined);
+  return { ...a, trackerRepo, queueLabel, stateLabels, routingLabelPrefix, targetRepos };
+};
+
+/**
+ * The gates alone, repo by repo, with nothing else asked.
+ *
+ * The area that earns amend mode: a CI command changes far more often than a
+ * clone URL does, and re-typing four repos to correct one lint invocation is the
+ * reason an operator edits config.json by hand instead.
+ */
+const askGatesOnly: AreaAsker = async (ctx, a) => {
+  if (a.targetRepos.length === 0) {
+    ctx.ui.notify("No repos are configured yet — amend \"tracker & repos\" first.", "warning");
+    return a;
+  }
+
+  const targetRepos: SetupAnswers["targetRepos"] = [];
+  for (const r of a.targetRepos) {
+    targetRepos.push({ ...r, gates: await askGates(ctx, r.name, r.gates) });
+  }
+  return { ...a, targetRepos };
+};
+
+/**
+ * Whether workers get a code graph, and where its clones live. Asked after the
+ * repos in the full interview because the answer is derived per repo.
+ */
+const askGraph: AreaAsker = async (ctx, a) => {
   const graphRoot = await askGraphRoot(
     ctx,
-    trackerRepo,
-    targetRepos.map((r) => r.name),
-    priorGraph?.graphProject === undefined ? undefined : dirname(priorGraph.graphProject),
+    a.trackerRepo,
+    a.targetRepos.map((r) => r.name),
+    a.graphRoot,
   );
 
-  const caps: Partial<Caps> = { ...prior?.caps };
+  const next: SetupAnswers = { ...a };
+  // Deleted rather than set to `undefined`: the absence of the key is what keeps
+  // a project that declines graphs identical to one written before they existed.
+  if (graphRoot === undefined) delete next.graphRoot;
+  else next.graphRoot = graphRoot;
+  return next;
+};
+
+/** The hard ceilings. One confirm first, because the shipped defaults are the
+ *  answer for anyone who has not measured their own runners. */
+const askCaps: AreaAsker = async (ctx, a) => {
+  const caps: Partial<Caps> = { ...a.caps };
   const tuneCaps = await ctx.ui.confirm(
     "Caps",
     `Defaults: ${DEFAULT_CAPS.maxConcurrentWorkers} workers, ` +
@@ -459,44 +507,48 @@ async function collectAnswers(
       `${Math.round(DEFAULT_CAPS.workerWallClockMs / 60000)} min per worker, ` +
       `${DEFAULT_CAPS.maxAttemptsPerIssue} attempts per issue. Change them?`,
   );
-  if (tuneCaps) {
-    // Spelled out rather than looped: adding a cap should fail to compile here,
-    // not silently go unasked.
-    caps.maxConcurrentWorkers = await askNumber(
-      ctx,
-      "Max concurrent workers",
-      caps.maxConcurrentWorkers ?? DEFAULT_CAPS.maxConcurrentWorkers,
-    );
-    caps.dailySpendUsd = await askNumber(ctx, "Spend ceiling per rolling day (USD)", caps.dailySpendUsd ?? DEFAULT_CAPS.dailySpendUsd);
-    caps.workerMaxTurns = await askNumber(ctx, "Turn ceiling per worker", caps.workerMaxTurns ?? DEFAULT_CAPS.workerMaxTurns);
-    caps.workerWallClockMs = await askNumber(
-      ctx,
-      "Wall-clock ceiling per worker (ms)",
-      caps.workerWallClockMs ?? DEFAULT_CAPS.workerWallClockMs,
-    );
-    caps.maxAttemptsPerIssue = await askNumber(
-      ctx,
-      "Attempts per issue before it escalates",
-      caps.maxAttemptsPerIssue ?? DEFAULT_CAPS.maxAttemptsPerIssue,
-    );
-  }
+  if (!tuneCaps) return { ...a, caps };
 
-  // Straight after the caps, and for the same reason they sit together: these
-  // are the two questions that decide what an unattended fleet may do without
-  // asking anybody.
-  const authority = await askAuthority(ctx, prior?.authority ?? SETUP_DEFAULTS.authority);
-
-  // Outside the caps block: a model is not a ceiling, and an operator who left
-  // the caps alone may still want workers on a cheaper model.
-  const answeredModel = await ask(
+  // Spelled out rather than looped: adding a cap should fail to compile here,
+  // not silently go unasked.
+  caps.maxConcurrentWorkers = await askNumber(
     ctx,
-    "Worker model pattern (blank = harness default)",
-    prior?.workerModel ?? "",
+    "Max concurrent workers",
+    caps.maxConcurrentWorkers ?? DEFAULT_CAPS.maxConcurrentWorkers,
   );
-  const workerModel = answeredModel.trim().length > 0 ? answeredModel.trim() : undefined;
+  caps.dailySpendUsd = await askNumber(ctx, "Spend ceiling per rolling day (USD)", caps.dailySpendUsd ?? DEFAULT_CAPS.dailySpendUsd);
+  caps.workerMaxTurns = await askNumber(ctx, "Turn ceiling per worker", caps.workerMaxTurns ?? DEFAULT_CAPS.workerMaxTurns);
+  caps.workerWallClockMs = await askNumber(
+    ctx,
+    "Wall-clock ceiling per worker (ms)",
+    caps.workerWallClockMs ?? DEFAULT_CAPS.workerWallClockMs,
+  );
+  caps.maxAttemptsPerIssue = await askNumber(
+    ctx,
+    "Attempts per issue before it escalates",
+    caps.maxAttemptsPerIssue ?? DEFAULT_CAPS.maxAttemptsPerIssue,
+  );
+  return { ...a, caps };
+};
 
+/** Outside the caps block: a model is not a ceiling, and an operator who left
+ *  the caps alone may still want workers on a cheaper model. */
+const askWorkerModel: AreaAsker = async (ctx, a) => {
+  const answered = await ask(ctx, "Worker model pattern (blank = harness default)", a.workerModel ?? "");
+  const next: SetupAnswers = { ...a };
+  if (answered.trim().length === 0) delete next.workerModel;
+  else next.workerModel = answered.trim();
+  return next;
+};
+
+/** Both grants, asked together because they are the two questions that decide
+ *  what an unattended fleet may do without asking anybody. */
+const askAuthorityArea: AreaAsker = async (ctx, a) => ({ ...a, authority: await askAuthority(ctx, a.authority) });
+
+/** How a stuck run reaches a human, and who triages it when it does. */
+const askEscalation: AreaAsker = async (ctx, a) => {
   const telegram = detectTelegram();
-  let telegramChatId = prior?.escalation.telegramChatId;
+  let telegramChatId = a.telegramChatId;
   if (telegram.available && telegram.hasToken) {
     if (telegramChatId === undefined && telegram.pairedOwnerId !== undefined) {
       const usePaired = await ctx.ui.confirm(
@@ -521,33 +573,128 @@ async function collectAnswers(
     "Also comment on the issue when a run escalates? Recommended: a chat message you miss is a run nobody sees.",
   );
 
-  const orchestratorMode = await askOrchestratorMode(
+  const orchestratorMode = await askOrchestratorMode(ctx, a.orchestratorMode);
+
+  const next: SetupAnswers = { ...a, fallbackToIssueComment, orchestratorMode };
+  if (telegramChatId === undefined) delete next.telegramChatId;
+  else next.telegramChatId = telegramChatId;
+  return next;
+};
+
+/** How loud the orchestrator is when nobody asked it anything. */
+const askReporting: AreaAsker = async (ctx, a) => ({ ...a, reportScope: await askReportScope(ctx, a.reportScope) });
+
+/** The operator's own brief. Asked last in the full interview, because the
+ *  question quotes the path the rest of the answers derive. */
+const askBrief: AreaAsker = async (ctx, a) => ({ ...a, writeOrchestratorBrief: await askOrchestratorBrief(ctx, a) });
+
+/**
+ * One dialog sequence per amend area, keyed so a new area cannot be added to
+ * {@link AMEND_AREA_IDS} without one.
+ */
+const AREA_ASKERS: { readonly [K in AmendAreaId]: AreaAsker } = {
+  tracker: askTrackerAndRepos,
+  gates: askGatesOnly,
+  // The two per-worker knobs the full interview separates with the authority
+  // grants; an amend has no reason to put anything between them.
+  caps: async (ctx, a) => await askWorkerModel(ctx, await askCaps(ctx, a)),
+  graph: askGraph,
+  authority: askAuthorityArea,
+  escalation: askEscalation,
+  reporting: askReporting,
+  brief: askBrief,
+};
+
+/** The two ways to answer the first question a configured project gets. Labels,
+ *  because the harness's select resolves to the label it displayed. */
+const AMEND_ONE = "Change one area";
+const REINTERVIEW = "Walk every question again";
+
+/**
+ * The first question a re-run asks, and the reason amend mode exists: adding one
+ * key should not cost twenty prompts.
+ *
+ * Returns the area to amend, or `undefined` for the full interview. Only asked
+ * when the named project is already configured — a first run, or a new project
+ * beside an old one, has nothing to amend and is never shown this.
+ */
+async function chooseAmendArea(ctx: CommandContext, prior: ProjectConfig): Promise<AmendAreaId | undefined> {
+  const mode = await ctx.ui.select(
+    `"${prior.name}" is already configured — what would you like to do?`,
+    [
+      {
+        label: AMEND_ONE,
+        description: "asks one area's questions; every other answer is carried through from the saved config",
+      },
+      {
+        label: REINTERVIEW,
+        description: "the full interview, every prompt pre-filled with what is configured now",
+      },
+    ],
+    { initialIndex: 0 },
+  );
+  if (mode === undefined) throw new Cancelled();
+  if (mode !== AMEND_ONE) {
+    // Either the operator chose the full interview, or the dialog answered with
+    // a label we never offered. Both land on today's behaviour, which is the one
+    // that cannot silently skip a question.
+    if (mode !== REINTERVIEW) ctx.ui.notify(`Unrecognised choice "${mode}" — asking everything.`, "warning");
+    return undefined;
+  }
+
+  const choices = amendChoices(prior);
+  const picked = await ctx.ui.select(
+    "Which area? Each row shows what it says now",
+    choices.map((c) => ({ label: c.label, description: c.description })),
+    { initialIndex: 0 },
+  );
+  if (picked === undefined) throw new Cancelled();
+
+  const chosen = choices.find((c) => c.label === picked);
+  if (chosen === undefined) {
+    // Guessing an area here would ask the wrong questions and carry the rest
+    // through as if they had been reviewed. Abandoning changes nothing.
+    ctx.ui.notify(`Unrecognised choice "${picked}" — nothing was changed.`, "warning");
+    throw new Cancelled();
+  }
+  return chosen.id;
+}
+
+/**
+ * The conversation. Reads only — every answer is collected before anything is
+ * checked against GitHub, and long before anything is written.
+ *
+ * Seeded from one answers object rather than pre-filling each prompt from
+ * `prior?.field ?? default`: that is the same carry-through an amend relies on,
+ * so the two flows cannot disagree about what an unanswered field is.
+ */
+async function collectAnswers(
+  ctx: CommandContext,
+  prior: ProjectConfig | undefined,
+  projectArg: string | undefined,
+): Promise<SetupAnswers> {
+  const seed = prior === undefined ? defaultAnswers(projectArg ?? "") : answersFromProject(prior);
+
+  const projectName = await askValid(
     ctx,
-    prior?.escalation.orchestrator ?? SETUP_DEFAULTS.orchestratorMode,
+    "Project name",
+    projectArg ?? seed.projectName,
+    (v) => (v.length > 0 ? undefined : "A name is required — it is how `/conductor status <name>` finds this project."),
   );
 
-  const reportScope = await askReportScope(ctx, prior?.reporting?.scope ?? DEFAULT_REPORT_SCOPE);
-
-  const answers: SetupAnswers = {
-    projectName,
-    trackerRepo,
-    queueLabel,
-    stateLabels,
-    routingLabelPrefix,
-    targetRepos,
-    caps,
-    fallbackToIssueComment,
-    authority,
-    orchestratorMode,
-    reportScope,
-    // Asked last, and asked with the real path in the question — which needs the
-    // rest of the answers to derive, so the decision is folded in below.
-    writeOrchestratorBrief: false,
-  };
-  if (telegramChatId !== undefined) answers.telegramChatId = telegramChatId;
-  if (workerModel !== undefined) answers.workerModel = workerModel;
-  if (graphRoot !== undefined) answers.graphRoot = graphRoot;
-  return { ...answers, writeOrchestratorBrief: await askOrchestratorBrief(ctx, answers) };
+  let a: SetupAnswers = { ...seed, projectName };
+  a = await askTrackerAndRepos(ctx, a);
+  // Straight after the repos, because it is a fact about them: one clone per
+  // routed repo, under one root.
+  a = await askGraph(ctx, a);
+  a = await askCaps(ctx, a);
+  a = await askAuthorityArea(ctx, a);
+  a = await askWorkerModel(ctx, a);
+  a = await askEscalation(ctx, a);
+  a = await askReporting(ctx, a);
+  // Asked last, and asked with the real path in the question — which needs the
+  // rest of the answers to derive.
+  return await askBrief(ctx, a);
 }
 
 /** The dry run, rendered. Same routing code the loop uses, so this is what the
@@ -585,14 +732,50 @@ async function tryPreview(project: string): Promise<string[]> {
   }
 }
 
+/** What the whole conversation produced: the answers, and which area an amend
+ *  narrowed it to. `amend` absent means every question was asked. */
+export interface CollectedSetup {
+  answers: SetupAnswers;
+  amend?: { area: AmendAreaId; before: ProjectConfig };
+}
+
 /**
- * The onboarding wizard.
+ * The whole conversation, from the amend question to the last prompt, and not one
+ * byte further: no `gh`, no dry run, nothing written.
+ *
+ * Exported at exactly that seam so a test can script the dialogs and pin what a
+ * first run asks and what an amend refuses to ask — the two properties amend mode
+ * is judged on — on a host with no `gh` and no config.
+ */
+export async function collectSetup(
+  ctx: CommandContext,
+  existing: ConductorConfig | undefined,
+  projectArg: string | undefined,
+): Promise<CollectedSetup> {
+  // Only a project that is already configured can be amended. A first run, or a
+  // name this config has never seen, goes straight into the full interview with
+  // no extra question — which is what it was before amend mode existed.
+  const prior = priorProject(existing, projectArg);
+  if (prior === undefined) return { answers: await collectAnswers(ctx, undefined, projectArg) };
+
+  const area = await chooseAmendArea(ctx, prior);
+  if (area === undefined) return { answers: await collectAnswers(ctx, prior, projectArg) };
+
+  return { answers: await AREA_ASKERS[area](ctx, answersFromProject(prior)), amend: { area, before: prior } };
+}
+
+/**
+ * The onboarding wizard, and — for a project it already knows — the amend.
  *
  * The invariant that makes this safe to run against a live tracker: nothing is
  * written or created before the confirm below returns true. Reading the config,
  * asking questions, `checkTokenScopes`, `planLabels` and `previewQueue` are all
  * reads. The four mutations — `createMissingLabels`, `saveConfig`,
  * `writeOrchestratorBrief`, `armConductor` — all live after it. Keep it that way.
+ *
+ * An amend changes which questions are asked and what the summary leads with,
+ * and nothing else: the same answers, the same `buildConfig`, the same single
+ * confirm, the same dry run. One writer, one consent gate.
  */
 async function setup(ctx: CommandContext, projectArg: string | undefined): Promise<void> {
   const path = configPath();
@@ -604,14 +787,15 @@ async function setup(ctx: CommandContext, projectArg: string | undefined): Promi
     ctx.ui.notify(`No config at ${path} yet — let's make one. Nothing is written until you confirm.`, "info");
   }
 
-  let answers: SetupAnswers;
+  let collected: CollectedSetup;
   try {
-    answers = await collectAnswers(ctx, existing, projectArg);
+    collected = await collectSetup(ctx, existing, projectArg);
   } catch (err) {
     if (!(err instanceof Cancelled)) throw err;
     ctx.ui.notify("Setup cancelled — nothing was changed.", "info");
     return;
   }
+  const { answers, amend } = collected;
 
   const scopes = await checkTokenScopes();
   const labels = await planLabels(answers.trackerRepo, answers);
@@ -619,6 +803,9 @@ async function setup(ctx: CommandContext, projectArg: string | undefined): Promi
 
   ctx.ui.notify(
     [
+      // The delta first when there is one, then the whole plan: the confirm has
+      // to name every mutation it authorises, and a delta names none of them.
+      ...(amend === undefined ? [] : [summariseAmend(amend.area, amend.before, answers)]),
       summarisePlan(answers, scopes, labels, telegram),
       "",
       existing === undefined
@@ -633,7 +820,7 @@ async function setup(ctx: CommandContext, projectArg: string | undefined): Promi
 
   const toCreate = labels.filter((l) => !l.exists).map((l) => l.name);
   const go = await ctx.ui.confirm(
-    "Apply this setup?",
+    amend === undefined ? "Apply this setup?" : `Apply this change to ${AMEND_AREAS[amend.area].name}?`,
     [
       toCreate.length > 0
         ? `Creates ${toCreate.length} label(s) in ${answers.trackerRepo}: ${toCreate.join(", ")}.`

@@ -17,12 +17,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, saveConfig, stateDir } from "./config.ts";
 import {
+  AMEND_AREA_IDS,
+  AMEND_AREAS,
   ORCHESTRATOR_BRIEF_NAME,
   REPORT_SCOPE_CHOICES,
+  amendChoices,
+  answersFromProject,
   buildConfig,
+  buildProject,
+  defaultAnswers,
   detectTelegram,
   orchestratorBriefPath,
   renderOrchestratorBrief,
+  summariseAmend,
   summarisePlan,
   writeOrchestratorBrief,
   type LabelPlan,
@@ -30,7 +37,7 @@ import {
   type SetupAnswers,
   type TelegramPresence,
 } from "./setup.ts";
-import { DEFAULT_AUTHORITY, DEFAULT_CAPS, DEFAULT_REPORT_SCOPE } from "./types.ts";
+import { DEFAULT_AUTHORITY, DEFAULT_CAPS, DEFAULT_REPORT_SCOPE, type ProjectConfig } from "./types.ts";
 
 const CONDUCTOR_HOME = "OMP_CONDUCTOR_HOME";
 const TELEGRAM_HOME = "OMP_TELEGRAM_STATE_DIR";
@@ -536,4 +543,220 @@ test("an install with no token line is available but cannot send", () => {
   expect(found.available).toBe(true);
   expect(found.hasToken).toBe(false);
   expect(found.pairedOwnerId).toBe("424242");
+});
+
+// ----------------------------------------------------------------- amend mode
+
+/**
+ * Every optional answered and no default left standing, so a round-trip that
+ * drops or re-derives a field has something to lose. This is the shape of a real
+ * fleet's config rather than the minimal one the other tests use.
+ */
+function fullAnswers(overrides: Partial<SetupAnswers> = {}): SetupAnswers {
+  return answers({
+    projectName: "veltro",
+    trackerRepo: "veltrosecurity/veltro",
+    queueLabel: "queued",
+    stateLabels: { inProgress: "agent:busy", blocked: "agent:parked", failed: "agent:gave-up" },
+    routingLabelPrefix: "module:",
+    targetRepos: [
+      {
+        name: "chad",
+        cloneUrl: "https://github.com/veltrosecurity/chad.git",
+        defaultBranch: "main",
+        gates: [
+          { cmd: "ruff check .", cwd: "backend" },
+          { cmd: "pnpm lint", cwd: "frontend" },
+        ],
+      },
+      {
+        name: "vectorflow",
+        cloneUrl: "https://github.com/veltrosecurity/vectorflow.git",
+        defaultBranch: "trunk",
+        gates: [{ cmd: "pnpm lint", cwd: "." }],
+      },
+    ],
+    caps: {
+      maxConcurrentWorkers: 3,
+      dailySpendUsd: 40,
+      workerMaxTurns: 200,
+      workerWallClockMs: 5_400_000,
+      maxAttemptsPerIssue: 1,
+    },
+    workerModel: "anthropic/claude-sonnet-4",
+    telegramChatId: "8236653927",
+    fallbackToIssueComment: false,
+    reportScope: "escalations",
+    authority: { merge: "orchestrator", release: "orchestrator" },
+    orchestratorMode: "external",
+    ...overrides,
+  });
+}
+
+/** Answers through the real validator and back, which is where an amend starts:
+ *  from what is on disk, not from what the wizard happened to hold. */
+function savedProject(a: SetupAnswers): ProjectConfig {
+  saveConfig(buildConfig(a));
+  const project = loadConfig().projects[0];
+  if (project === undefined) throw new Error("buildConfig wrote no project");
+  return project;
+}
+
+/** Key-order-independent JSON, so "identical" means every value is identical
+ *  rather than that two builders happened to assign in the same order. */
+function serialise(value: unknown): string {
+  const stable = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.map(stable);
+    if (v === null || typeof v !== "object") return v;
+    return Object.fromEntries(
+      Object.entries(v as Record<string, unknown>)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([k, x]) => [k, stable(x)]),
+    );
+  };
+  return JSON.stringify(stable(value), null, 2);
+}
+
+test("the answers derived from a project rebuild that project exactly", () => {
+  const root = join(home, "graph", "veltrosecurity");
+  const project = savedProject(fullAnswers({ graphRoot: root }));
+
+  // The whole basis of amending one area: everything not asked about is read out
+  // of the config and written back byte-identically. Anything answersFromProject
+  // forgets is a setting an operator loses by changing an unrelated one.
+  expect(serialise(buildProject(answersFromProject(project)))).toBe(serialise(project));
+});
+
+test("a project with no graph rebuilds with no graph", () => {
+  const project = savedProject(fullAnswers());
+
+  const rebuilt = buildProject(answersFromProject(project));
+
+  expect(serialise(rebuilt)).toBe(serialise(project));
+  expect(Object.hasOwn(rebuilt.routing.repos["chad"] ?? {}, "graphProject")).toBe(false);
+});
+
+test("derived answers write no brief and spell out the scope a config only implied", () => {
+  const project = savedProject(fullAnswers());
+  // A config from before `reporting` existed: the key is absent, and what it
+  // means is the default rather than nothing.
+  delete project.reporting;
+
+  const derived = answersFromProject(project);
+
+  // Never true from a config: the brief is the operator's file, and an amend that
+  // did not ask about it must not replace it.
+  expect(derived.writeOrchestratorBrief).toBe(false);
+  expect(derived.reportScope).toBe(DEFAULT_REPORT_SCOPE);
+  expect(buildProject(derived).reporting).toEqual({ scope: DEFAULT_REPORT_SCOPE });
+});
+
+test("a first-run seed answers nothing and defaults everything", () => {
+  const seed = defaultAnswers("fresh");
+
+  // The two required answers are deliberately empty: a pre-filled tracker repo is
+  // the one default an operator would Enter straight past.
+  expect(seed.trackerRepo).toBe("");
+  expect(seed.targetRepos).toEqual([]);
+  expect(seed.caps).toEqual({});
+  expect(seed.authority).toEqual(DEFAULT_AUTHORITY);
+  expect(seed.writeOrchestratorBrief).toBe(false);
+  expect(Object.hasOwn(seed, "graphRoot")).toBe(false);
+  expect(Object.hasOwn(seed, "workerModel")).toBe(false);
+});
+
+test("every amend row names the area and what it says right now", () => {
+  const project = savedProject(fullAnswers());
+
+  const rows = amendChoices(project);
+
+  // One row per area, in the order the full interview asks them.
+  expect(rows.map((r) => r.id)).toEqual([...AMEND_AREA_IDS]);
+  // The harness's select resolves to the label it displayed, so two rows sharing
+  // one label would make the operator's choice unrecoverable.
+  expect(new Set(rows.map((r) => r.label)).size).toBe(rows.length);
+  for (const row of rows) {
+    expect(row.label).toContain(" — ");
+    expect(row.description.length).toBeGreaterThan(0);
+  }
+
+  const byId = new Map(rows.map((r) => [r.id, r.label]));
+  // The reason the menu is worth reading: the value, not the noun.
+  expect(byId.get("graph")).toBe("code graph — not configured — workers grep");
+  expect(byId.get("caps")).toContain("3 workers, 200 turns, 90m, $40/day, 1 attempts");
+  expect(byId.get("gates")).toContain("chad: ruff check . @ backend, pnpm lint @ frontend");
+  expect(byId.get("authority")).toBe("authority — merge=orchestrator, release=orchestrator");
+  expect(byId.get("escalation")).toContain("tier 2 pages Telegram 8236653927");
+});
+
+test("a long current value is elided in the menu but never in the summary", () => {
+  const long = "x".repeat(200);
+  const project = savedProject(
+    fullAnswers({
+      targetRepos: [
+        {
+          name: "chad",
+          cloneUrl: "https://github.com/veltrosecurity/chad.git",
+          defaultBranch: "main",
+          gates: [{ cmd: long, cwd: "." }],
+        },
+      ],
+    }),
+  );
+
+  const row = amendChoices(project).find((r) => r.id === "gates");
+
+  expect(row?.label.length).toBeLessThan(120);
+  expect(row?.label.endsWith("…")).toBe(true);
+  // The full text is not lost — the delta the operator confirms prints all of it.
+  expect(AMEND_AREAS["gates"].describe(project)).toContain(long);
+});
+
+test("an amend leads with the one area it changed and names what it carried over", () => {
+  const project = savedProject(fullAnswers());
+  const amended = { ...answersFromProject(project), graphRoot: join(home, "graph", "veltrosecurity") };
+
+  const text = summariseAmend("graph", project, amended);
+
+  expect(text).toContain("amending       code graph  —  project veltro");
+  expect(text).toContain("was            not configured — workers grep");
+  expect(text).toContain(`now            ${join(home, "graph", "veltrosecurity")} — 2 clone(s): chad, vectorflow`);
+  // Every other area is named, so "what happened to the rest of my config" is
+  // answered on the consent screen rather than by reading the file afterwards.
+  for (const id of AMEND_AREA_IDS) {
+    if (id === "graph") continue;
+    expect(text).toContain(AMEND_AREAS[id].name);
+  }
+});
+
+test("an amend that changed nothing says so instead of implying a change", () => {
+  const project = savedProject(fullAnswers());
+
+  const text = summariseAmend("authority", project, answersFromProject(project));
+
+  expect(text).toContain("no change      merge=orchestrator, release=orchestrator");
+  expect(text).not.toContain("was            ");
+});
+
+test("the brief area's delta is what the wizard would do, not what the disk says", () => {
+  const project = savedProject(fullAnswers());
+  const derived = answersFromProject(project);
+
+  // Declining leaves the file alone, and the summary has to say that rather than
+  // compare a file that this run never touches.
+  expect(summariseAmend("brief", project, derived)).toContain("not written — left exactly as it is");
+
+  const writing = { ...derived, writeOrchestratorBrief: true };
+  expect(summariseAmend("brief", project, writing)).toContain(`would write ${orchestratorBriefPath(writing)}`);
+  writeOrchestratorBrief(writing);
+  expect(summariseAmend("brief", project, writing)).toContain(`would OVERWRITE ${orchestratorBriefPath(writing)}`);
+});
+
+test("the reporting row quotes the same description the wizard's own list does", () => {
+  const project = savedProject(fullAnswers({ reportScope: "material" }));
+  const chosen = REPORT_SCOPE_CHOICES.find((c) => c.scope === "material");
+
+  // One spelling of what "material" means: the dialog, the plan and the amend
+  // menu all read it from the same place.
+  expect(AMEND_AREAS["reporting"].describe(project)).toBe(`material — ${chosen?.description ?? ""}`);
 });

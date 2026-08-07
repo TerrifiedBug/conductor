@@ -38,7 +38,7 @@ The package ships three deployables, plus one skill:
 | --- | --- | --- |
 | omp plugin | `/conductor` slash command | Inspect and arm the conductor from inside an omp session: dry-run the queue, read status, pause, resume. |
 | Standalone daemon | `omp-conductor` binary | The dispatch loop, managed as a background process (`start` / `stop` / `restart`) with a `/healthz` endpoint for a supervisor. |
-| Orchestrator heartbeat | omp extension, activated by `.conductor-tick.json` | Prompts a 24/7 orchestrator session on a fixed interval so its standing loop actually runs, and marks the session stalled when its prompts stop being consumed. Inert in every other session. See [Orchestrator tick](#orchestrator-tick). |
+| Orchestrator heartbeat | omp extension, activated by `.conductor-tick.json` | Prompts a 24/7 orchestrator session on a fixed interval so its standing loop actually runs, and marks the session stalled when its prompts stop being consumed. Inert in every other session — including a second session opened in the fleet's own directory. See [Orchestrator tick](#orchestrator-tick). |
 | Onboarding skill | `skill://conductor-onboarding` | Directs an omp session to interview you, read your repos for real CI gates, and tailor `ORCHESTRATOR.md` — then finish through the wizard. Discovered automatically once the plugin is installed. See [Onboarding](#onboarding). |
 
 The first two are thin wrappers over the same `daemon.ts`, so the plugin and the
@@ -170,7 +170,7 @@ Onboarding this package has two layers, and installing it gives you both.
 
 | Layer | What it is | What it owns |
 | --- | --- | --- |
-| **`/conductor setup`** | The deterministic wizard. Closed questions, a label plan, a dry run, one confirm. | **Mechanical config.** It is the only thing that writes `config.json`, and it mutates nothing before you confirm. |
+| **`/conductor setup`** | The deterministic wizard. Closed questions, a label plan, a dry run, one confirm. On a project it already knows, it offers to amend one area instead of re-asking everything — see [Changing one setting](#changing-one-setting). | **Mechanical config.** It is the only thing that writes `config.json`, and it mutates nothing before you confirm. |
 | **`skill://conductor-onboarding`** | A skill bundled in this package (`skills/conductor-onboarding/SKILL.md`), discovered automatically by any omp session once the plugin is installed. | **Brief authoring.** The judgement the wizard cannot prompt for. |
 
 The split exists because the two halves fail differently. A wrong config value is
@@ -214,6 +214,59 @@ turned on you can also invoke it directly:
 
 Nothing about the wizard changes: `/conductor setup` on its own remains a
 complete, supported path, and the brief it renders is safe unedited.
+
+### Changing one setting
+
+`config.json` is wizard-written, so changing a value means running the wizard —
+and a wizard that re-asks twenty questions to add one key is a wizard people edit
+the file behind instead. So a re-run against a project that is already configured
+opens with one question:
+
+```text
+"veltro" is already configured — what would you like to do?
+> Change one area
+    asks one area's questions; every other answer is carried through from the saved config
+  Walk every question again
+    the full interview, every prompt pre-filled with what is configured now
+```
+
+Amending is the default. Pick it and the eight areas are listed with what each one
+says right now, so the row you want is the row you can see:
+
+```text
+Which area? Each row shows what it says now
+  tracker & repos — veltrosecurity/veltro, queue "ready-for-agent", "repo:" → veltro, chad, warden, vectorflow
+  gates — veltro: none; chad: ruff check . @ backend, pnpm lint @ frontend; warden: ruff check . @ backen…
+  caps & worker model — 2 workers, 120 turns, 90m, $25/day, 2 attempts (all defaults) — harness default model
+  code graph — not configured — workers grep
+  authority — merge=orchestrator, release=orchestrator
+  escalation & triage — tier 2 pages Telegram 8236653927, comments too, triage external
+  reporting scope — material — escalations, plus green PRs, second failures, and anything that stops the fleet
+  orchestrator brief — none at /root/.omp/conductor/worktrees/ORCHESTRATOR.md
+```
+
+Only that area's questions are asked. Every other answer is read back out of
+`config.json` and written again unchanged — the same answers, the same builder,
+the same single confirm, so there is still exactly one thing in this package that
+writes a config, and it still writes nothing before you agree. The consent screen
+leads with the delta and then shows the whole project as it would be written:
+
+```text
+amending       code graph  —  project veltro
+  was            not configured — workers grep
+  now            /root/.cache/conductor-graph/veltrosecurity — 4 clone(s): veltro, chad, warden, vectorflow
+  carried over   tracker & repos, gates, caps & worker model, authority, escalation & triage, reporting scope, orchestrator brief
+                 read back from /root/.omp/conductor/config.json and rewritten unchanged
+```
+
+A first run, or a project name this config has never seen, never sees either
+question: there is nothing to amend, so it is the full interview exactly as
+before. Choosing *Walk every question again* is also unchanged — every prompt
+pre-filled with what is configured, Enter to keep it — with one wrinkle worth
+knowing: the two authority confirms and the orchestrator-session confirm cannot
+start on "yes", so Entering through the full interview **revokes** a delegation
+rather than renewing it. Amending the `authority` area names the current grant in
+the question, which is the safer way to leave one alone.
 
 ### Keeping a brief current
 
@@ -552,7 +605,10 @@ Say yes and the wizard asks for one root, then derives one clone per routed repo
 underneath it (default `~/.cache/conductor-graph/<org>/<repo>`) and writes it to
 each repo's [`graphProject`](#configuration). Nothing else changes: this package
 never runs an indexer, never imports one, and behaves identically with the graph
-server absent — dispatch, caps and escalation do not know it exists.
+server absent — dispatch, caps and escalation do not know it exists. On a fleet
+that was configured before this key existed, `/conductor setup` and the `code
+graph` area add it in two prompts — see
+[Changing one setting](#changing-one-setting).
 
 ### Why the clone, and not your checkout or the worktree
 
@@ -686,6 +742,10 @@ The file is validated on every read. A malformed config produces one readable er
 listing every fault, and the daemon refuses to start rather than running with half
 a project.
 
+`/conductor setup` is the only thing here that writes this file, and on a project
+it already knows it can rewrite one area of it without re-asking the rest — see
+[Changing one setting](#changing-one-setting).
+
 `version` is `2`. A `version: 1` file still loads: caps it names that this build no
 longer enforces are dropped rather than treated as typos, and the next save writes
 it back as `2`. In a `version: 2` file an unrecognised cap key **is** an error,
@@ -811,7 +871,8 @@ in the orchestrator's working directory:
 | `intervalSeconds` | yes | — | Whole seconds between ticks, minimum `60`. A tick costs a full turn of a frontier model, so a sub-minute period is refused rather than obeyed. |
 | `armedFile` | no | none — the gate passes | Path to the arm marker. A tick does nothing while the file is missing. Relative paths resolve against the session cwd, so `state/armed` means `<cwd>/state/armed`. |
 | `accessFile` | no | none — the gate passes | Path to the Telegram bridge's `access.json`. Every tick re-reads it and requires `enabled: true` with exactly one entry in `allowFrom`. Relative paths resolve against the session cwd. **Configure this on any fleet deploy** — see below. |
-| `message` | no | `Tick <ISO timestamp>: re-read <workspaceRoot>/ORCHESTRATOR.md from disk, then run your standing loop from it.`, then the `reporting.scope` line, then the delivery rule | Sent verbatim when set — and then it owns the whole contract: neither the scope line nor the delivery rule is appended to a prompt you wrote yourself. Re-read from disk on **every** tick, so rewording it binds the next heartbeat instead of waiting for a session restart; a re-read that fails — caught mid-edit, removed, or invalid — keeps the value read at session start rather than stopping the heartbeat. `intervalSeconds` is *not* re-read: rescheduling a live timer still needs a restart. The default *orders* the session to re-read its brief, naming the path resolved from the conductor config — a 24/7 session otherwise acts on the copy loaded at its start (resume included), and an amendment added between ticks never binds — and carries the timestamp, which makes two consecutive ticks distinguishable in the session log. |
+| `message` | no | `Tick <ISO timestamp>: re-read <workspaceRoot>/ORCHESTRATOR.md from disk, then run your standing loop from it.`, then the `reporting.scope` line, then the delivery rule | Sent verbatim when set — and then it owns the whole contract: neither the scope line nor the delivery rule is appended to a prompt you wrote yourself. Re-read from disk on **every** tick, so rewording it binds the next heartbeat instead of waiting for a session restart; a re-read that fails — caught mid-edit, removed, or invalid — keeps the value read at session start rather than stopping the heartbeat. `intervalSeconds` is *not* re-read: rescheduling a live timer still needs a restart. The default *orders* the session to re-read its brief, naming the path resolved from the project's `workspaceRoot`, because a standing prompt drifts out of a long-lived session's context while the file on disk does not. |
+| `agentName` | no | `fleet` | The herdr agent name the orchestrator's pane is registered under. Under herdr this is the whole of the identity check below, and the default matches `AGENT_NAME=${AGENT_NAME:-fleet}` in the recovery plugin's `recover.sh`, so both halves key on one name. Rename the agent and set this to match. |
 
 A tick sends one message (`customType` `omp-conductor.tick`, attributed to the
 user): the standing-loop prompt, the one constraint line the project's
@@ -825,14 +886,59 @@ watched succeed. The tick starts a turn if the session is idle; while a turn is
 streaming it is queued as a follow-up and consumed when that turn ends.
 It sends **nothing** when:
 
-- `/conductor pause` (or `omp-conductor pause`) holds the pause flag, the same
-  flag the dispatch loop reads, so pausing the fleet pauses its heartbeat;
 - `armedFile` is configured and missing;
 - `accessFile` is configured and the escalation channel is not verifiably up;
 - an earlier tick is still queued. Ticks coalesce rather than stack, so a slow
   turn cannot leave a backlog of heartbeats behind it — and two coalesced ticks
   in a row are the signal that the session is not slow but wedged, which is
   what the [stall marker](#a-wedged-session-and-the-marker-that-notices) is for.
+
+### One session per directory ticks, and it says which
+
+Activation is a property of the *directory*, so before it arms anything the
+heartbeat asks whether this session is the orchestrator or merely a session
+standing in its directory. It has to: opening a second omp session in the fleet's
+cwd — a shell to read state, say — used to arm a second heartbeat that prompted
+*that* session with the standing loop, and with
+[`authority`](#configuration) delegated it would consider itself entitled to
+merge PRs and cut releases. Two brains, one queue, and nothing in the log to tell
+them apart.
+
+**Under herdr** (`HERDR_ENV=1` with a `HERDR_PANE_ID`), the answer is the pane's
+registered agent name: the heartbeat asks `herdr agent list` for the entry whose
+`pane_id` is this pane's and ticks only when its `name` equals `agentName`. Fleetness
+is the *session* — every pane in it shares `HERDR_SESSION` and the cwd — and
+herdr's `agent` field is the *runtime*, `omp` for the orchestrator and for the
+shell beside it, so neither can tell them apart. The registered name can, it is
+what `herdr agent start fleet --kind omp --pane <id>` sets, and it is the same
+identity the recovery plugin keys on. A pane with a different name, or no name at
+all, stays inert.
+
+**Without herdr**, the session claims the directory in a sibling
+`.conductor-tick-owner.json` (pid, session file, claim time) and ticks only while
+it is the live claimant. Liveness is a **pid check, never a timestamp**: a crashed
+orchestrator's claim is reclaimed by the next session rather than wedging the
+fleet until somebody deletes a file, and a slow-but-running orchestrator never
+loses its claim to a lease that expired.
+
+Declining is logged once, at session start, naming the holder — which is the whole
+point, because the original failure was that the second ticker was
+indistinguishable from the first:
+
+```text
+[omp-conductor] orchestrator tick inactive: pane w1:p1 (agent "fleet") owns the fleet tick here — this session will not tick
+[omp-conductor] orchestrator tick inactive: this pane is agent "scratch", not the fleet agent "fleet" — this session will not tick
+[omp-conductor] orchestrator tick inactive: pid 4147344 (claimed 2026-08-07T07:55:36.001Z, session …/fleet.jsonl) owns the fleet tick in /root/.omp/conductor — this session will not tick
+```
+
+A `herdr agent list` that does not answer also declines, for the same reason the
+escalation channel fails closed: under herdr this session is one pane of several
+in that directory, and an unproven identity is exactly the case the check exists
+for. That includes `herdr` not being on the session's `PATH` — worth checking on a
+fleet host, where the orchestrator's environment comes from a unit file rather
+than a login shell — and `HERDR_BIN_PATH` names the binary when it is not, the
+same escape hatch the recovery plugin's `recover.sh` has. On a host with no herdr
+and no prior claimant — the ordinary single-session case — nothing changes.
 
 ### The escalation channel is a gate, and it fails closed
 

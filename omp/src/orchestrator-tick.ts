@@ -32,9 +32,15 @@
  * `message` replaces both, and is re-read per tick for the same reason.
  *
  * The extension is inert unless `<cwd>/.conductor-tick.json` exists, so shipping
- * it inside `omp-conductor` costs an ordinary session nothing.
+ * it inside `omp-conductor` costs an ordinary session nothing. That file is a
+ * property of the *directory*, though, which is why arming is gated on one more
+ * question — {@link resolveTickOwnership}: is this session the orchestrator, or
+ * merely a session standing in its directory? Without it, a shell opened in the
+ * fleet's cwd armed a second heartbeat and, with merge and release delegated in
+ * config, believed it held both.
  */
 
+import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { findProject, loadConfig } from "./config.ts";
@@ -52,6 +58,16 @@ export const TICK_CUSTOM_TYPE = "omp-conductor.tick";
  * misconfiguration worth refusing rather than obeying.
  */
 export const MIN_INTERVAL_SECONDS = 60;
+
+/**
+ * How often to re-ask who owns the fleet tick after herdr failed to answer.
+ *
+ * Retrying rather than latching is the whole point: a declined identity is
+ * permanent, an unanswered one is a blip. Cheap enough to run every minute — one
+ * short-lived `herdr agent list` — and it stops the moment the answer is
+ * definitive, either way.
+ */
+const RETRY_OWNERSHIP_MS = 60_000;
 
 /**
  * The stall marker — written beside the activation file, in the session cwd —
@@ -119,6 +135,15 @@ interface TickContext {
   /** True while steering, follow-up or next-turn messages are still queued. */
   hasPendingMessages(): boolean;
   /**
+   * The session's own transcript path, or `undefined` before anything is written
+   * to it. Typed as the SDK types it: `ExtensionContext.sessionManager` is a
+   * `ReadonlySessionManager`, whose `getSessionFile(): string | undefined` is at
+   * `@oh-my-pi/pi-coding-agent/src/session/session-manager.ts`. Read for one
+   * reason — a directory claim that names only a pid tells an operator which
+   * process holds the tick but not which session it is.
+   */
+  sessionManager: { getSessionFile(): string | undefined };
+  /**
    * Managed timer: throws inside `callback` are contained and surfaced on the
    * extension error channel, the handle is `unref`'d, and it is cleared on
    * `session_shutdown`. Raw `setInterval` has none of that and a throwing tick
@@ -168,6 +193,14 @@ export interface TickConfig {
   armedFile?: string;
   accessFile?: string;
   message?: string;
+  /**
+   * The herdr agent name this fleet's orchestrator pane is registered under, and
+   * the whole of {@link resolveTickOwnership}'s identity test under herdr.
+   * Omitted means {@link DEFAULT_FLEET_AGENT_NAME}, which is
+   * `herdr/bin/recover.sh`'s own `AGENT_NAME=${AGENT_NAME:-fleet}` default — the
+   * recovery half and the ticking half key on one identity or neither is safe.
+   */
+  agentName?: string;
 }
 
 /**
@@ -332,6 +365,16 @@ export function readTickConfig(cwd: string): TickConfigResult {
     }
   }
 
+  const agentRaw = raw["agentName"];
+  let agentName: string | undefined;
+  if (agentRaw !== undefined) {
+    if (typeof agentRaw !== "string" || agentRaw.trim().length === 0) {
+      problems.push("agentName must be a non-empty string when present");
+    } else {
+      agentName = agentRaw.trim();
+    }
+  }
+
   if (problems.length > 0) return { kind: "invalid", path, problem: problems.join("; ") };
 
   return {
@@ -342,8 +385,331 @@ export function readTickConfig(cwd: string): TickConfigResult {
       ...(armedFile === undefined ? {} : { armedFile }),
       ...(accessFile === undefined ? {} : { accessFile }),
       ...(message === undefined ? {} : { message }),
+      ...(agentName === undefined ? {} : { agentName }),
     },
   };
+}
+
+/**
+ * The claim file the non-herdr path uses to make "who is the orchestrator here"
+ * answerable from disk. A sibling of the activation file, and dot-prefixed like
+ * the rest of that family.
+ */
+export const TICK_OWNER_FILE = ".conductor-tick-owner.json";
+
+/**
+ * The agent name a fleet is registered under when its config names none —
+ * `herdr/bin/recover.sh`'s own default (`AGENT_NAME=${AGENT_NAME:-fleet}`).
+ */
+export const DEFAULT_FLEET_AGENT_NAME = "fleet";
+
+/** A herdr query that hangs would hang session startup, so it is bounded. */
+const HERDR_QUERY_TIMEOUT_MS = 3000;
+
+/**
+ * One entry of `herdr agent list`, narrowed to the two fields that decide
+ * identity.
+ *
+ * `name` is the *registered agent name* — what `herdr agent start fleet --pane`
+ * sets, what `recover.sh` keys every identity decision on, and what an ad-hoc
+ * shell in the same directory does not have. herdr's `agent` field is
+ * deliberately not read: it is the *runtime*, it says `"omp"` for the real
+ * orchestrator and for a pane somebody opened to look at state, and reading it
+ * is what made this problem look unfixable.
+ */
+export interface HerdrPaneAgent {
+  paneId: string;
+  /** Absent on a pane herdr has no registered name for. */
+  name?: string;
+}
+
+/** Either the list, or why there is none — never an exception: a herdr that does
+ *  not answer is a fact to log, not a session that fails to start. */
+export type HerdrAgentList =
+  | { kind: "ok"; agents: HerdrPaneAgent[] }
+  | { kind: "unavailable"; problem: string };
+
+/**
+ * Whether this session may tick in this directory.
+ *
+ * `declined` carries the whole sentence to log, because the point of the check is
+ * that an operator can tell which session is driving the fleet — a decline that
+ * does not name the holder answers the question no better than silence did.
+ */
+export type TickOwnership =
+  | { kind: "owner"; note?: string }
+  /** Proven not to be the fleet's session. Permanent until this session ends. */
+  | { kind: "declined"; reason: string }
+  /**
+   * Could not be determined — herdr did not answer. Deliberately NOT `declined`:
+   * both refuse to tick, but only this one is worth retrying, and conflating
+   * them means a single 3-second CLI timeout silently disables the real
+   * orchestrator until someone restarts the pane. An unproven identity still
+   * must not tick; a heartbeat that stopped for a transient blip and never came
+   * back is the exact silent stall this package keeps having to fix.
+   */
+  | { kind: "unresolved"; reason: string };
+
+/**
+ * `herdr agent list`, over the socket herdr injected into this pane's
+ * environment.
+ *
+ * Shelled out rather than spoken over the socket directly: the wire protocol is
+ * not a published interface, while the CLI's "one JSON line on stdout" is — it is
+ * what `herdr/bin/recover.sh` already parses, envelope and all. `HERDR_BIN_PATH`
+ * is honoured for the same reason that script honours it, so both halves of this
+ * repo have one spelling of "how do we reach herdr".
+ *
+ * Synchronous on purpose: it feeds a decision taken inside `session_start`, and a
+ * heartbeat that armed first and checked afterwards would tick from the wrong
+ * session for the length of the window between.
+ */
+function readHerdrAgents(env: Record<string, string | undefined>): HerdrAgentList {
+  const bin = env["HERDR_BIN_PATH"] ?? "herdr";
+  let stdout: string;
+  try {
+    const run = spawnSync(bin, ["agent", "list"], {
+      encoding: "utf8",
+      timeout: HERDR_QUERY_TIMEOUT_MS,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    if (run.error !== undefined) return { kind: "unavailable", problem: run.error.message };
+    if (run.status !== 0) {
+      // A signal rather than an exit code when herdr was killed mid-answer; both
+      // mean the same thing here, and both belong in the log line an operator
+      // reads to find out why the heartbeat stopped.
+      const how = run.signal === null || run.signal === undefined ? `exited ${String(run.status)}` : `died on ${run.signal}`;
+      const detail = (run.stderr ?? "").trim().split("\n")[0] ?? "";
+      return { kind: "unavailable", problem: `\`${bin} agent list\` ${how}${detail.length === 0 ? "" : `: ${detail}`}` };
+    }
+    stdout = run.stdout ?? "";
+  } catch (err) {
+    return { kind: "unavailable", problem: err instanceof Error ? err.message : String(err) };
+  }
+
+  return parseHerdrAgents(stdout);
+}
+
+/**
+ * The CLI's single JSON line, as `recover.sh` reads it: the payload is either the
+ * envelope's `result` or the object itself, and `agents` is inside it. Anything
+ * else is reported rather than guessed at — an agent list that cannot be parsed
+ * proves nothing about which pane owns the tick.
+ */
+export function parseHerdrAgents(stdout: string): HerdrAgentList {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch (err) {
+    return { kind: "unavailable", problem: `agent list was not JSON (${err instanceof Error ? err.message : String(err)})` };
+  }
+  if (parsed === null || typeof parsed !== "object") return { kind: "unavailable", problem: "agent list was not an object" };
+
+  const envelope = parsed as { readonly [key: string]: unknown };
+  const inner = envelope["result"];
+  const payload = (inner !== null && typeof inner === "object" ? inner : envelope) as {
+    readonly [key: string]: unknown;
+  };
+  const rows = payload["agents"];
+  if (!Array.isArray(rows)) return { kind: "unavailable", problem: "agent list carried no agents array" };
+
+  const agents: HerdrPaneAgent[] = [];
+  for (const row of rows) {
+    if (row === null || typeof row !== "object") continue;
+    const entry = row as { readonly [key: string]: unknown };
+    const paneId = entry["pane_id"];
+    if (typeof paneId !== "string" || paneId.length === 0) continue;
+    const name = entry["name"];
+    // `null` is what herdr reports for an unnamed pane, and it means the same
+    // thing as the key being absent: this pane is not a registered agent.
+    agents.push({ paneId, ...(typeof name === "string" && name.trim().length > 0 ? { name: name.trim() } : {}) });
+  }
+  return { kind: "ok", agents };
+}
+
+/**
+ * The herdr half of the decision, with no subprocess in it.
+ *
+ * Fleet-ness is the *session*, shared by every pane in it, so `HERDR_SESSION` and
+ * the cwd cannot distinguish the orchestrator from a shell opened beside it. The
+ * pane's registered name can, and it survives a detection gap: herdr counts a
+ * pane as an agent terminal on a saved name alone, so the fleet pane is listed
+ * with its name even in the moment before its runtime is re-detected.
+ */
+export function paneOwnership(input: { paneId: string; agentName: string; agents: HerdrPaneAgent[] }): TickOwnership {
+  const mine = input.agents.find((a) => a.paneId === input.paneId);
+  if (mine?.name === input.agentName) return { kind: "owner" };
+
+  if (mine?.name !== undefined) {
+    // A registered agent, just not this fleet's. herdr can name several omp
+    // agents in one directory, and requiring merely *a* name would arm each one.
+    return {
+      kind: "declined",
+      reason: `this pane is agent "${mine.name}", not the fleet agent "${input.agentName}" — this session will not tick`,
+    };
+  }
+
+  const holder = input.agents.find((a) => a.name === input.agentName);
+  if (holder !== undefined) {
+    return {
+      kind: "declined",
+      reason: `pane ${holder.paneId} (agent "${input.agentName}") owns the fleet tick here — this session will not tick`,
+    };
+  }
+
+  // No name here and nobody else holding it: an ad-hoc pane in the fleet's
+  // directory, which is exactly the session that must stay inert. Fail-closed,
+  // and the fix is named — an orchestrator that lost its registration is one
+  // `herdr agent start` from ticking again.
+  return {
+    kind: "declined",
+    reason:
+      `this pane is not a registered herdr agent, and no pane is running the fleet agent ` +
+      `"${input.agentName}" — register it with \`herdr agent start ${input.agentName} --kind omp --pane ${input.paneId}\`; ` +
+      `this session will not tick`,
+  };
+}
+
+/** The claim on disk. `sessionFile` is for the human reading it — the decision
+ *  itself only ever trusts `pid`. */
+interface TickOwnerRecord {
+  pid: number;
+  sessionFile?: string;
+  claimedAt: string;
+}
+
+/** Whether a pid is running. `EPERM` means it exists and is not ours, which is
+ *  still alive; only `ESRCH` proves it is gone. */
+function pidIsAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err !== null && typeof err === "object" && "code" in err && err.code === "EPERM";
+  }
+}
+
+/**
+ * The no-herdr half: claim the directory, and tick only while this process is the
+ * live claimant.
+ *
+ * Liveness is a pid check and never a timestamp. A crashed orchestrator leaves
+ * its claim behind, and a claim that expired on age alone would either wedge the
+ * fleet until someone deleted a file, or hand ownership to a second session while
+ * the first was merely slow.
+ */
+export function claimTickOwner(input: {
+  cwd: string;
+  pid: number;
+  sessionFile?: string;
+  now: Date;
+  alive?: (pid: number) => boolean;
+}): TickOwnership {
+  const alive = input.alive ?? pidIsAlive;
+  const path = join(input.cwd, TICK_OWNER_FILE);
+
+  const held = readOwnerRecord(path);
+  if (held !== undefined && held.pid !== input.pid && alive(held.pid)) {
+    return {
+      kind: "declined",
+      reason:
+        `pid ${held.pid} (claimed ${held.claimedAt}${held.sessionFile === undefined ? "" : `, session ${held.sessionFile}`}) ` +
+        `owns the fleet tick in ${input.cwd} — this session will not tick`,
+    };
+  }
+
+  const record: TickOwnerRecord = {
+    pid: input.pid,
+    ...(input.sessionFile === undefined ? {} : { sessionFile: input.sessionFile }),
+    claimedAt: input.now.toISOString(),
+  };
+  try {
+    writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+  } catch (err) {
+    // An unwritable claim leaves this session no worse off than it was before the
+    // file existed, and refusing to tick over it would silence a fleet that has
+    // no rival at all. Said out loud, because the guard is now only advisory.
+    return {
+      kind: "owner",
+      note: `could not write ${path} (${err instanceof Error ? err.message : String(err)}) — ticking anyway, but a second session here would not be detected`,
+    };
+  }
+  return { kind: "owner" };
+}
+
+/** A claim that is missing, unreadable or not shaped like one is no claim: the
+ *  caller then takes ownership, which is also how a corrupt file heals. */
+function readOwnerRecord(path: string): TickOwnerRecord | undefined {
+  if (!existsSync(path)) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (parsed === null || typeof parsed !== "object") return undefined;
+    const raw = parsed as { readonly [key: string]: unknown };
+    const pid = raw["pid"];
+    if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return undefined;
+    const sessionFile = raw["sessionFile"];
+    const claimedAt = raw["claimedAt"];
+    return {
+      pid,
+      ...(typeof sessionFile === "string" && sessionFile.length > 0 ? { sessionFile } : {}),
+      claimedAt: typeof claimedAt === "string" && claimedAt.length > 0 ? claimedAt : "unknown",
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Who owns the tick in this directory: the whole answer, both paths.
+ *
+ * Activation is the presence of `.conductor-tick.json` in the session cwd, which
+ * is a property of the *directory* — so every omp session started there became a
+ * ticker, and with `authority.merge`/`authority.release` delegated, a shell
+ * somebody opened to read state believed it could merge and release. The
+ * directory cannot identify a session, so this asks something that can: under
+ * herdr, the pane's registered agent name; otherwise, a claim on the directory
+ * that is only honoured while its claimant is alive.
+ *
+ * Every collaborator is injectable so the two paths can be tested without a
+ * running herdr and without spawning processes to kill.
+ */
+export function resolveTickOwnership(input: {
+  cwd: string;
+  agentName: string;
+  env: Record<string, string | undefined>;
+  pid: number;
+  now: Date;
+  sessionFile?: string;
+  listAgents?: (env: Record<string, string | undefined>) => HerdrAgentList;
+  alive?: (pid: number) => boolean;
+}): TickOwnership {
+  const paneId = input.env["HERDR_PANE_ID"] ?? "";
+  if (input.env["HERDR_ENV"] === "1" && paneId.length > 0) {
+    const list = (input.listAgents ?? readHerdrAgents)(input.env);
+    if (list.kind === "ok") return paneOwnership({ paneId, agentName: input.agentName, agents: list.agents });
+
+    // Fail closed, but not forever. Under herdr this session is one pane of
+    // possibly several in the fleet's directory, and an unproven identity is the
+    // case this whole check exists for — so it does not tick. It is `unresolved`
+    // rather than `declined` because herdr not answering says nothing about who
+    // this pane is: the caller retries, and the moment herdr answers the real
+    // orchestrator arms. Latching here would mean one CLI timeout stops the
+    // fleet until a human notices and restarts the pane.
+    return {
+      kind: "unresolved",
+      reason:
+        `cannot yet prove this pane is the fleet agent "${input.agentName}" — ${list.problem} — not ticking until it can`,
+    };
+  }
+
+  return claimTickOwner({
+    cwd: input.cwd,
+    pid: input.pid,
+    ...(input.sessionFile === undefined ? {} : { sessionFile: input.sessionFile }),
+    now: input.now,
+    ...(input.alive === undefined ? {} : { alive: input.alive }),
+  });
 }
 
 /**
@@ -538,8 +904,10 @@ function tick(pi: TickApi, ctx: TickContext, config: TickConfig, session: TickSe
 
 export default function orchestratorTickExtension(pi: TickApi): void {
   // Scoped to this registration rather than the module, so a second
-  // `session_start` cannot install a second heartbeat on the same session.
-  let armed = false;
+  // `session_start` can neither install a second heartbeat on the same session
+  // nor repeat the ownership decline — which is logged exactly once, because it
+  // is the line that tells an operator which session is driving the fleet.
+  let decided = false;
   // Held per registration for the same reason: the "using the default reporting
   // scope, because ..." line is logged once for this heartbeat, and the stall
   // counter is about this session's own queue. A second session in the same
@@ -547,7 +915,7 @@ export default function orchestratorTickExtension(pi: TickApi): void {
   const session: TickSession = { scopeFallbackLogged: false, pendingSkips: 0 };
 
   pi.on("session_start", (_event, ctx) => {
-    if (armed) return;
+    if (decided) return;
 
     // A subagent inherits the orchestrator's cwd, so it finds the same
     // activation file and would arm a heartbeat of its own — one extra tick
@@ -580,8 +948,68 @@ export default function orchestratorTickExtension(pi: TickApi): void {
     }
 
     const config = result.config;
+
+    // Activation is a property of the directory, so every omp session started in
+    // the fleet's cwd used to become a ticker — and with merge and release
+    // delegated in config, a shell opened beside the orchestrator believed it
+    // held both. Asked after the config read because the config names the agent,
+    // and before the timer because arming first is the bug.
+    const agentName = config.agentName ?? DEFAULT_FLEET_AGENT_NAME;
+    const resolve = (): TickOwnership =>
+      resolveTickOwnership({
+        cwd: ctx.cwd,
+        agentName,
+        env: process.env,
+        pid: process.pid,
+        now: new Date(),
+        ...(ctx.sessionManager.getSessionFile() === undefined
+          ? {}
+          : { sessionFile: ctx.sessionManager.getSessionFile() }),
+      });
+
+    const ownership = resolve();
+
+    // Only a definitive answer is final. "You are not the fleet agent" cannot
+    // become untrue while this session lives, so it latches. "herdr did not
+    // answer" says nothing about identity, so it must not — otherwise one CLI
+    // timeout at session start is indistinguishable from a fleet that was never
+    // meant to tick, and the heartbeat is gone until a human notices.
+    if (ownership.kind === "unresolved") {
+      pi.logger.info(`[omp-conductor] orchestrator tick pending: ${ownership.reason}`, { agentName });
+      // Faster than the tick interval so a blip costs a minute rather than a
+      // whole cycle, and never slower than one — a fleet on a short interval
+      // should not wait longer to recover than it would to tick.
+      const retryMs = Math.min(RETRY_OWNERSHIP_MS, config.intervalSeconds * 1000);
+      // Disarmed by a flag, not `clearInterval`: `ctx.setInterval` hands back an
+      // opaque handle precisely because the harness owns timer lifecycle and
+      // clears them on `session_shutdown`. A settled retry is a no-op that costs
+      // one boolean per minute until the session ends.
+      let settled = false;
+      ctx.setInterval(() => {
+        if (settled) return;
+        const next = resolve();
+        if (next.kind === "unresolved") return; // already logged once; stay quiet
+        settled = true;
+        if (next.kind === "declined") {
+          pi.logger.info(`[omp-conductor] orchestrator tick inactive: ${next.reason}`, { agentName });
+          return;
+        }
+        if (next.note !== undefined) pi.logger.error(`[omp-conductor] tick ownership: ${next.note}`);
+        ctx.setInterval(() => tick(pi, ctx, config, session), config.intervalSeconds * 1000);
+        pi.logger.info(`[omp-conductor] orchestrator tick active: ownership resolved on retry`, { agentName });
+      }, retryMs);
+      decided = true;
+      return;
+    }
+
+    if (ownership.kind === "declined") {
+      decided = true;
+      pi.logger.info(`[omp-conductor] orchestrator tick inactive: ${ownership.reason}`, { agentName });
+      return;
+    }
+    if (ownership.note !== undefined) pi.logger.error(`[omp-conductor] tick ownership: ${ownership.note}`);
     ctx.setInterval(() => tick(pi, ctx, config, session), config.intervalSeconds * 1000);
-    armed = true;
+    decided = true;
     // Both gates are named at startup: "why is it not ticking?" is answered by
     // looking at the files this line lists, and an unset channel gate on a fleet
     // host is visible here rather than only in its absence.

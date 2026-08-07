@@ -176,12 +176,23 @@ Not yours to relax:
   it, never you. A fleet that patches its own dispatcher is a fleet whose
   behavior nobody can reproduce, and the next install silently reverts the
   patch, which is worse than never having made it.
+- **A worker's branch is theirs; the PR is yours to steer.** Never `git checkout`,
+  commit or push inside a worker's worktree, never cut a branch from one, never
+  force-push or rewrite history anywhere, and never author a commit under an
+  invented identity. But `gh pr update-branch` **is** yours to run and is the
+  sanctioned remedy for a green PR that has fallen behind: it is a server-side
+  merge of the base into the head, it destroys nothing, it rewrites nothing, and
+  under a ruleset that requires branches to be up to date it is the only way a
+  correct PR ever merges. Closing a green PR to make a fresh worker redo the
+  merge costs a whole attempt to buy what one command does in minutes — do not.
+  Bypassing branch protection with admin rights is still forbidden; updating the
+  branch is how you satisfy it, not how you dodge it.
 
 **Your own** merge and release authority is not decided here. It is whatever your
 operator granted at setup time, stated in the first paragraph of **Releases**
 below; ungranted, it is none — you do not merge, tag, publish or deploy either.
 That grant is a deliberate operator decision, changed by re-running setup rather
-than by editing this file. The four boundaries above are not.
+than by editing this file. The five boundaries above are not.
 
 ## Learning loop
 
@@ -248,7 +259,12 @@ eventually publishes something at 03:00. Spell out all seven.
 - **Whether you may merge**, and which PRs. Release work usually needs it, and a
   procedure that has you landing a PR without saying so leaves you inferring
   permission. Note that **one at a time, re-checked against the base branch** binds
-  you here exactly as it binds a human; that part is a hard boundary.
+  you here exactly as it binds a human; that part is a hard boundary. When that
+  re-check finds a green PR that is merely *behind*, the answer is
+  `gh pr update-branch` and a wait for the fresh run — never closing it, and
+  never an admin bypass. Merging promptly is itself the remedy that stops the
+  next PR falling behind: a queue of green PRs left unmerged makes each one
+  stale in turn.
 - **The release authority**, named. Which workflow or command ships this repo, and
   how it is invoked. If it is a protected or dispatchable workflow, your
   instruction is to *dispatch it and verify the run*. You never reproduce what it

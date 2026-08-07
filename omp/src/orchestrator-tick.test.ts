@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { configPath, stateDir } from "./config.ts";
 import { setPaused } from "./daemon.ts";
 import orchestratorTickExtension, {
+  DEFAULT_FLEET_AGENT_NAME,
   MIN_INTERVAL_SECONDS,
   readTickConfig,
   STALL_MARKER_FILE,
@@ -22,28 +23,50 @@ import orchestratorTickExtension, {
   TICK_CONFIG_FILE,
   TICK_CUSTOM_TYPE,
   TICK_DELIVERY_RULE,
+  TICK_OWNER_FILE,
   TICK_SCOPE_CONSTRAINTS,
+  claimTickOwner,
   defaultTickMessage,
+  paneOwnership,
+  parseHerdrAgents,
+  resolveTickOwnership,
   tickDecision,
 } from "./orchestrator-tick.ts";
 import type { ReportScope } from "./types.ts";
 
 const HOME_KEY = "OMP_CONDUCTOR_HOME";
+/**
+ * The pane identity herdr injects. Cleared per test — the suite itself may well
+ * be running inside a herdr pane, and an inherited `HERDR_ENV` would send every
+ * activation test down the pane-ownership path and out to a real `herdr`.
+ */
+const HERDR_KEYS = ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_BIN_PATH"] as const;
 
 let cwd = "";
 let home = "";
 let previousHome: string | undefined;
+let previousHerdr: Record<string, string | undefined> = {};
 
 beforeEach(() => {
   previousHome = process.env[HOME_KEY];
   cwd = mkdtempSync(join(tmpdir(), "omp-conductor-tick-cwd-"));
   home = mkdtempSync(join(tmpdir(), "omp-conductor-tick-home-"));
   process.env[HOME_KEY] = home;
+  previousHerdr = {};
+  for (const key of HERDR_KEYS) {
+    previousHerdr[key] = process.env[key];
+    delete process.env[key];
+  }
 });
 
 afterEach(() => {
   if (previousHome === undefined) delete process.env[HOME_KEY];
   else process.env[HOME_KEY] = previousHome;
+  for (const key of HERDR_KEYS) {
+    const value = previousHerdr[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   rmSync(cwd, { recursive: true, force: true });
   rmSync(home, { recursive: true, force: true });
 });
@@ -65,7 +88,9 @@ interface SentMessage {
  * operator sitting at the orchestrator terminal — so every pre-existing test
  * keeps describing the case it was written for.
  */
-function fakeHost(options: { pending?: boolean; hasUI?: boolean; activeTools?: string[] } = {}) {
+function fakeHost(
+  options: { pending?: boolean; hasUI?: boolean; activeTools?: string[]; sessionFile?: string } = {},
+) {
   const logs: string[] = [];
   const errors: string[] = [];
   const notices: { message: string; type?: string }[] = [];
@@ -82,6 +107,7 @@ function fakeHost(options: { pending?: boolean; hasUI?: boolean; activeTools?: s
       },
     },
     hasPendingMessages: () => state.pending,
+    sessionManager: { getSessionFile: () => options.sessionFile },
     setInterval(callback: () => void, ms?: number): unknown {
       intervals.push({ callback, ms });
       return { id: intervals.length };
@@ -817,4 +843,317 @@ test("the default tick is three lines: the prompt, the scope contract, the deliv
   expect(lines[0]).toContain("ORCHESTRATOR.md");
   expect(lines[1]).toBe(TICK_SCOPE_CONSTRAINTS.material);
   expect(lines[2]).toBe(TICK_DELIVERY_RULE);
+});
+
+// ---------------------------------------------------------------- tick owner
+//
+// Activation is the presence of `.conductor-tick.json` in the cwd, which is a
+// property of the *directory*: every omp session started there armed a
+// heartbeat, and with merge and release delegated in config, a shell opened
+// beside the orchestrator to read state believed it held both (issue #40,
+// observed live on 2026-08-07 as panes w1:p1 and w1:p5 both ticking).
+
+/** herdr's own answer shape, envelope and all — `name` is `null`, not absent,
+ *  on a pane it has no registered agent name for. */
+function agentListJson(rows: { pane: string; name?: string | null }[]): string {
+  return JSON.stringify({
+    id: "cli:agent:list",
+    result: {
+      agents: rows.map((r) => ({
+        agent: "omp",
+        agent_status: "idle",
+        cwd,
+        name: r.name ?? null,
+        pane_id: r.pane,
+      })),
+    },
+  });
+}
+
+/** A stand-in `herdr` on PATH-free terms: `HERDR_BIN_PATH` names it, exactly as
+ *  herdr/bin/recover.sh allows, so the subprocess path is exercised for real. */
+function fakeHerdrBin(body: string, exitCode = 0): string {
+  const path = join(cwd, "fake-herdr");
+  writeFileSync(path, `#!/bin/sh\ncat <<'JSON'\n${body}\nJSON\nexit ${String(exitCode)}\n`, { mode: 0o755 });
+  return path;
+}
+
+test("the fleet's own pane ticks, and the discriminator is the name and not the runtime", () => {
+  const agents = [
+    { paneId: "w1:p1", name: "fleet" },
+    { paneId: "w1:p5" },
+  ];
+
+  expect(paneOwnership({ paneId: "w1:p1", agentName: "fleet", agents })).toEqual({ kind: "owner" });
+});
+
+test("an ad-hoc pane in the fleet cwd declines, naming the pane that owns the tick", () => {
+  const agents = [
+    { paneId: "w1:p1", name: "fleet" },
+    { paneId: "w1:p5" },
+  ];
+
+  // The wording is the deliverable: the failure was never that a second session
+  // could exist, it was that nobody could tell which one was driving the fleet.
+  expect(paneOwnership({ paneId: "w1:p5", agentName: "fleet", agents })).toEqual({
+    kind: "declined",
+    reason: 'pane w1:p1 (agent "fleet") owns the fleet tick here — this session will not tick',
+  });
+});
+
+test("a named pane that is not this fleet's agent declines, and says which agent it is", () => {
+  const agents = [
+    { paneId: "w1:p1", name: "fleet" },
+    { paneId: "w1:p5", name: "scratch" },
+  ];
+
+  // Requiring merely *a* name would arm every registered omp agent herdr keeps
+  // in this directory, which is the same bug with a nicer log line.
+  expect(paneOwnership({ paneId: "w1:p5", agentName: "fleet", agents })).toEqual({
+    kind: "declined",
+    reason: 'this pane is agent "scratch", not the fleet agent "fleet" — this session will not tick',
+  });
+});
+
+test("an unnamed pane with no fleet agent anywhere declines, and names the fix", () => {
+  const decision = paneOwnership({ paneId: "w1:p5", agentName: "fleet", agents: [{ paneId: "w1:p5" }] });
+
+  // Fail closed: this is the ad-hoc shell the issue is about. An orchestrator
+  // that lost its registration is one `herdr agent start` from ticking again, so
+  // the decline says so rather than leaving an operator to guess.
+  expect(decision.kind).toBe("declined");
+  const reason = decision.kind === "declined" ? decision.reason : "";
+  expect(reason).toContain("not a registered herdr agent");
+  expect(reason).toContain("herdr agent start fleet --kind omp --pane w1:p5");
+  expect(reason.endsWith("this session will not tick")).toBe(true);
+});
+
+test("a renamed fleet agent is honoured on both halves, not just recover.sh's default", () => {
+  const agents = [{ paneId: "w2:p1", name: "veltro-fleet" }];
+
+  expect(paneOwnership({ paneId: "w2:p1", agentName: "veltro-fleet", agents })).toEqual({ kind: "owner" });
+  expect(paneOwnership({ paneId: "w2:p1", agentName: DEFAULT_FLEET_AGENT_NAME, agents }).kind).toBe("declined");
+});
+
+test("herdr's agent list parses through its envelope, and a null name is no name", () => {
+  expect(parseHerdrAgents(agentListJson([{ pane: "w1:p1", name: "fleet" }, { pane: "w1:p5" }]))).toEqual({
+    kind: "ok",
+    agents: [{ paneId: "w1:p1", name: "fleet" }, { paneId: "w1:p5" }],
+  });
+
+  // An unparseable list proves nothing about who owns the tick, so it is a
+  // reported fact rather than an empty list that would read as "nobody owns it".
+  expect(parseHerdrAgents("not json").kind).toBe("unavailable");
+  expect(parseHerdrAgents('{"result":{}}').kind).toBe("unavailable");
+});
+
+test("a herdr that does not answer is unresolved, not declined — the difference is retryability", () => {
+  const decision = resolveTickOwnership({
+    cwd,
+    agentName: "fleet",
+    env: { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p5" },
+    pid: process.pid,
+    now: new Date(),
+    listAgents: () => ({ kind: "unavailable", problem: "socket refused" }),
+  });
+
+  // Both outcomes refuse to tick. Only this one may be retried: herdr failing to
+  // answer says nothing about who this pane is, so latching it would let a
+  // single CLI timeout stop the real orchestrator until a human restarts it.
+  expect(decision).toEqual({
+    kind: "unresolved",
+    reason: 'cannot yet prove this pane is the fleet agent "fleet" — socket refused — not ticking until it can',
+  });
+  // And it wrote no claim: under herdr the pane name is the answer, and a claim
+  // file would be a second, disagreeing source of truth.
+  expect(existsSync(join(cwd, TICK_OWNER_FILE))).toBe(false);
+});
+
+test("with no herdr, the first session claims the directory and ticks", () => {
+  const decision = claimTickOwner({ cwd, pid: 4242, sessionFile: "/tmp/session.jsonl", now: new Date(0) });
+
+  expect(decision).toEqual({ kind: "owner" });
+  expect(JSON.parse(readFileSync(join(cwd, TICK_OWNER_FILE), "utf8"))).toEqual({
+    pid: 4242,
+    sessionFile: "/tmp/session.jsonl",
+    claimedAt: "1970-01-01T00:00:00.000Z",
+  });
+});
+
+test("a live owner's claim is honoured, and the decline names the holder", () => {
+  claimTickOwner({ cwd, pid: 4242, sessionFile: "/tmp/first.jsonl", now: new Date(0) });
+
+  const decision = claimTickOwner({ cwd, pid: 9999, now: new Date(1000), alive: (pid) => pid === 4242 });
+
+  expect(decision.kind).toBe("declined");
+  const reason = decision.kind === "declined" ? decision.reason : "";
+  expect(reason).toContain("pid 4242");
+  expect(reason).toContain("/tmp/first.jsonl");
+  expect(reason).toContain(cwd);
+  // The claim is untouched: a live owner keeps it.
+  expect(JSON.parse(readFileSync(join(cwd, TICK_OWNER_FILE), "utf8")).pid).toBe(4242);
+});
+
+test("a dead owner's claim is reclaimed — liveness is a pid check, never a timestamp", () => {
+  claimTickOwner({ cwd, pid: 4242, now: new Date(0) });
+
+  // The claim is ancient and the pid is gone: a crashed pane must not wedge the
+  // fleet, and an age-based lease would have handed ownership away while a slow
+  // orchestrator was still running.
+  const decision = claimTickOwner({ cwd, pid: 9999, now: new Date(10_000), alive: () => false });
+
+  expect(decision).toEqual({ kind: "owner" });
+  expect(JSON.parse(readFileSync(join(cwd, TICK_OWNER_FILE), "utf8")).pid).toBe(9999);
+});
+
+test("the owner re-claiming its own directory still owns it", () => {
+  claimTickOwner({ cwd, pid: 4242, now: new Date(0) });
+
+  expect(claimTickOwner({ cwd, pid: 4242, now: new Date(5000), alive: () => true })).toEqual({ kind: "owner" });
+});
+
+test("a corrupt or partial claim file is no claim at all", () => {
+  for (const body of ["{ not json", "[]", '{"pid":"nine"}', '{"claimedAt":"now"}']) {
+    writeFileSync(join(cwd, TICK_OWNER_FILE), body);
+    expect(claimTickOwner({ cwd, pid: 4242, now: new Date(0), alive: () => true })).toEqual({ kind: "owner" });
+  }
+});
+
+test("under herdr, the fleet pane arms through a real `herdr agent list` call", () => {
+  writeTickConfig({ intervalSeconds: 600 });
+  process.env["HERDR_ENV"] = "1";
+  process.env["HERDR_PANE_ID"] = "w1:p1";
+  process.env["HERDR_BIN_PATH"] = fakeHerdrBin(agentListJson([{ pane: "w1:p1", name: "fleet" }, { pane: "w1:p5" }]));
+  const pi = fakeHost();
+
+  orchestratorTickExtension(pi);
+  pi.start();
+
+  expect(pi.intervals).toHaveLength(1);
+  expect(pi.logs.join("\n")).toContain("orchestrator tick active");
+  // The pane name decided it, so no claim file was written beside the config.
+  expect(existsSync(join(cwd, TICK_OWNER_FILE))).toBe(false);
+});
+
+test("under herdr, a second pane in the same cwd arms nothing and says so exactly once", () => {
+  writeTickConfig({ intervalSeconds: 600 });
+  process.env["HERDR_ENV"] = "1";
+  process.env["HERDR_PANE_ID"] = "w1:p5";
+  process.env["HERDR_BIN_PATH"] = fakeHerdrBin(agentListJson([{ pane: "w1:p1", name: "fleet" }, { pane: "w1:p5" }]));
+  const pi = fakeHost();
+
+  orchestratorTickExtension(pi);
+  pi.start();
+  pi.start();
+
+  expect(pi.intervals).toHaveLength(0);
+  expect(pi.sent).toHaveLength(0);
+  expect(pi.notices).toHaveLength(0);
+  expect(pi.logs).toEqual([
+    '[omp-conductor] orchestrator tick inactive: pane w1:p1 (agent "fleet") owns the fleet tick here — this session will not tick',
+  ]);
+});
+
+test("under herdr, the expected agent name comes from the activation config", () => {
+  writeTickConfig({ intervalSeconds: 600, agentName: "veltro-fleet" });
+  process.env["HERDR_ENV"] = "1";
+  process.env["HERDR_PANE_ID"] = "w1:p1";
+  process.env["HERDR_BIN_PATH"] = fakeHerdrBin(agentListJson([{ pane: "w1:p1", name: "veltro-fleet" }]));
+  const pi = fakeHost();
+
+  orchestratorTickExtension(pi);
+  pi.start();
+
+  expect(pi.intervals).toHaveLength(1);
+});
+
+test("a `herdr agent list` that exits non-zero withholds the heartbeat but keeps asking", () => {
+  writeTickConfig({ intervalSeconds: 600 });
+  process.env["HERDR_ENV"] = "1";
+  process.env["HERDR_PANE_ID"] = "w1:p1";
+  process.env["HERDR_BIN_PATH"] = fakeHerdrBin('{"error":"no such session"}', 2);
+  const pi = fakeHost();
+
+  orchestratorTickExtension(pi);
+  pi.start();
+
+  // One interval, and it is the ownership retry — not the heartbeat. An
+  // unproven identity still must not tick.
+  expect(pi.intervals).toHaveLength(1);
+  expect(pi.logs.join("\n")).toContain("cannot yet prove this pane is the fleet agent");
+  expect(pi.logs.join("\n")).toContain("tick pending");
+  expect(pi.logs.join("\n")).not.toContain("tick active");
+});
+
+test("a herdr blip costs a retry, not the fleet: the heartbeat arms once it answers", () => {
+  // The regression this exists for. Ownership used to latch on any failure, so a
+  // single 3-second CLI timeout at session start disabled the real orchestrator
+  // until a human noticed and restarted the pane — silent, and indistinguishable
+  // from a fleet that was never meant to tick.
+  writeTickConfig({ intervalSeconds: 600 });
+  process.env["HERDR_ENV"] = "1";
+  process.env["HERDR_PANE_ID"] = "w1:p1";
+  process.env["HERDR_BIN_PATH"] = fakeHerdrBin('{"error":"socket refused"}', 2);
+  const pi = fakeHost();
+
+  orchestratorTickExtension(pi);
+  pi.start();
+  expect(pi.intervals).toHaveLength(1); // the retry only
+
+  // herdr comes back, and this pane is the fleet.
+  process.env["HERDR_BIN_PATH"] = fakeHerdrBin(agentListJson([{ pane: "w1:p1", name: "fleet" }]));
+  pi.intervals[0]?.callback();
+
+  expect(pi.intervals).toHaveLength(2); // heartbeat armed
+  expect(pi.logs.join("\n")).toContain("ownership resolved on retry");
+
+  // And the retry disarms itself rather than arming a second heartbeat: the
+  // harness owns timer lifecycle, so this is a flag, not a clearInterval.
+  pi.intervals[0]?.callback();
+  expect(pi.intervals).toHaveLength(2);
+});
+
+test("a retry that proves this pane is NOT the fleet latches, and never arms", () => {
+  writeTickConfig({ intervalSeconds: 600 });
+  process.env["HERDR_ENV"] = "1";
+  process.env["HERDR_PANE_ID"] = "w1:p5";
+  process.env["HERDR_BIN_PATH"] = fakeHerdrBin('{"error":"socket refused"}', 2);
+  const pi = fakeHost();
+
+  orchestratorTickExtension(pi);
+  pi.start();
+
+  process.env["HERDR_BIN_PATH"] = fakeHerdrBin(agentListJson([{ pane: "w1:p1", name: "fleet" }]));
+  pi.intervals[0]?.callback();
+
+  expect(pi.intervals).toHaveLength(1); // still just the retry; no heartbeat
+  expect(pi.logs.join("\n")).toContain("owns the fleet tick here");
+
+  // Definitive, so it stops asking — a rival must not keep re-testing its luck.
+  const before = pi.logs.length;
+  pi.intervals[0]?.callback();
+  expect(pi.logs).toHaveLength(before);
+});
+
+test("with no herdr at all, a lone session behaves exactly as it did — and records its claim", () => {
+  writeTickConfig({ intervalSeconds: 600 });
+  const pi = fakeHost({ sessionFile: "/tmp/lone.jsonl" });
+
+  orchestratorTickExtension(pi);
+  pi.start();
+
+  expect(pi.intervals).toHaveLength(1);
+  const claim = JSON.parse(readFileSync(join(cwd, TICK_OWNER_FILE), "utf8"));
+  expect(claim.pid).toBe(process.pid);
+  expect(claim.sessionFile).toBe("/tmp/lone.jsonl");
+});
+
+test("readTickConfig carries agentName through, and rejects an empty one", () => {
+  writeTickConfig({ intervalSeconds: 600, agentName: " fleet " });
+  const ok = readTickConfig(cwd);
+  expect(ok.kind === "ok" && ok.config.agentName).toBe("fleet");
+
+  writeTickConfig({ intervalSeconds: 600, agentName: "" });
+  const bad = readTickConfig(cwd);
+  expect(bad.kind === "invalid" && bad.problem).toContain("agentName");
 });
