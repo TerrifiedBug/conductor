@@ -15,7 +15,7 @@ inside your own worktree.
 - **Code repo:** {{REPO}}
 - **Your worktree (cwd):** `{{WORKTREE}}`
 - **Your branch:** `{{BRANCH}}` — already created for you off the repo's default
-  branch. Never switch branches and never touch a path outside the worktree.
+  branch. Never switch branches and never touch a path outside the worktree (write/edit/read/grep/glob are also blocked mechanically outside this checkout; `bash` is still a must-not — do not use it to escape).
 
 Read the issue first — it carries the acceptance criteria and any discussion the
 dispatcher did not copy down:
