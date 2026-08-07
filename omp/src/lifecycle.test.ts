@@ -18,7 +18,9 @@ import {
   healthCheck,
   isAlive,
   livingDaemon,
+  probeUnit,
   readRecord,
+  restartDaemon,
   runtimeDir,
   setSystemctlForTest,
   startDaemon,
@@ -27,7 +29,6 @@ import {
   systemdMainPid,
   writeRecord,
 } from "./lifecycle.ts";
-
 const ENV_KEY = "OMP_CONDUCTOR_RUNTIME_DIR";
 
 /** Above every plausible `pid_max`, so `kill` answers ESRCH rather than hitting a real process. */
@@ -145,17 +146,16 @@ test("startDaemon refuses to double-start against a live pid", async () => {
   await expect(startDaemon({ port: 9191 })).rejects.toThrow(new RegExp(`already running \\(pid ${process.pid}`));
   expect(readRecord()?.pid).toBe(process.pid);
 });
-
 test("stopDaemon reports not-running and clears a stale record", async () => {
   writeRecord(record({ pid: DEAD_PID }));
-  // No unit on this host (or the stub says so) — bare not-running.
-  setSystemctlForTest(() => ({ ok: false, stdout: "", stderr: "unit not found" }));
+  // Confirmed no systemd on this host — bare not-running, signal would ESRCH.
+  setSystemctlForTest(() => ({ ok: false, stdout: "", stderr: "not found", missing: true }));
   expect(await stopDaemon()).toEqual({ kind: "not-running" });
   expect(existsSync(recordFile())).toBe(false);
 });
 
 test("stopDaemon reports not-running when there was never a pidfile", async () => {
-  setSystemctlForTest(() => ({ ok: false, stdout: "", stderr: "unit not found" }));
+  setSystemctlForTest(() => ({ ok: false, stdout: "", stderr: "not found", missing: true }));
   expect(await stopDaemon()).toEqual({ kind: "not-running" });
 });
 
@@ -257,6 +257,190 @@ test("systemdMainPid returns the MainPID of an active unit", () => {
   setSystemctlForTest(() => ({ ok: true, stdout: "4242\nactive\n", stderr: "" }));
   expect(systemdMainPid()).toBe(4242);
 });
+
+test("stopDaemon throws when the unit owns the pid but systemctl stop refuses", async () => {
+  // The bug this guards: collapsing manager failure to "not ours" and then
+  // SIGTERMing a unit-owned MainPID — Restart=on-failure reads that as a crash
+  // and the unit comes straight back. Ownership is proven; refusal is terminal.
+  const child = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
+  const pid = child.pid;
+  const calls: string[][] = [];
+  try {
+    writeRecord(record({ pid }));
+    setSystemctlForTest((args) => {
+      calls.push(args);
+      if (args[0] === "show") return { ok: true, stdout: `${pid}\nactive\n`, stderr: "" };
+      if (args[0] === "stop") {
+        return { ok: false, stdout: "", stderr: "Access denied\n" };
+      }
+      return { ok: false, stdout: "", stderr: `unexpected ${args.join(" ")}` };
+    });
+
+    await expect(stopDaemon()).rejects.toThrow(/systemctl stop .* failed: Access denied/);
+    // Must not have signalled the child — it is still the unit's MainPID.
+    expect(isAlive(pid)).toBe(true);
+    // Pidfile stays so the next start does not bind a port systemd still holds.
+    expect(readRecord()?.pid).toBe(pid);
+    expect(calls.filter((a) => a[0] === "stop")).toHaveLength(1);
+  } finally {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+    await child.exited;
+  }
+});
+
+test("restartDaemon throws when the unit owns the pid but systemctl restart refuses", async () => {
+  const child = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
+  const pid = child.pid;
+  const calls: string[][] = [];
+  try {
+    writeRecord(record({ pid }));
+    setSystemctlForTest((args) => {
+      calls.push(args);
+      if (args[0] === "show") return { ok: true, stdout: `${pid}\nactive\n`, stderr: "" };
+      if (args[0] === "restart") {
+        return { ok: false, stdout: "", stderr: "Connection timed out\n" };
+      }
+      // A fallthrough that called stop would still be wrong — assert neither.
+      return { ok: false, stdout: "", stderr: `unexpected ${args.join(" ")}` };
+    });
+
+    await expect(restartDaemon()).rejects.toThrow(/systemctl restart .* failed: Connection timed out/);
+    expect(isAlive(pid)).toBe(true);
+    expect(readRecord()?.pid).toBe(pid);
+    expect(calls.some((a) => a[0] === "stop")).toBe(false);
+    expect(calls.filter((a) => a[0] === "restart")).toHaveLength(1);
+  } finally {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+    await child.exited;
+  }
+});
+
+test("stopDaemon throws when systemctl show fails — ownership unknown is not not-ours", async () => {
+  // The hole after the first fail-closed pass: show failures (dbus blip,
+  // timeout, auth) collapsed to undefined MainPID → decideSystemdStop said
+  // "not-ours" → raw SIGTERM of a possibly unit-owned pid. Query failure must
+  // refuse to signal.
+  const child = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
+  const pid = child.pid;
+  const calls: string[][] = [];
+  try {
+    writeRecord(record({ pid }));
+    setSystemctlForTest((args) => {
+      calls.push(args);
+      if (args[0] === "show") {
+        return { ok: false, stdout: "", stderr: "Failed to connect to bus: Connection refused\n" };
+      }
+      return { ok: false, stdout: "", stderr: `unexpected ${args.join(" ")}` };
+    });
+
+    await expect(stopDaemon()).rejects.toThrow(/ownership is unknown/);
+    expect(isAlive(pid)).toBe(true);
+    expect(readRecord()?.pid).toBe(pid);
+    expect(calls.every((a) => a[0] === "show")).toBe(true);
+    expect(calls.some((a) => a[0] === "stop")).toBe(false);
+  } finally {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+    await child.exited;
+  }
+});
+
+test("restartDaemon throws when systemctl show fails — ownership unknown", async () => {
+  const child = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
+  const pid = child.pid;
+  try {
+    writeRecord(record({ pid }));
+    setSystemctlForTest((args) => {
+      if (args[0] === "show") {
+        return { ok: false, stdout: "", stderr: "Failed to connect to bus: Connection refused\n" };
+      }
+      return { ok: false, stdout: "", stderr: `unexpected ${args.join(" ")}` };
+    });
+
+    await expect(restartDaemon()).rejects.toThrow(/ownership is unknown/);
+    expect(isAlive(pid)).toBe(true);
+    expect(readRecord()?.pid).toBe(pid);
+  } finally {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+    await child.exited;
+  }
+});
+
+test("probeUnit distinguishes a missing binary from a failed show", () => {
+  setSystemctlForTest(() => ({ ok: false, stdout: "", stderr: "spawn systemctl ENOENT", missing: true }));
+  expect(probeUnit()).toEqual({ kind: "inactive" });
+
+  setSystemctlForTest(() => ({
+    ok: false,
+    stdout: "",
+    stderr: "Failed to connect to bus: Connection refused",
+  }));
+  expect(probeUnit()).toEqual({
+    kind: "unknown",
+    reason: "Failed to connect to bus: Connection refused",
+  });
+
+  setSystemctlForTest(() => ({ ok: true, stdout: "0\ninactive\n", stderr: "" }));
+  expect(probeUnit()).toEqual({ kind: "inactive" });
+
+  setSystemctlForTest(() => ({ ok: true, stdout: "99\nactive\n", stderr: "" }));
+  expect(probeUnit()).toEqual({ kind: "active", pid: 99 });
+});
+
+test("probeUnit treats a live MainPID as owned during activating", () => {
+  // activating/deactivating/reloading still have a systemd-owned MainPID.
+  // Labelling them inactive is how stop fell through to SIGTERM mid-start.
+  for (const state of ["activating", "deactivating", "reloading", "reactivating", "active"]) {
+    setSystemctlForTest(() => ({ ok: true, stdout: `4242\n${state}\n`, stderr: "" }));
+    expect(probeUnit()).toEqual({ kind: "active", pid: 4242 });
+    expect(systemdMainPid()).toBe(4242);
+  }
+});
+
+test("stopDaemon uses systemctl while the unit is activating", async () => {
+  const child = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
+  const pid = child.pid;
+  const calls: string[][] = [];
+  try {
+    writeRecord(record({ pid }));
+    setSystemctlForTest((args) => {
+      calls.push(args);
+      if (args[0] === "show") return { ok: true, stdout: `${pid}\nactivating\n`, stderr: "" };
+      if (args[0] === "stop") {
+        child.kill("SIGTERM");
+        return { ok: true, stdout: "", stderr: "" };
+      }
+      return { ok: false, stdout: "", stderr: `unexpected ${args.join(" ")}` };
+    });
+
+    expect(await stopDaemon()).toEqual({ kind: "stopped", pid, via: "systemctl" });
+    expect(calls.some((a) => a[0] === "stop")).toBe(true);
+    expect(isAlive(pid)).toBe(false);
+  } finally {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+    await child.exited;
+  }
+});
+
 
 test("healthCheck resolves ok:false against a closed port instead of rejecting", async () => {
   // Port 1 is privileged, so nothing in a test run is listening on it and the

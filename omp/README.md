@@ -348,6 +348,53 @@ the current tick rather than mid-run. When the live process is the MainPID of
 `Restart=on-failure` cannot bring it straight back; otherwise it is a raw
 `SIGTERM` (then `SIGKILL` after 10 seconds).
 
+
+### Stop the conductor (hold / halt)
+
+Four control planes used to answer "stop" differently. The package verbs:
+
+| Verb | Claiming | Tick sends | Dispatch daemon | Conductor pane |
+| --- | --- | --- | --- | --- |
+| `hold` | paused | disarmed | left running | left running |
+| `halt` | paused | disarmed | stopped (systemctl-aware) | left running |
+| `halt --pane` | paused | disarmed | stopped | stopped + recovery pinned off |
+| `pause` | paused | **still armed** | left running | left running |
+
+`resume` clears pause only and **never re-arms**. `arm` is proof-gated: it sends a Telegram challenge and writes the arm marker only after your reply appears as a *user* turn in the orchestrator transcript. `halt --pane` targets the configured conductor agent only — it does **not** run `systemctl stop herdr-fleet`.
+
+`status` prints a layered header (`dispatch` / `ticks` / `pane` / `recovery` / `herdr` / `daemon`) so a paused fleet cannot hide an armed orchestrator still spending turns.
+
+`halt --pane` is **fail-closed**: it exits `0` only when the conductor agent is
+*proven* gone. It writes the recovery pin first, so a failed stop still cannot be
+undone by `herdr-conductor` respawning the agent, and then refuses (nonzero exit,
+message on stderr) on every uncertainty:
+
+- no tick config exists at all — `recover.sh` reads only
+  `$FLEET_CWD/.conductor-pane-halted`, and without that file the pane's own
+  directory is unknown, so the pin would land somewhere recovery never looks and
+  the agent would be respawned seconds later. `release-pane` refuses for the
+  same reason, and `status` shows `recovery unpinnable` rather than `clear`
+- the tick config does not parse — the agent name would be a guess
+- `herdr agent list` is unreachable, prints nothing, or prints output with no
+  explicit `agents` array; only a real `agents: []` means "no agents"
+- an agent row is unreadable — a missing `name`/`pane_id`, or an `agent` field
+  present with a non-string value. An *absent* or `null` `agent` is the sticky
+  claim herdr reports after the agent exits, and stays a normal answer
+- the configured agent name is not unique, or the claimed pane runs some other agent
+- `pane process-info` fails, or the claim is live `omp` but names no recognizable
+  omp foreground PID — "cannot see it" is never reported as "it is stopped"
+- a signal cannot be delivered, or liveness cannot be probed — only `ESRCH`
+  ("no such process") proves death, so `EPERM` reads as "exists, not ours",
+  never as "stopped"
+- the process is still alive after `SIGTERM` then `SIGKILL`
+
+The pin is written to the pane's own directory (the one holding
+`.conductor-tick.json`, which is `FLEET_CWD` — the only place `recover.sh` looks),
+including when that tick config is the thing that failed to parse.
+
+Clear the pin with `omp-conductor release-pane` when you want recovery again.
+
+
 ## How one tick works
 
 Per tick, for the daemon's project:

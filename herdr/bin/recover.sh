@@ -916,6 +916,16 @@ run_recovery() {
     return 0
   fi
 
+  # omp-conductor `halt --pane` writes this marker so recovery will not bring
+  # the conductor agent back. Narrow by design: only this fleet agent at
+  # FLEET_CWD. It never stops herdr-fleet.service or any other session on the
+  # box. Clear with `omp-conductor release-pane`.
+  if [[ -f $FLEET_CWD/.conductor-pane-halted ]]; then
+    decide "skip: pane recovery pinned off by omp-conductor halt --pane ($FLEET_CWD/.conductor-pane-halted) — clear with omp-conductor release-pane"
+    return 0
+  fi
+
+
   if ! command -v jq >/dev/null 2>&1; then
     # Paging still works without jq for the toast; say so plainly either way.
     page 'jq is not installed on this host' \
