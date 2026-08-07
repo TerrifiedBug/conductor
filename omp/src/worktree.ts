@@ -379,7 +379,17 @@ export async function addWorktree(
  * none of that may be skipped by an exception from the last-ditch step.
  */
 export type SalvageOutcome =
-  | { kind: "salvaged"; sha: string; branch: string; pushed: boolean; pushError?: string }
+  | {
+      kind: "salvaged";
+      sha: string;
+      branch: string;
+      pushed: boolean;
+      pushError?: string;
+      /** Paths in the salvage commit (count = length). */
+      files: string[];
+      /** Subset that were untracked before salvage (`A` in the commit). */
+      newPaths: string[];
+    }
   /** Nothing uncommitted was there to save — a clean tree, or no tree at all. */
   | { kind: "nothing" }
   /** There was work and git would not commit it. This is the loud one. */
@@ -402,6 +412,51 @@ const SALVAGE_COMMIT_CONFIG = [
   "-c",
   "commit.gpgsign=false",
 ];
+
+/**
+ * Subject stays the historical one-liner so status greps keep working; the
+ * body is the manifest (#38). Cap the new-path list so a runaway tree cannot
+ * push a multi-kilobyte commit message into every escalation.
+ */
+export function salvageCommitMessage(
+  issue: number,
+  attempt: number,
+  reason: string,
+  files: string[],
+  newPaths: string[],
+): { subject: string; body: string } {
+  const subject = `wip(#${issue}): attempt ${attempt} killed by ${reason} — auto-salvaged`;
+  const n = files.length;
+  const count = `${n} file${n === 1 ? "" : "s"}`;
+  if (newPaths.length === 0) {
+    return { subject, body: `${count} (all modifications to tracked paths).` };
+  }
+  const cap = 30;
+  const shown = newPaths.slice(0, cap);
+  const more = newPaths.length - shown.length;
+  const list = shown.map((f) => `  ${f}`).join("\n");
+  const suffix = more > 0 ? `\n  … and ${more} more` : "";
+  return {
+    subject,
+    body: `${count}. New (untracked before salvage):\n${list}${suffix}`,
+  };
+}
+
+function parseCachedNameStatus(raw: string): { files: string[]; newPaths: string[] } {
+  const files: string[] = [];
+  const newPaths: string[] = [];
+  for (const line of raw.split("\n")) {
+    if (line === "") continue;
+    // name-status: "<status>\t<path>" or rename "R100\t<old>\t<new>"
+    const parts = line.split("\t");
+    const status = parts[0] ?? "";
+    const path = parts.length >= 3 ? (parts[2] ?? parts[1] ?? "") : (parts[1] ?? "");
+    if (path === "") continue;
+    files.push(path);
+    if (status.startsWith("A")) newPaths.push(path);
+  }
+  return { files, newPaths };
+}
 
 /**
  * Commits a dead run's uncommitted work to the run's own branch and pushes it,
@@ -472,40 +527,42 @@ export async function salvageWip(
     // only changes were ignored scratch had work by that test and none by this.
     // Without this, `commit` exits non-zero on an empty index and a tree
     // holding nothing worth keeping gets reported as a salvage *failure*.
-    if ((await git(["diff", "--cached", "--name-only"], worktree)) === "") {
+    const cached = await git(["diff", "--cached", "--name-status"], worktree);
+    if (cached === "") {
       return { kind: "nothing" };
     }
+    const { files, newPaths } = parseCachedNameStatus(cached);
+    const msg = salvageCommitMessage(issue, attempt, reason, files, newPaths);
     await git(
       [
         ...SALVAGE_COMMIT_CONFIG,
         "commit",
         "--no-verify",
         "-m",
-        `wip(#${issue}): attempt ${attempt} killed by ${reason} — auto-salvaged`,
+        msg.subject,
+        "-m",
+        msg.body,
       ],
       worktree,
     );
     const sha = await git(["rev-parse", "HEAD"], worktree);
+    const salvaged = { kind: "salvaged" as const, sha, branch, files, newPaths };
 
     if (branch === "HEAD") {
       // Detached: the commit is real but reachable only by sha, and pushing
       // `HEAD` from here would publish a branch literally named HEAD.
       return {
-        kind: "salvaged",
-        sha,
-        branch,
+        ...salvaged,
         pushed: false,
         pushError: "detached HEAD — no branch to push",
       };
     }
 
     const push = await runGit(["push", "origin", `HEAD:refs/heads/${branch}`], worktree);
-    if (push.code === 0) return { kind: "salvaged", sha, branch, pushed: true };
+    if (push.code === 0) return { ...salvaged, pushed: true };
 
     return {
-      kind: "salvaged",
-      sha,
-      branch,
+      ...salvaged,
       pushed: false,
       pushError: (
         push.stderr.trim() ||

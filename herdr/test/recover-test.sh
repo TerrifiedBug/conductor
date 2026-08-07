@@ -928,6 +928,41 @@ check 'telegram credentials are read from the omp-telegram files' \
   '123456:AA-fixture-token_value|987654321' "$creds"
 
 # --------------------------------------------------------------------------
+# recover poke — a real resume writes .conductor-tick-requested under FLEET_CWD
+# before agent start, so the omp tick extension can fire without waiting a full
+# interval (#19). Dry-run plans already mention the path; this proves the write.
+# --------------------------------------------------------------------------
+
+d=$(newcase recover-tick-request)
+mkdir -p "$d/fleet-cwd"
+sed -i.bak "s|^FLEET_CWD=.*|FLEET_CWD=$d/fleet-cwd|" "$d/config/config.env"
+saved_session_json fleet "$REF" >"$d/session/session.json"
+empty_agent_list >"$d/agent-list.json"
+pane_list_json "$(free_pane 'w1:p1' "$REF")" >"$d/pane-list.json"
+process_info_json 'w1:p1' >"$d/process-info-w1:p1.json"
+(
+  cd "$root" || exit 1
+  HERDR_BIN_PATH="$tmp/herdr" \
+    STUB_DIR="$d" \
+    HERDR_PLUGIN_CONFIG_DIR="$d/config" \
+    HERDR_PLUGIN_STATE_DIR="$d/state" \
+    HERDR_SOCKET_PATH="$d/session/herdr.sock" \
+    HERDR_PLUGIN_EVENT=startup \
+    HERDR_SESSION=fleet \
+    RECOVER_RECHECK_SECONDS=0 \
+    bash "$recover" >"$d/stdout" 2>"$d/stderr"
+)
+out=$(cat "$d/stdout")
+if [[ -f $d/fleet-cwd/.conductor-tick-requested &&
+  $out == *'requested immediate tick'* &&
+  $out == *"recovered: agent 'fleet' resumed"* ]]; then
+  pass 'a real resume writes the immediate-tick request under FLEET_CWD'
+else
+  fail 'a real resume writes the immediate-tick request under FLEET_CWD' \
+    "file=$(ls -la "$d/fleet-cwd" 2>&1) / out: ${out//$'\n'/ | } / err: $(tr '\n' '|' <"$d/stderr")"
+fi
+
+# --------------------------------------------------------------------------
 # case 12 — a real (non-dry-run) page raises a Herdr notification and degrades
 # cleanly when no bot token is configured. Offline by construction: the token
 # lookup fails before curl is ever reached.

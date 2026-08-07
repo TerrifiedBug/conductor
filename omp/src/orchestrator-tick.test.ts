@@ -21,6 +21,7 @@ import orchestratorTickExtension, {
   STALL_MARKER_FILE,
   STALL_TICKS,
   TICK_CONFIG_FILE,
+  TICK_REQUESTED_FILE,
   TICK_CUSTOM_TYPE,
   TICK_DELIVERY_RULE,
   TICK_OWNER_FILE,
@@ -361,6 +362,37 @@ test("firing the captured callback sends one tick with the documented delivery",
   expect(tick?.message.content).toContain("ORCHESTRATOR.md");
   expect(pi.logs.join("\n")).toContain("tick sent");
 });
+
+test("a recover tick request fires immediately on arm and clears the sentinel", () => {
+  writeTickConfig({ intervalSeconds: 600 });
+  writeFileSync(join(cwd, TICK_REQUESTED_FILE), "2026-08-07T15:00:00Z recover\n");
+  const pi = fakeHost();
+  orchestratorTickExtension(pi);
+  pi.start();
+
+  expect(pi.sent).toHaveLength(1);
+  expect(pi.logs.join("\n")).toContain("tick requested by recover");
+  expect(existsSync(join(cwd, TICK_REQUESTED_FILE))).toBe(false);
+});
+
+test("a recover tick request survives a not-armed skip so a later arm can still send", () => {
+  writeTickConfig({ intervalSeconds: 600, armedFile: "state/armed" });
+  mkdirSync(join(cwd, "state"), { recursive: true });
+  writeFileSync(join(cwd, TICK_REQUESTED_FILE), "recover\n");
+  const pi = fakeHost();
+  orchestratorTickExtension(pi);
+  pi.start();
+
+  // Gates fail: no send, sentinel stays for when the operator arms.
+  expect(pi.sent).toHaveLength(0);
+  expect(existsSync(join(cwd, TICK_REQUESTED_FILE))).toBe(true);
+
+  writeFileSync(join(cwd, "state", "armed"), "");
+  pi.fire();
+  expect(pi.sent).toHaveLength(1);
+  expect(existsSync(join(cwd, TICK_REQUESTED_FILE))).toBe(false);
+});
+
 
 test("a configured message is sent verbatim in place of the default", () => {
   writeTickConfig({ intervalSeconds: 600, message: "loop now" });

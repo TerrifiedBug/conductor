@@ -633,20 +633,46 @@ page() {
 # flow
 # --------------------------------------------------------------------------
 
+# Ask the omp orchestrator-tick extension to fire as soon as it arms, instead of
+# waiting up to `intervalSeconds` (often 30 min) after a restart. Written into
+# FLEET_CWD *before* `agent start` so session_start can see it; the extension
+# clears the file only after a tick is actually sent (armed + channel up).
+# Live-agent short-circuit never calls this — nothing was resumed.
+TICK_REQUESTED_FILE='.conductor-tick-requested'
+
+request_immediate_tick() {
+  local path=$FLEET_CWD/$TICK_REQUESTED_FILE
+  if dry_run; then
+    decide "plan: request immediate tick via $path"
+    return 0
+  fi
+  if printf '%s recover\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$path" 2>/dev/null; then
+    decide "requested immediate tick: $path"
+  else
+    log "could not write $path; resumed fleet may wait a full tick interval to reconcile"
+  fi
+}
+
 start_fleet() {
   local pane=$1 ref=$2 kind=$3 err
   if dry_run; then
-    decide "plan: $HERDR_BIN agent start '$AGENT_NAME' --kind omp --pane $pane -- --resume=$ref (ref kind: $kind)"
+    decide "plan: $HERDR_BIN agent start '$AGENT_NAME' --kind omp --pane $pane -- --resume=$ref (ref kind: $kind); request immediate tick via $FLEET_CWD/$TICK_REQUESTED_FILE"
     return 0
   fi
   # `--` hands the rest to the agent verbatim (src/cli/agent.rs:277-280,339-343)
   # and omp resumes with `--resume=<id-or-path>` for both ref kinds
   # (src/agent_resume.rs:154-158).
+  # Tick request first: agent start is when session_start runs, and that is the
+  # moment the heartbeat can consume the sentinel without waiting an interval.
+  request_immediate_tick
   if err=$("$HERDR_BIN" agent start "$AGENT_NAME" --kind omp --pane "$pane" -- "--resume=$ref" 2>&1 >/dev/null); then
     remember_identity "$pane" "$ref"
     decide "recovered: agent '$AGENT_NAME' resumed in pane $pane (--resume=$ref)"
     return 0
   fi
+  # Start failed: drop the poke so a later live session in this cwd is not
+  # spuriously tick-nudged by a recovery that never happened.
+  rm -f "$FLEET_CWD/$TICK_REQUESTED_FILE" 2>/dev/null || true
   page "agent start failed for pane $pane" "${err:-no error output}"
   return 0
 }
@@ -681,7 +707,7 @@ bootstrap_fleet() {
     return 0
   fi
   if dry_run; then
-    decide "plan: bootstrap — $HERDR_BIN workspace create --cwd $FLEET_CWD --label fleet --no-focus, then agent start with --resume=$BOOTSTRAP_RESUME"
+    decide "plan: bootstrap — $HERDR_BIN workspace create --cwd $FLEET_CWD --label fleet --no-focus, then agent start with --resume=$BOOTSTRAP_RESUME; request immediate tick via $FLEET_CWD/$TICK_REQUESTED_FILE"
     return 0
   fi
   local created pane

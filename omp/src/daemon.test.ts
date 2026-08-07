@@ -645,7 +645,14 @@ describe("salvageLines", () => {
 
   it("names the branch and sha a killed run's work was committed to", () => {
     const lines = salvageLines(
-      { kind: "salvaged", sha: "9f2c1ab", branch: "conductor/issue-140", pushed: true },
+      {
+        kind: "salvaged",
+        sha: "9f2c1ab",
+        branch: "conductor/issue-140",
+        pushed: true,
+        files: ["src/a.ts", ".scratch82/env.sh"],
+        newPaths: [".scratch82/env.sh"],
+      },
       TREE,
     );
 
@@ -654,7 +661,8 @@ describe("salvageLines", () => {
     expect(lines[0]).toBe(
       "WIP committed to conductor/issue-140 @ 9f2c1ab and pushed — the work outlives this worktree",
     );
-    expect(lines[1]).toBe(`Worktree kept for inspection: ${TREE}`);
+    expect(lines[1]).toBe("2 files; new: .scratch82/env.sh");
+    expect(lines[2]).toBe(`Worktree kept for inspection: ${TREE}`);
   });
 
   it("still reports the sha when the push was refused, and says it is local", () => {
@@ -665,6 +673,8 @@ describe("salvageLines", () => {
         branch: "conductor/issue-140",
         pushed: false,
         pushError: "non-fast-forward",
+        files: ["src/a.ts"],
+        newPaths: [],
       },
       TREE,
     );
@@ -673,6 +683,7 @@ describe("salvageLines", () => {
     expect(lines[0]).toContain("@ 9f2c1ab");
     expect(lines[0]).toContain("NOT pushed (non-fast-forward)");
     expect(lines[0]).toContain("this host's mirror");
+    expect(lines[1]).toBe("1 file (all modifications to tracked paths)");
   });
 
   it("says plainly when there was nothing to salvage", () => {

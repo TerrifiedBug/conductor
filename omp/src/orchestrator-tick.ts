@@ -95,6 +95,14 @@ export const STALL_MARKER_FILE = ".conductor-stalled";
 export const STALL_TICKS = 2;
 
 /**
+ * Written by herdr-conductor `recover.sh` *before* `agent start`, so a resumed
+ * fleet can reconcile orphans without waiting a full `intervalSeconds`. Cleared
+ * only after a tick is actually sent — a disarmed or channel-down fleet keeps
+ * the request until gates pass (or a human removes the file).
+ */
+export const TICK_REQUESTED_FILE = ".conductor-tick-requested";
+
+/**
  * The marker's one line after its ISO timestamp, and the middle of the error
  * log. Shared so the file and the log can never describe different failures.
  */
@@ -834,6 +842,23 @@ function clearStallMarker(pi: TickApi, cwd: string): void {
   }
 }
 
+/**
+ * Best-effort, same posture as {@link clearStallMarker}. Leaving the file on a
+ * failed unlink means the next successful send retries the clear; that is
+ * preferable to treating a recover poke as fire-and-forget when the tick did
+ * land.
+ */
+function clearTickRequest(pi: TickApi, cwd: string): void {
+  const path = join(cwd, TICK_REQUESTED_FILE);
+  if (!existsSync(path)) return;
+  try {
+    rmSync(path, { force: true });
+    pi.logger.info("[omp-conductor] recover tick request cleared: a tick was sent");
+  } catch (err) {
+    pi.logger.error(`[omp-conductor] could not remove ${path}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 /** Everything one tick remembers for the next. */
 interface TickSession {
   /**
@@ -900,6 +925,21 @@ function tick(pi: TickApi, ctx: TickContext, config: TickConfig, session: TickSe
   // this is the only place either the counter or the marker is cleared.
   session.pendingSkips = 0;
   clearStallMarker(pi, ctx.cwd);
+  // Recover poke is consumed only on a real send — gates still apply above.
+  clearTickRequest(pi, ctx.cwd);
+}
+
+/**
+ * Arm the interval heartbeat, then honour a recover poke if one is waiting.
+ * Extracted so the ownership-retry path and the immediate-accept path cannot
+ * drift: both must fire the same "do not wait a full interval after resume"
+ * behaviour.
+ */
+function armTickHeartbeat(pi: TickApi, ctx: TickContext, config: TickConfig, session: TickSession): void {
+  ctx.setInterval(() => tick(pi, ctx, config, session), config.intervalSeconds * 1000);
+  if (!existsSync(join(ctx.cwd, TICK_REQUESTED_FILE))) return;
+  pi.logger.info("[omp-conductor] tick requested by recover — firing without waiting for the interval");
+  tick(pi, ctx, config, session);
 }
 
 export default function orchestratorTickExtension(pi: TickApi): void {
@@ -995,7 +1035,7 @@ export default function orchestratorTickExtension(pi: TickApi): void {
           return;
         }
         if (next.note !== undefined) pi.logger.error(`[omp-conductor] tick ownership: ${next.note}`);
-        ctx.setInterval(() => tick(pi, ctx, config, session), config.intervalSeconds * 1000);
+        armTickHeartbeat(pi, ctx, config, session);
         pi.logger.info(`[omp-conductor] orchestrator tick active: ownership resolved on retry`, { agentName });
       }, retryMs);
       decided = true;
@@ -1008,7 +1048,7 @@ export default function orchestratorTickExtension(pi: TickApi): void {
       return;
     }
     if (ownership.note !== undefined) pi.logger.error(`[omp-conductor] tick ownership: ${ownership.note}`);
-    ctx.setInterval(() => tick(pi, ctx, config, session), config.intervalSeconds * 1000);
+    armTickHeartbeat(pi, ctx, config, session);
     decided = true;
     // Both gates are named at startup: "why is it not ticking?" is answered by
     // looking at the files this line lists, and an unset channel gate on a fleet
