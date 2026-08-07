@@ -151,10 +151,13 @@ async function watchOrchestrator(d: Deps): Promise<void> {
     tier: 2,
     project: d.project.name,
     issue: NO_ISSUE,
-    // Dated like the other tier-2 summaries: the dedup key is the summary, and
-    // a second wedge next month must not read as a repeat of this one.
+    // Keyed on the marker's own timestamp, not the date. The dedup ledger keys
+    // on this summary, and two wedges in one day is not a hypothetical — the
+    // failure mode is a session that gets stuck, gets restarted, and gets stuck
+    // again on the same cause an hour later. A day-keyed summary would report
+    // the first and silently swallow every one after it.
     summary:
-      `Orchestrator session wedged on ${new Date().toISOString().slice(0, 10)} — ` +
+      `Orchestrator session wedged (${verdict.since ?? `marker at ${marker}`}) — ` +
       `it has stopped reading its queue (${d.project.name})`,
     detail: [
       verdict.since ?? "Marker present with no readable timestamp.",
@@ -731,6 +734,15 @@ async function tick(d: Deps): Promise<void> {
   // attributable. A legitimate deploy never trips it, because installing a new
   // build and restarting the unit re-records the baseline from the new files;
   // only an edit *underneath* a live daemon diverges from it.
+  //
+  // Below the pause gate on purpose, unlike the stall watch above. The property
+  // being defended is that no work is dispatched under a package the operator
+  // did not install — and a paused fleet dispatches nothing, so nothing needs
+  // attributing yet. Tampering during a pause is not missed, only deferred: the
+  // baseline is boot's, so the first tick after `resume` compares against it and
+  // pauses again before claiming anything. Checking above the gate instead would
+  // page on every legitimate build an operator deploys into a parked fleet,
+  // which is exactly when they deploy them.
   const integrity = checkIntegrity(d.integrity, packageManifest());
   if (integrity.pause) {
     const shown = integrity.diff.slice(0, INTEGRITY_SAMPLE);
