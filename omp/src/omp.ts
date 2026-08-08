@@ -14,6 +14,8 @@
  * the module, which is the whole reason this shim exists.
  */
 import { worktreeConfinement } from "./confinement.ts";
+import { releasePolicyTripwire, type ReleaseShape } from "./release-policy.ts";
+import type { ReleasePolicy } from "./types.ts";
 
 const OMP_PACKAGE = "@oh-my-pi/pi-coding-agent";
 
@@ -122,6 +124,10 @@ export async function createSession(opts: {
    * to read the state directory and briefs.
    */
   confineToCwd?: boolean;
+  /** Install the release/deploy tool-call gate for this session. */
+  releasePolicy?: ReleasePolicy;
+  /** Durable audit callback invoked only when that gate rejects a call. */
+  onReleaseBlocked?: (shape: ReleaseShape) => void;
 }): Promise<AgentSessionLike> {
   let loaded: unknown;
   try {
@@ -158,6 +164,12 @@ export async function createSession(opts: {
   // `session.sessionFile` undefined, and once the worktree is gone the
   // transcript is the only record of what the worker actually did.
   const sessionManager = await openSessionManager(mod, opts);
+  const extensions = [
+    ...(opts.confineToCwd ? [worktreeConfinement(opts.cwd)] : []),
+    ...(opts.releasePolicy === undefined
+      ? []
+      : [releasePolicyTripwire(opts.releasePolicy, opts.onReleaseBlocked)]),
+  ];
 
   const created = await mod.createAgentSession({
     cwd: opts.cwd,
@@ -175,10 +187,9 @@ export async function createSession(opts: {
     // agentDir (~/.omp/agent/mcp.json) — without this, workers grep-only and
     // burn the turns cap on discovery (#29).
     enableMCP: true,
-    // Mechanical worktree gate (#24): structured write/edit/read/grep/glob
-    // whose path resolves outside cwd are blocked before execution. Inline
-    // extension — the harness has no separate fs-policy field.
-    ...(opts.confineToCwd ? { extensions: [worktreeConfinement(opts.cwd)] } : {}),
+    // Mechanical tool gates: confinement prevents structured worktree I/O from
+    // escaping cwd; release policy blocks release/deploy calls when configured.
+    ...(extensions.length === 0 ? {} : { extensions }),
   });
   const raw = asRawSession(created);
   // Surfaced rather than swallowed: this is how a quiet downgrade to a weaker

@@ -86,6 +86,7 @@ function answers(overrides: Partial<SetupAnswers> = {}): SetupAnswers {
     fallbackToIssueComment: true,
     reportScope: DEFAULT_REPORT_SCOPE,
     authority: { ...DEFAULT_AUTHORITY },
+    releasePolicy: "none",
     orchestratorMode: "embedded",
     writeOrchestratorBrief: false,
     ...overrides,
@@ -691,7 +692,9 @@ test("every amend row names the area and what it says right now", () => {
   expect(byId.get("graph")).toBe("code graph — not configured — workers grep");
   expect(byId.get("caps")).toContain("3 workers, 200 turns, 90m, $40/day, 1 failed attempt, 2 continuations");
   expect(byId.get("gates")).toContain("chad: ruff check . @ backend, pnpm lint @ frontend");
-  expect(byId.get("authority")).toBe("authority — merge=orchestrator, release=orchestrator");
+  expect(byId.get("authority")).toBe(
+    "authority — merge=orchestrator, release=orchestrator, releasePolicy=none",
+  );
   expect(byId.get("escalation")).toContain("tier 2 pages Telegram 8236653927");
 });
 

@@ -117,7 +117,10 @@ function fakeHost(
     },
   };
 
-  let handler: ((event: { type: "session_start" }, ctx: typeof pi.ctx) => void) | undefined;
+  let sessionHandler: ((event: { type: "session_start" }, ctx: typeof pi.ctx) => void) | undefined;
+  let toolHandler:
+    | ((event: { toolName: string; input: Record<string, unknown> }, ctx: unknown) => unknown)
+    | undefined;
 
   const pi = {
     logger: {
@@ -131,8 +134,12 @@ function fakeHost(
       },
     },
     getActiveTools: () => options.activeTools ?? [],
-    on(_event: "session_start", h: (event: { type: "session_start" }, c: typeof ctx) => void) {
-      handler = h as typeof handler;
+    on(event: "session_start" | "tool_call", h: unknown) {
+      if (event === "session_start") {
+        sessionHandler = h as typeof sessionHandler;
+      } else {
+        toolHandler = h as typeof toolHandler;
+      }
     },
     sendMessage(message: SentMessage["message"], opts: SentMessage["options"]) {
       sent.push({ message, options: opts });
@@ -145,8 +152,11 @@ function fakeHost(
     intervals,
     state,
     start() {
-      if (handler === undefined) throw new Error("extension never registered session_start");
-      handler({ type: "session_start" }, ctx);
+      if (sessionHandler === undefined) throw new Error("extension never registered session_start");
+      sessionHandler({ type: "session_start" }, ctx);
+    },
+    callTool(toolName: string, input: Record<string, unknown>): unknown {
+      return toolHandler?.({ toolName, input }, {});
     },
     fire(): void {
       const first = intervals[0];
@@ -373,12 +383,35 @@ test("heartbeat publishes its next due time for out-of-process status", () => {
   pi.start();
 
   const status = readTickRuntimeStatus(cwd);
+
   expect(status?.pid).toBe(process.pid);
   expect(status?.intervalSeconds).toBe(600);
   const due = Date.parse(status?.nextTickAt ?? "");
   expect(due).toBeGreaterThanOrEqual(before + 600_000);
   expect(due).toBeLessThanOrEqual(Date.now() + 600_000);
   expect(existsSync(join(cwd, TICK_STATUS_FILE))).toBe(true);
+});
+test("the external orchestrator blocks releases under the default policy and reports drift next tick", () => {
+  writeConductorConfig({ name: "fleet" });
+  writeTickConfig({ intervalSeconds: 600 });
+  const pi = fakeHost();
+  orchestratorTickExtension(pi);
+  pi.start();
+
+  expect(pi.callTool("bash", { command: "npm publish --provenance" })).toMatchObject({ block: true });
+  pi.fire();
+  expect(pi.sent[0]?.message.content).toContain("Release-policy drift today: 1");
+  expect(pi.sent[0]?.message.content).toContain("orchestrator package-publish");
+});
+
+test("the external orchestrator permits releases when operator-brief opens the gate", () => {
+  writeConductorConfig({ name: "fleet", releasePolicy: "operator-brief" });
+  writeTickConfig({ intervalSeconds: 600 });
+  const pi = fakeHost();
+  orchestratorTickExtension(pi);
+  pi.start();
+
+  expect(pi.callTool("bash", { command: "npm publish --provenance" })).toBeUndefined();
 });
 
 test("a recover tick request fires immediately on arm and clears the sentinel", () => {
@@ -787,7 +820,9 @@ test("an unconfigured accessFile leaves the channel gate open", () => {
 // re-runs `/conductor setup` while the orchestrator session lives.
 
 /** A conductor config the loader accepts, carrying the scope under test. */
-function writeConductorConfig(...projects: { name: string; scope?: ReportScope }[]): void {
+function writeConductorConfig(
+  ...projects: { name: string; scope?: ReportScope; releasePolicy?: "none" | "operator-brief" }[]
+): void {
   mkdirSync(stateDir(), { recursive: true });
   writeFileSync(
     configPath(),
@@ -798,7 +833,9 @@ function writeConductorConfig(...projects: { name: string; scope?: ReportScope }
         tracker: { kind: "github", repo: `acme/${p.name}` },
         queueLabel: "ready-for-agent",
         routing: { repos: { api: { cloneUrl: "git@github.com:acme/api.git" } } },
+        escalation: { fallbackToIssueComment: true, orchestrator: "external" },
         ...(p.scope === undefined ? {} : { reporting: { scope: p.scope } }),
+        ...(p.releasePolicy === undefined ? {} : { releasePolicy: p.releasePolicy }),
       })),
     }),
   );

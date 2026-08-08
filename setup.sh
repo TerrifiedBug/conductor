@@ -5,7 +5,8 @@
 #
 #   ./setup.sh preflight   check only, change nothing
 #   ./setup.sh install     preflight, then link or install both plugins
-#   ./setup.sh             same as install
+#   ./setup.sh install --force-link
+#                          replace an npm omp-conductor install with this checkout
 #
 # Preflight evaluates every check before it decides, so one missing tool does
 # not hide the next three. Each failure prints the command that fixes it.
@@ -14,10 +15,11 @@ set -uo pipefail
 
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
-USAGE='usage: ./setup.sh [preflight|install]
+USAGE='usage: ./setup.sh [preflight|install [--force-link]]
 
-  preflight   check only, change nothing
-  install     preflight, then link or install both plugins (default)'
+  preflight             check only, change nothing
+  install               preflight, then link or install both plugins (default)
+  install --force-link  deliberately replace an npm omp-conductor with this checkout'
 
 # Collected rather than fatal-on-first: one run should tell you everything to fix.
 HARD_FAILURES=()
@@ -81,6 +83,27 @@ has_telegram_token() {
 		[ -n "$value" ] && return 0
 	done <"$env_path"
 	return 1
+}
+
+# Exit 0 only when omp reports omp-conductor in its npm-managed package list.
+# Malformed/unreadable inventory is exit 2: callers fail closed rather than
+# silently replacing an install whose source could not be identified.
+omp_conductor_installed_from_npm() {
+	local listing
+	listing=$(omp plugin list --json 2>/dev/null) || return 2
+	OMP_PLUGIN_LIST_JSON=$listing bun -e '
+		try {
+			const inventory = JSON.parse(process.env.OMP_PLUGIN_LIST_JSON ?? "{}");
+			process.exit(
+				Array.isArray(inventory.npm) &&
+					inventory.npm.some((plugin) => plugin?.name === "omp-conductor")
+					? 0
+					: 1,
+			);
+		} catch {
+			process.exit(2);
+		}
+	'
 }
 
 preflight() {
@@ -177,17 +200,35 @@ preflight() {
 }
 
 install_plugins() {
+	local force_link=${1:-0}
 	preflight || return 1
 
 	# A checkout installs from source; anything else installs the published
 	# package. `omp/package.json` beside this script is the reliable tell.
-	local from_checkout=0
+	local from_checkout=0 preserve_npm=0 inventory_status
 	[ -f "$SCRIPT_DIR/omp/package.json" ] && from_checkout=1
+	if [ "$from_checkout" -eq 1 ] && [ "$force_link" -ne 1 ]; then
+		omp_conductor_installed_from_npm
+		inventory_status=$?
+		case $inventory_status in
+		0) preserve_npm=1 ;;
+		1) ;;
+		*)
+			printf '  FAIL  could not identify the installed omp-conductor source\n' >&2
+			printf '        refusing to replace it; repair `omp plugin list --json` or rerun with --force-link\n' >&2
+			return 1
+			;;
+		esac
+	fi
 
 	printf '\ninstall\n'
 
-	# Re-linking and reinstalling are the refresh path, so neither is guarded.
-	if [ "$from_checkout" -eq 1 ]; then
+	# A checkout normally links from source. Preserve an existing npm-managed
+	# install unless the operator explicitly chooses the mutable checkout.
+	if [ "$preserve_npm" -eq 1 ]; then
+		printf '  warn  omp-conductor is npm-managed; keeping it instead of linking %s\n' "$SCRIPT_DIR/omp"
+		printf '        use `./setup.sh install --force-link` to replace it deliberately\n'
+	elif [ "$from_checkout" -eq 1 ]; then
 		printf '  omp    linking %s\n' "$SCRIPT_DIR/omp"
 		omp plugin link "$SCRIPT_DIR/omp" || return 1
 	else
@@ -218,8 +259,29 @@ EOF
 }
 
 case ${1:-install} in
-preflight) preflight ;;
-install) install_plugins ;;
+preflight)
+	[ "$#" -eq 1 ] || {
+		printf 'preflight takes no options\n\n%s\n' "$USAGE" >&2
+		exit 2
+	}
+	preflight
+	;;
+install)
+	case ${2:-} in
+	'') install_plugins 0 ;;
+	--force-link)
+		[ "$#" -eq 2 ] || {
+			printf 'install --force-link takes no other options\n\n%s\n' "$USAGE" >&2
+			exit 2
+		}
+		install_plugins 1
+		;;
+	*)
+		printf 'unknown install option: %s\n\n%s\n' "$2" "$USAGE" >&2
+		exit 2
+		;;
+	esac
+	;;
 -h | --help | help) printf '%s\n' "$USAGE" ;;
 *)
 	printf 'unknown subcommand: %s\n\n%s\n' "$1" "$USAGE" >&2

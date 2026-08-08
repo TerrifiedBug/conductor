@@ -27,6 +27,12 @@ It checks every prerequisite before installing anything and prints the fix besid
 each failure. For a running fleet, use the update skill below rather than
 replacing live plugin files with this setup command.
 
+When this checkout finds an existing npm-managed `omp-conductor`, ordinary
+`./setup.sh install` keeps that immutable package and links only the Herdr half.
+It prints the decision instead of silently replacing npm with a mutable checkout.
+Use `./setup.sh install --force-link` only when you deliberately want the checkout
+to become omp's plugin source.
+
 Or install each half by hand. They are useful separately, and share no runtime,
 config file, or state directory:
 
@@ -49,6 +55,33 @@ pins one npm release across the Bun-global CLI, omp plugin, and Herdr plugin,
 reloads the processes, verifies twice, and restores the prior pause state. It also
 converts an old locally linked Herdr plugin to a managed pinned checkout. Tick
 arming is preserved, so an ordinary update needs no halt or new Telegram proof.
+
+### Release the npm package
+
+Releases are human-gated by a version tag, not by an npm password or OTP. The
+repository's `release.yml` uses npm trusted publishing (GitHub OIDC), reruns the
+TypeScript gates, verifies that `vX.Y.Z` matches `omp/package.json`, and publishes
+the public package with provenance.
+
+One npm owner must configure the package once at
+**npmjs.com → omp-conductor → Settings → Trusted Publisher**:
+
+- provider: GitHub Actions
+- organization or user: `TerrifiedBug`
+- repository: `conductor`
+- workflow filename: `release.yml`
+- environment: leave blank
+
+Do not add an `NPM_TOKEN` secret. After a version-bump PR is merged and green, a
+human creates and pushes the matching tag:
+
+```bash
+git tag vX.Y.Z
+git push origin vX.Y.Z
+```
+
+The workflow refuses a mismatched tag before publishing. Publishing from a local
+checkout remains intentionally outside the release path.
 
 ### Prerequisites
 

@@ -11,7 +11,8 @@
  */
 
 import { createSession, disposeSession } from "./omp.ts";
-import type { Caps, RunState } from "./types.ts";
+import type { ReleaseShape } from "./release-policy.ts";
+import type { Caps, ReleasePolicy, RunState } from "./types.ts";
 
 /** Structured evidence fields from the worker's final report. */
 const PR_URL_PATTERN = /^pr:\s*(https:\/\/github\.com\/\S+\/pull\/\d+)\s*$/im;
@@ -45,6 +46,10 @@ export interface WorkerOpts {
    * the harness to pick, which is what an unconfigured project wants.
    */
   model?: string;
+  /** Effective release/deploy gate for this session. */
+  releasePolicy?: ReleasePolicy;
+  /** Durable audit sink for rejected release/deploy calls. */
+  onReleaseBlocked?: (shape: ReleaseShape) => void;
   /**
    * Reads the effective ceiling at each turn boundary. Omitted, the configured
    * startup cap remains fixed for the run.
@@ -174,6 +179,8 @@ export async function runWorker(
     ...(o.model === undefined ? {} : { model: o.model }),
     // Prevention half of #24: structured file tools cannot leave this worktree.
     confineToCwd: true,
+    ...(o.releasePolicy === undefined ? {} : { releasePolicy: o.releasePolicy }),
+    ...(o.onReleaseBlocked === undefined ? {} : { onReleaseBlocked: o.onReleaseBlocked }),
   });
 
   // Before the first turn, not after the last: a caller that only learns the

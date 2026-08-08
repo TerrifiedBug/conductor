@@ -32,17 +32,19 @@ import {
   renderBriefTemplate,
   writeWithBackup,
 } from "./brief-upgrade.ts";
-import { configPath, resolveCaps, stateDir } from "./config.ts";
+import { configPath, resolveCaps, resolveReleasePolicy, stateDir } from "./config.ts";
 import { graphProjectPath, graphRepos } from "./graph.ts";
 import {
   CONFIG_VERSION,
   DEFAULT_AUTHORITY,
   DEFAULT_CAPS,
+  DEFAULT_RELEASE_POLICY,
   DEFAULT_REPORT_SCOPE,
   type Caps,
   type ConductorConfig,
   type OrchestratorMode,
   type ProjectConfig,
+  type ReleasePolicy,
   type ReportScope,
   type RepoTarget,
 } from "./types.ts";
@@ -71,6 +73,8 @@ export interface SetupAnswers {
   fallbackToIssueComment: boolean;
   /** How loud the supervising orchestrator session should be. */
   reportScope: ReportScope;
+  /** Mechanical gate for release/deploy-shaped tool calls. */
+  releasePolicy: ReleasePolicy;
   /**
    * Whether to render `ORCHESTRATOR.md` into the project's workspace root. Not
    * part of the config — the brief is the operator's file, and the conductor
@@ -131,6 +135,8 @@ export const SETUP_DEFAULTS = {
   defaultBranch: "main",
   /** Both authorities start with the human; the wizard asks to move each one. */
   authority: DEFAULT_AUTHORITY,
+  /** Mechanical release/deploy gate stays closed until explicitly opened. */
+  releasePolicy: DEFAULT_RELEASE_POLICY,
   /** The daemon runs its own triage session unless an operator already runs one. */
   orchestratorMode: "embedded",
 } as const;
@@ -465,6 +471,7 @@ export function buildProject(a: SetupAnswers): ProjectConfig {
       : {}),
     escalation,
     authority: { ...a.authority },
+    releasePolicy: a.releasePolicy,
     reporting: { scope: a.reportScope },
     // Both under the state dir so one `rm -rf ~/.omp/conductor` is a complete
     // uninstall, and neither can land in a repo the daemon then tries to commit.
@@ -521,6 +528,7 @@ export function defaultAnswers(projectName: string): SetupAnswers {
     caps: {},
     fallbackToIssueComment: true,
     authority: { ...SETUP_DEFAULTS.authority },
+    releasePolicy: SETUP_DEFAULTS.releasePolicy,
     orchestratorMode: SETUP_DEFAULTS.orchestratorMode,
     reportScope: DEFAULT_REPORT_SCOPE,
     writeOrchestratorBrief: false,
@@ -566,6 +574,7 @@ export function answersFromProject(p: ProjectConfig): SetupAnswers {
     caps: { ...p.caps },
     fallbackToIssueComment: p.escalation.fallbackToIssueComment,
     authority: { ...p.authority },
+    releasePolicy: resolveReleasePolicy(p),
     orchestratorMode: p.escalation.orchestrator,
     reportScope: p.reporting?.scope ?? DEFAULT_REPORT_SCOPE,
     writeOrchestratorBrief: false,
@@ -910,6 +919,7 @@ export function summarisePlan(
   lines.push(
     "",
     `authority      merge=${a.authority.merge}  release=${a.authority.release}`,
+    `tool gate      releasePolicy=${a.releasePolicy}`,
     delegated
       ? "               the brief tells that session so, and it must spell the procedure out before acting"
       : "               humans do both; workers and the conductor stop at a green PR",
@@ -1041,8 +1051,9 @@ export const AMEND_AREAS: {
   },
   authority: {
     name: "authority",
-    asks: "who lands green PRs, and who cuts releases",
-    describe: (p) => `merge=${p.authority.merge}, release=${p.authority.release}`,
+    asks: "who lands green PRs, who cuts releases, and whether release/deploy tools are mechanically open",
+    describe: (p) =>
+      `merge=${p.authority.merge}, release=${p.authority.release}, releasePolicy=${resolveReleasePolicy(p)}`,
   },
   escalation: {
     name: "escalation & triage",

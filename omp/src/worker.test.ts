@@ -36,7 +36,14 @@ function fakeHarness(opts?: {
   sessionFile?: string;
   gated?: boolean;
 }) {
-  const received: { cwd?: string; sessionDir?: string; model?: string; confineToCwd?: boolean }[] = [];
+  const received: {
+    cwd?: string;
+    sessionDir?: string;
+    model?: string;
+    confineToCwd?: boolean;
+    releasePolicy?: "none" | "operator-brief";
+    onReleaseBlocked?: (shape: never) => void;
+  }[] = [];
   const handlers = new Map<string, ((e: unknown) => void)[]>();
   const entered = Promise.withResolvers<void>();
   const gate = Promise.withResolvers<void>();
@@ -68,7 +75,7 @@ function fakeHarness(opts?: {
     started: entered.promise,
     release: () => gate.resolve(),
     deps: {
-      createSession: async (o: { cwd: string; sessionDir?: string; model?: string; confineToCwd?: boolean }) => {
+      createSession: async (o: (typeof received)[number]) => {
         received.push(o);
         return session;
       },
@@ -144,6 +151,16 @@ describe("runWorker session options", () => {
     // Prevention half of #24: without this flag the harness extension is never
     // installed and write/edit/read can leave the checkout.
     expect(harness.received[0]?.confineToCwd).toBe(true);
+  });
+
+  test("passes the effective release policy and audit sink into the worker session", async () => {
+    const harness = fakeHarness();
+    const blocked = () => {};
+
+    await runWorker(workerOpts({ releasePolicy: "none", onReleaseBlocked: blocked }), harness.deps);
+
+    expect(harness.received[0]?.releasePolicy).toBe("none");
+    expect(harness.received[0]?.onReleaseBlocked).toBe(blocked);
   });
 
   test("carries a model downgrade out on the result so the daemon can log it", async () => {
