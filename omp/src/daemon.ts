@@ -1021,9 +1021,46 @@ export async function admitCandidates(
   return admitted;
 }
 
+export interface WorkerPool {
+  launch(work: Promise<void>): void;
+  activeCount(): number;
+  drain(): Promise<void>;
+}
+
+/** Keeps background workers alive without making the five-minute tick await them. */
+export function createWorkerPool(): WorkerPool {
+  const active = new Set<Promise<void>>();
+  return {
+    launch(work) {
+      active.add(work);
+      void work.then(
+        () => active.delete(work),
+        () => active.delete(work),
+      );
+    },
+    activeCount: () => active.size,
+    async drain() {
+      await Promise.allSettled(active);
+    },
+  };
+}
+
+/** `--once` awaits workers; the resident daemon registers them for shutdown. */
+export async function dispatchAdmissions(
+  admitted: readonly Admission[],
+  run: (admission: Admission) => Promise<void>,
+  pool?: WorkerPool,
+): Promise<void> {
+  if (pool !== undefined) {
+    for (const admission of admitted) pool.launch(run(admission));
+    return;
+  }
+  await Promise.allSettled(admitted.map(run));
+}
+
 // ----------------------------------------------------------------------- a tick
 
-async function tick(d: Deps): Promise<void> {
+async function tick(d: Deps, workers?: WorkerPool): Promise<void> {
   // Before the pause check, deliberately. This one is not about dispatch: the
   // orchestrator is a different process, and it can be wedged while this fleet
   // is paused — which is exactly the state the reference fleet was in when the
@@ -1157,8 +1194,11 @@ async function tick(d: Deps): Promise<void> {
   if (admitted.length === 0) return;
 
   log(`dispatching ${admitted.map((a) => `#${a.r.issue.number}`).join(" ")}`);
-  // handleIssue never rejects; allSettled is the belt to that braces.
-  await Promise.allSettled(admitted.map((a) => handleIssue(d, a.r, a.attempt)));
+  await dispatchAdmissions(
+    admitted,
+    (a) => handleIssue(d, a.r, a.attempt),
+    workers,
+  );
 }
 
 // --------------------------------------------------------------- read-only views
@@ -1448,12 +1488,13 @@ export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
     return;
   }
 
+  const workers = createWorkerPool();
   let stopping = false;
   let wake: (() => void) | undefined;
   const stop = (): void => {
     if (stopping) return;
     stopping = true;
-    log("shutting down after the current tick");
+    log("shutting down after active workers finish");
     wake?.();
   };
   process.on("SIGINT", stop);
@@ -1482,7 +1523,7 @@ export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
   try {
     while (!stopping) {
       try {
-        await tick(d);
+        await tick(d, workers);
       } catch (err) {
         // A tick that blows up outside an issue (the tracker is down, say) must
         // not end the daemon; the next one will retry.
@@ -1501,6 +1542,7 @@ export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
   } finally {
     process.off("SIGINT", stop);
     process.off("SIGTERM", stop);
+    await workers.drain();
     await server.stop(true);
     // Before the store closes: a queued injection that rejects on the way out
     // falls back to an issue comment, and that path writes the dedup marker.

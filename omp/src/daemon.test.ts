@@ -39,6 +39,8 @@ import {
   buildBrief,
   checkIntegrity,
   checkStall,
+  createWorkerPool,
+  dispatchAdmissions,
   hasContinuationBudget,
   manifestDiff,
   markPaged,
@@ -420,6 +422,50 @@ async function captureLog<T>(fn: () => Promise<T>): Promise<{ value: T; log: str
     process.stderr.write = real;
   }
 }
+
+describe("dispatchAdmissions", () => {
+  it("returns while resident-daemon workers run, then drains them on shutdown", async () => {
+    const release = Promise.withResolvers<void>();
+    const pool = createWorkerPool();
+    let finished = false;
+
+    await dispatchAdmissions(
+      [{ r: candidate(42), attempt: 1 }],
+      async () => {
+        await release.promise;
+        finished = true;
+      },
+      pool,
+    );
+
+    expect(finished).toBe(false);
+    expect(pool.activeCount()).toBe(1);
+    let drained = false;
+    const draining = pool.drain().then(() => {
+      drained = true;
+    });
+    expect(drained).toBe(false);
+
+    release.resolve();
+    await draining;
+    expect(finished).toBe(true);
+    expect(pool.activeCount()).toBe(0);
+  });
+
+  it("keeps daemon --once waiting for its admitted workers", async () => {
+    const release = Promise.withResolvers<void>();
+    let finished = false;
+    const dispatch = dispatchAdmissions([{ r: candidate(42), attempt: 1 }], async () => {
+      await release.promise;
+      finished = true;
+    });
+
+    expect(finished).toBe(false);
+    release.resolve();
+    await dispatch;
+    expect(finished).toBe(true);
+  });
+});
 
 describe("admitCandidates", () => {
   let store!: Store;
