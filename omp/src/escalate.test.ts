@@ -117,6 +117,9 @@ function makeStore() {
     wasNotified: (key: string) => notified.has(key),
     recordDispatch: () => {},
     latestDispatch: () => undefined,
+    recordFriction: () => {},
+    pendingFriction: () => [],
+    markFrictionSurfaced: () => {},
     markNotified: (key: string) => {
       notified.add(key);
       marked.push(key);

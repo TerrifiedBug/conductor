@@ -11,10 +11,20 @@
 
 import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 
+import { stateDir } from "./config.ts";
 import { DEFAULT_CAPS } from "./types.ts";
-import type { DispatchSummary, RunRecord, RunState, Store } from "./types.ts";
+import type {
+  DispatchSummary,
+  FrictionAdmissionReason,
+  FrictionKind,
+  FrictionObservation,
+  FrictionSignal,
+  RunRecord,
+  RunState,
+  Store,
+} from "./types.ts";
 
 /**
  * States backed by a worker process. These are what worker capacity counts:
@@ -36,6 +46,24 @@ const ACTIVE_STATES: readonly RunState[] = [...LIVE_STATES, "pushed-pending", "p
 
 const LIVE_PLACEHOLDERS = LIVE_STATES.map(() => "?").join(", ");
 const ACTIVE_PLACEHOLDERS = ACTIVE_STATES.map(() => "?").join(", ");
+
+const FRICTION_HOLD_REASONS: ReadonlySet<FrictionAdmissionReason> = new Set([
+  "failed-attempts",
+  "continuations",
+  "parent-lookup-error",
+  "open-pr-lookup-error",
+  "unroutable:no-repo-label",
+  "unroutable:multiple-repo-labels",
+  "unroutable:unknown-repo",
+]);
+
+const FRICTION_ISSUE_SAMPLES = 5;
+const FRICTION_TEXT_SAMPLES = 3;
+const FRICTION_TEXT_LIMIT = 160;
+
+function isFrictionHoldReason(reason: string): reason is FrictionAdmissionReason {
+  return FRICTION_HOLD_REASONS.has(reason as FrictionAdmissionReason);
+}
 
 /**
  * Allowlist for `updateRun`'s dynamic SET clause. Column names cannot be bound
@@ -86,6 +114,22 @@ interface RunRow {
   lastError: string | null;
 }
 
+interface FrictionRollupRow {
+  project: string;
+  day: string;
+  kind: string;
+  observations: number;
+  occurrences: number;
+  issues: string;
+  samples: string;
+  latestAt: number;
+}
+
+interface FrictionSurfaceRow {
+  kind: string;
+  at: number;
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS runs (
   id          TEXT    PRIMARY KEY,
@@ -117,6 +161,27 @@ CREATE TABLE IF NOT EXISTS notifications (
 CREATE TABLE IF NOT EXISTS dispatch_summaries (
   project   TEXT PRIMARY KEY,
   summary   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS friction_rollups (
+  project       TEXT    NOT NULL,
+  day           TEXT    NOT NULL,
+  kind          TEXT    NOT NULL,
+  observations  INTEGER NOT NULL,
+  occurrences   INTEGER NOT NULL,
+  issues        TEXT    NOT NULL,
+  samples       TEXT    NOT NULL,
+  latestAt      INTEGER NOT NULL,
+  PRIMARY KEY (project, day, kind)
+);
+CREATE INDEX IF NOT EXISTS friction_rollups_project_day
+  ON friction_rollups (project, day);
+
+CREATE TABLE IF NOT EXISTS friction_surfaces (
+  project TEXT NOT NULL,
+  kind    TEXT NOT NULL,
+  at      INTEGER NOT NULL,
+  PRIMARY KEY (project, kind)
 );
 `;
 
@@ -184,6 +249,48 @@ function toDispatchSummary(text: string): DispatchSummary | undefined {
   } catch {
     return undefined;
   }
+}
+
+function parseNumberList(text: string): number[] {
+  try {
+    const value = JSON.parse(text) as unknown;
+    return Array.isArray(value)
+      ? value.filter((item): item is number => Number.isSafeInteger(item) && item > 0)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseTextList(text: string): string[] {
+  try {
+    const value = JSON.parse(text) as unknown;
+    return Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === "string" && item.length > 0)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function boundedUnique<T>(current: readonly T[], additions: readonly T[], limit: number): T[] {
+  return [...new Set([...current, ...additions])].slice(0, limit);
+}
+
+function isFrictionKind(value: string): value is FrictionKind {
+  if (value.startsWith("admission:")) {
+    return isFrictionHoldReason(value.slice("admission:".length));
+  }
+  return (
+    value === "feedback:escalation-should-digest" ||
+    value === "feedback:report-noise" ||
+    value === "feedback:report-surprise"
+  );
+}
+
+/** Single database for every project; every table partitions by project name. */
+export function dbPath(): string {
+  return join(stateDir(), "conductor.db");
 }
 
 /**
@@ -295,6 +402,72 @@ export function openStore(dbPath: string): Store {
   const selectDispatch = db.query<{ summary: string }, [string]>(
     `SELECT summary FROM dispatch_summaries WHERE project = ?`,
   );
+  const selectFrictionRollup = db.query<FrictionRollupRow, [string, string, string]>(
+    `SELECT * FROM friction_rollups WHERE project = ? AND day = ? AND kind = ?`,
+  );
+  const upsertFrictionRollup = db.query<
+    unknown,
+    [string, string, string, number, number, string, string, number]
+  >(
+    `INSERT INTO friction_rollups
+       (project, day, kind, observations, occurrences, issues, samples, latestAt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(project, day, kind) DO UPDATE SET
+       observations = excluded.observations,
+       occurrences = excluded.occurrences,
+       issues = excluded.issues,
+       samples = excluded.samples,
+       latestAt = excluded.latestAt`,
+  );
+  const selectFrictionSince = db.query<FrictionRollupRow, [string, string]>(
+    `SELECT * FROM friction_rollups
+      WHERE project = ? AND day >= ?
+      ORDER BY latestAt DESC`,
+  );
+  const selectFrictionSurfaces = db.query<FrictionSurfaceRow, [string]>(
+    `SELECT kind, at FROM friction_surfaces WHERE project = ?`,
+  );
+  const upsertFrictionSurface = db.query<unknown, [string, string, number]>(
+    `INSERT INTO friction_surfaces (project, kind, at) VALUES (?, ?, ?)
+     ON CONFLICT(project, kind) DO UPDATE SET at = excluded.at`,
+  );
+
+  const recordFriction = (project: string, observation: FrictionObservation): void => {
+    if (
+      !Number.isSafeInteger(observation.occurrences) ||
+      observation.occurrences < 1 ||
+      !Number.isSafeInteger(observation.at) ||
+      observation.at < 0
+    ) {
+      return;
+    }
+    const day = new Date(observation.at).toISOString().slice(0, 10);
+    const prior = selectFrictionRollup.get(project, day, observation.kind);
+    const issues = boundedUnique(
+      prior === null ? [] : parseNumberList(prior.issues),
+      [
+        ...(observation.issues ?? []),
+        ...(observation.issue === undefined || observation.issue <= 0 ? [] : [observation.issue]),
+      ],
+      FRICTION_ISSUE_SAMPLES,
+    );
+    const sample = observation.sample?.replace(/\s+/g, " ").trim().slice(0, FRICTION_TEXT_LIMIT);
+    const samples = boundedUnique(
+      prior === null ? [] : parseTextList(prior.samples),
+      sample === undefined || sample.length === 0 ? [] : [sample],
+      FRICTION_TEXT_SAMPLES,
+    );
+    upsertFrictionRollup.run(
+      project,
+      day,
+      observation.kind,
+      (prior?.observations ?? 0) + 1,
+      (prior?.occurrences ?? 0) + observation.occurrences,
+      JSON.stringify(issues),
+      JSON.stringify(samples),
+      Math.max(prior?.latestAt ?? 0, observation.at),
+    );
+  };
 
   return {
     createRun(r: Omit<RunRecord, "id">): RunRecord {
@@ -397,12 +570,87 @@ export function openStore(dbPath: string): Store {
     },
 
     recordDispatch(project: string, summary: DispatchSummary): void {
+      const previous = selectDispatch.get(project);
       upsertDispatch.run(project, JSON.stringify(summary));
+      if (
+        previous !== null &&
+        toDispatchSummary(previous.summary)?.completedAt === summary.completedAt
+      ) {
+        return;
+      }
+      for (const hold of summary.holds) {
+        if (!isFrictionHoldReason(hold.reason)) continue;
+        recordFriction(project, {
+          kind: `admission:${hold.reason}`,
+          occurrences: hold.count,
+          issues: hold.issues,
+          ...(hold.issues.length === 0
+            ? {}
+            : { sample: `issues ${hold.issues.map((issue) => `#${issue}`).join(", ")}` }),
+          at: summary.completedAt,
+        });
+      }
     },
 
     latestDispatch(project: string): DispatchSummary | undefined {
       const row = selectDispatch.get(project);
       return row === null ? undefined : toDispatchSummary(row.summary);
+    },
+
+    recordFriction,
+
+    pendingFriction(
+      project: string,
+      sinceEpochMs: number,
+      minimumObservations: number,
+      surfacedBeforeEpochMs: number,
+    ): FrictionSignal[] {
+      const sinceDay = new Date(sinceEpochMs).toISOString().slice(0, 10);
+      const surfaces = new Map(selectFrictionSurfaces.all(project).map((row) => [row.kind, row.at]));
+      const combined = new Map<FrictionKind, FrictionSignal>();
+      for (const row of selectFrictionSince.all(project, sinceDay)) {
+        if (
+          !isFrictionKind(row.kind) ||
+          row.latestAt < sinceEpochMs ||
+          row.observations < 1 ||
+          row.occurrences < 1
+        ) {
+          continue;
+        }
+        const prior = combined.get(row.kind);
+        combined.set(row.kind, {
+          kind: row.kind,
+          observations: (prior?.observations ?? 0) + row.observations,
+          occurrences: (prior?.occurrences ?? 0) + row.occurrences,
+          issues: boundedUnique(
+            prior?.issues ?? [],
+            parseNumberList(row.issues),
+            FRICTION_ISSUE_SAMPLES,
+          ),
+          samples: boundedUnique(
+            prior?.samples ?? [],
+            parseTextList(row.samples),
+            FRICTION_TEXT_SAMPLES,
+          ),
+          latestAt: Math.max(prior?.latestAt ?? 0, row.latestAt),
+        });
+      }
+      return [...combined.values()]
+        .filter(
+          (signal) =>
+            signal.observations >= minimumObservations &&
+            (surfaces.get(signal.kind) ?? 0) <= surfacedBeforeEpochMs,
+        )
+        .sort(
+          (a, b) =>
+            b.observations - a.observations ||
+            b.occurrences - a.occurrences ||
+            b.latestAt - a.latestAt,
+        );
+    },
+
+    markFrictionSurfaced(project: string, kinds: readonly FrictionKind[], at: number): void {
+      for (const kind of new Set(kinds)) upsertFrictionSurface.run(project, kind, at);
     },
 
     close(): void {

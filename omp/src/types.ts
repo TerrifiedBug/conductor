@@ -390,6 +390,45 @@ export interface DispatchSummary {
   holds: AdmissionHoldSummary[];
 }
 
+/** Admission holds that indicate repairable friction rather than normal flow control. */
+export type FrictionAdmissionReason =
+  | "failed-attempts"
+  | "continuations"
+  | "parent-lookup-error"
+  | "open-pr-lookup-error"
+  | "unroutable:no-repo-label"
+  | "unroutable:multiple-repo-labels"
+  | "unroutable:unknown-repo";
+
+/** A mechanically observed or explicitly classified source of repeated friction. */
+export type FrictionKind =
+  | `admission:${FrictionAdmissionReason}`
+  | "feedback:escalation-should-digest"
+  | "feedback:report-noise"
+  | "feedback:report-surprise";
+
+/** One observation persisted into the daily friction rollup. */
+export interface FrictionObservation {
+  kind: FrictionKind;
+  /** Number of affected candidates/events represented by this observation. */
+  occurrences: number;
+  issues?: number[];
+  issue?: number;
+  /** Bounded human-readable evidence, never an unbounded error or transcript. */
+  sample?: string;
+  at: number;
+}
+
+/** A repeated signal eligible for the orchestrator's Learning loop. */
+export interface FrictionSignal {
+  kind: FrictionKind;
+  observations: number;
+  occurrences: number;
+  issues: number[];
+  samples: string[];
+  latestAt: number;
+}
+
 
 /**
  * Bookkeeping only — GitHub labels remain the source of truth. The store
@@ -426,6 +465,17 @@ export interface Store {
   wasNotified(key: string): boolean;
   recordDispatch(project: string, summary: DispatchSummary): void;
   latestDispatch(project: string): DispatchSummary | undefined;
+  /** Add one bounded observation to the per-day friction rollup. */
+  recordFriction(project: string, observation: FrictionObservation): void;
+  /** Repeated signals not surfaced within the supplied cooldown window. */
+  pendingFriction(
+    project: string,
+    sinceEpochMs: number,
+    minimumObservations: number,
+    surfacedBeforeEpochMs: number,
+  ): FrictionSignal[];
+  /** Start the cooldown only after a tick carrying these signals was sent. */
+  markFrictionSurfaced(project: string, kinds: readonly FrictionKind[], at: number): void;
   markNotified(key: string): void;
   close(): void;
 }

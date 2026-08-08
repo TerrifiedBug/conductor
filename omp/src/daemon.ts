@@ -21,7 +21,7 @@ import type { OrchestratorHandle } from "./orchestrator.ts";
 import { recordReleaseBlock } from "./release-policy.ts";
 import { branchName, route } from "./routing.ts";
 import type { Routed, UnroutableReason } from "./routing.ts";
-import { openStore } from "./store.ts";
+import { dbPath, openStore } from "./store.ts";
 import { makeTracker } from "./tracker/github.ts";
 import type {
   AdmissionHoldReason,
@@ -88,10 +88,6 @@ interface Deps {
 
 // ---------------------------------------------------------------- paths & pause
 
-/** Single database for every project; the store partitions by project name. */
-export function dbPath(): string {
-  return join(stateDir(), "conductor.db");
-}
 
 // ------------------------------------------------------- orchestrator liveness
 

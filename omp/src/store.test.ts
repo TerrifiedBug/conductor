@@ -227,6 +227,74 @@ describe("openStore", () => {
     expect(store.latestDispatch(PROJECT)?.admitted).toBe(1);
   });
 
+  it("aggregates only repairable admission holds into repeated friction signals", () => {
+    const at = Date.parse("2026-08-08T12:00:00Z");
+    for (let tick = 0; tick < 3; tick += 1) {
+      store.recordDispatch(PROJECT, {
+        completedAt: at + tick * 300_000,
+        ready: 3,
+        routed: 2,
+        admitted: 0,
+        degraded: false,
+        holds: [
+          { reason: "capacity", count: 1, issues: [40] },
+          { reason: "unroutable:no-repo-label", count: 2, issues: [41, 42] },
+        ],
+      });
+    }
+    store.recordDispatch(PROJECT, {
+      completedAt: at + 600_000,
+      ready: 3,
+      routed: 2,
+      admitted: 0,
+      degraded: false,
+      holds: [
+        { reason: "capacity", count: 1, issues: [40] },
+        { reason: "unroutable:no-repo-label", count: 2, issues: [41, 42] },
+      ],
+    });
+
+    expect(store.pendingFriction(PROJECT, at - 1, 3, at)).toEqual([
+      {
+        kind: "admission:unroutable:no-repo-label",
+        observations: 3,
+        occurrences: 6,
+        issues: [41, 42],
+        samples: ["issues #41, #42"],
+        latestAt: at + 600_000,
+      },
+    ]);
+  });
+
+  it("bounds evidence and cools a surfaced signal without discarding later observations", () => {
+    const day = Date.parse("2026-08-08T00:00:00Z");
+    for (let index = 0; index < 5; index += 1) {
+      store.recordFriction(PROJECT, {
+        kind: "feedback:report-surprise",
+        occurrences: 1,
+        issue: 100 + index,
+        sample: `unexpected report ${index}`,
+        at: day + index,
+      });
+    }
+
+    const before = store.pendingFriction(PROJECT, day, 3, day);
+    expect(before).toEqual([
+      {
+        kind: "feedback:report-surprise",
+        observations: 5,
+        occurrences: 5,
+        issues: [100, 101, 102, 103, 104],
+        samples: ["unexpected report 0", "unexpected report 1", "unexpected report 2"],
+        latestAt: day + 4,
+      },
+    ]);
+
+    store.markFrictionSurfaced(PROJECT, before.map((signal) => signal.kind), day + 10);
+    expect(store.pendingFriction(PROJECT, day, 3, day + 9)).toEqual([]);
+    expect(store.pendingFriction(PROJECT, day, 3, day + 10)).toEqual(before);
+  });
+
   it("adds headSha and maxTurns to a legacy run database without losing rows", () => {
     const dir = mkdtempSync(join(tmpdir(), "conductor-store-"));
     const path = join(dir, "runs.sqlite");
