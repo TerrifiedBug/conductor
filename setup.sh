@@ -251,10 +251,11 @@ install_plugins() {
 	cat <<'EOF'
 
 next
-  1. In an omp session, run:  /conductor setup
-     It interviews you, prints a dry run, and mutates nothing until you confirm.
-  2. For a brief tailored to your project rather than the conservative floor,
-     ask an omp session to read:  skill://conductor-onboarding
+  1. For guided repo-specific setup, ask an omp session to read:
+       skill://conductor-onboarding
+  2. Or run the complete deterministic path:  /conductor setup
+     It shows every change before consent, then runs the paused host smoke.
+  3. Run the printed systemd commands, or run:  omp-conductor start
 EOF
 }
 
