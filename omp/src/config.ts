@@ -137,21 +137,20 @@ export function saveConfig(c: ConductorConfig): void {
 }
 
 /**
- * Layers a project's overrides on the global defaults, field by field, so a
- * project that pins one cap still inherits the other five. `??` not `||`: a
- * deliberate `dailySpendUsd: 0` is a hard stop, not "unset", and `null` is a
- * deliberate "no spend gate" that must not fall through to the default.
- * Spelled out per field so adding a `Caps` member fails to compile here.
+ * Layers a project's overrides on the global defaults, field by field. `??`
+ * not `||`: a deliberate `dailySpendUsd: 0` is a hard stop, and `null` is a
+ * deliberate "no spend gate". Spelled out so a new cap fails compilation here.
  */
 export function resolveCaps(p: ProjectConfig, defaults: Caps): Caps {
   const o: Partial<Caps> = p.caps ?? {};
   return {
     maxConcurrentWorkers: o.maxConcurrentWorkers ?? defaults.maxConcurrentWorkers,
-    // nullish only — `null` means off; do not coalesce it to the default.
     dailySpendUsd: o.dailySpendUsd !== undefined ? o.dailySpendUsd : defaults.dailySpendUsd,
     workerMaxTurns: o.workerMaxTurns ?? defaults.workerMaxTurns,
     workerWallClockMs: o.workerWallClockMs ?? defaults.workerWallClockMs,
     maxAttemptsPerIssue: o.maxAttemptsPerIssue ?? defaults.maxAttemptsPerIssue,
+    maxContinuationsPerIssue:
+      o.maxContinuationsPerIssue ?? defaults.maxContinuationsPerIssue,
   };
 }
 

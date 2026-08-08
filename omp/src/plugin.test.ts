@@ -404,7 +404,7 @@ test("the amend menu shows each area's current value", async () => {
   expect(menu?.labels).toEqual([
     `tracker & repos — veltrosecurity/veltro, queue "queued", "module:" → chad, vectorflow`,
     "gates — chad: ruff check . @ backend, pnpm lint @ frontend; vectorflow: pnpm lint",
-    "caps & worker model — 3 workers, 200 turns, 90m, $40/day, 1 attempts — model anthropic/claude-sonnet-4",
+    "caps & worker model — 3 workers, 200 turns, 90m, $40/day, 1 failed attempt, 2 continuations — model anthropic/claude-…",
     "code graph — not configured — workers grep",
     "authority — merge=orchestrator, release=orchestrator",
     "escalation & triage — tier 2 pages Telegram 8236653927, no comment fallback, triage external",

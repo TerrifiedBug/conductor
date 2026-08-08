@@ -39,6 +39,7 @@ import {
   buildBrief,
   checkIntegrity,
   checkStall,
+  hasContinuationBudget,
   manifestDiff,
   markPaged,
   packageManifest,
@@ -130,16 +131,15 @@ describe("reconcileOrphanedRuns", () => {
     expect(store.getRun(other.id)?.state).toBe("running");
   });
 
-  it("orphaned attempts still count toward the attempt cap", async () => {
+  it("charges orphaned runs to continuation budget, not implementation failures", async () => {
     store.createRun(draft({ issue: 9, attempt: 1, state: "running" }));
     await reconcileOrphanedRuns(store, PROJECT);
     store.createRun(draft({ issue: 9, attempt: 2, state: "running", startedAt: 2_000 }));
     await reconcileOrphanedRuns(store, PROJECT);
 
-    // A worker that keeps dying on one issue is indistinguishable from a worker
-    // that keeps failing on it: the cap must escalate it to a human rather than
-    // let a crash loop redispatch forever.
     expect(store.attemptsFor(PROJECT, 9)).toBe(2);
+    expect(store.failuresFor(PROJECT, 9)).toBe(0);
+    expect(store.continuationsFor(PROJECT, 9)).toBe(2);
   });
 
   it("salvages a dirty worktree before marking the row orphaned", async () => {
@@ -192,6 +192,15 @@ describe("reconcileOrphanedRuns", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("hasContinuationBudget", () => {
+  it("allows the configured number of resumes, then stops the loop", () => {
+    expect(hasContinuationBudget(0, 2)).toBe(true);
+    expect(hasContinuationBudget(1, 2)).toBe(true);
+    expect(hasContinuationBudget(2, 2)).toBe(true);
+    expect(hasContinuationBudget(3, 2)).toBe(false);
   });
 });
 
@@ -524,6 +533,32 @@ describe("admitCandidates", () => {
     expect(admitted).toEqual([]);
     expect(asked).toEqual([]);
     expect(escalated.map((e) => e.issue)).toEqual([600]);
+  });
+
+  it("admits operational continuations without spending the failure budget", async () => {
+    store.createRun(draft({ issue: 700, attempt: 1, state: "killed" }));
+    store.createRun(draft({ issue: 700, attempt: 2, state: "orphaned", startedAt: 2_000 }));
+    store.createRun(draft({ issue: 700, attempt: 3, state: "failed", startedAt: 3_000 }));
+    const { d } = deps(store, admissionTracker());
+
+    const admitted = await admitCandidates(d, [candidate(700)], 1);
+
+    expect(admitted).toEqual([{ r: candidate(700), attempt: 4 }]);
+    expect(store.failuresFor(PROJECT, 700)).toBe(1);
+    expect(store.continuationsFor(PROJECT, 700)).toBe(2);
+  });
+
+  it("escalates only after the independent continuation budget is exceeded", async () => {
+    store.createRun(draft({ issue: 701, attempt: 1, state: "killed" }));
+    store.createRun(draft({ issue: 701, attempt: 2, state: "orphaned", startedAt: 2_000 }));
+    store.createRun(draft({ issue: 701, attempt: 3, state: "blocked", startedAt: 3_000 }));
+    const { d, escalated } = deps(store, admissionTracker());
+
+    const admitted = await admitCandidates(d, [candidate(701)], 1);
+
+    expect(admitted).toEqual([]);
+    expect(escalated[0]?.summary).toBe("#701 exceeded its 2-continuation budget");
+    expect(store.failuresFor(PROJECT, 701)).toBe(0);
   });
 
   it("admits only the first of two ready siblings under the same epic", async () => {

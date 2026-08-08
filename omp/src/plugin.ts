@@ -571,7 +571,8 @@ const askCaps: AreaAsker = async (ctx, a) => {
     `Defaults: ${workersDefault} workers, ` +
       `${spendLabel}, ${DEFAULT_CAPS.workerMaxTurns} turns and ` +
       `${Math.round(DEFAULT_CAPS.workerWallClockMs / 60000)} min per worker, ` +
-      `${DEFAULT_CAPS.maxAttemptsPerIssue} attempts per issue.${smallHostNote} Change them?`,
+      `${DEFAULT_CAPS.maxAttemptsPerIssue} failed attempts and ` +
+      `${DEFAULT_CAPS.maxContinuationsPerIssue} operational continuations per issue.${smallHostNote} Change them?`,
   );
   if (!tuneCaps) {
     if (
@@ -603,8 +604,13 @@ const askCaps: AreaAsker = async (ctx, a) => {
   );
   caps.maxAttemptsPerIssue = await askNumber(
     ctx,
-    "Attempts per issue before it escalates",
+    "Failed implementation attempts per issue before escalation",
     caps.maxAttemptsPerIssue ?? DEFAULT_CAPS.maxAttemptsPerIssue,
+  );
+  caps.maxContinuationsPerIssue = await askNumber(
+    ctx,
+    "Operational continuations per issue before escalation",
+    caps.maxContinuationsPerIssue ?? DEFAULT_CAPS.maxContinuationsPerIssue,
   );
   return { ...a, caps };
 };

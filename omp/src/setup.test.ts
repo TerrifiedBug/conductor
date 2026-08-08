@@ -689,7 +689,7 @@ test("every amend row names the area and what it says right now", () => {
   const byId = new Map(rows.map((r) => [r.id, r.label]));
   // The reason the menu is worth reading: the value, not the noun.
   expect(byId.get("graph")).toBe("code graph — not configured — workers grep");
-  expect(byId.get("caps")).toContain("3 workers, 200 turns, 90m, $40/day, 1 attempts");
+  expect(byId.get("caps")).toContain("3 workers, 200 turns, 90m, $40/day, 1 failed attempt, 2 continuations");
   expect(byId.get("gates")).toContain("chad: ruff check . @ backend, pnpm lint @ frontend");
   expect(byId.get("authority")).toBe("authority — merge=orchestrator, release=orchestrator");
   expect(byId.get("escalation")).toContain("tier 2 pages Telegram 8236653927");

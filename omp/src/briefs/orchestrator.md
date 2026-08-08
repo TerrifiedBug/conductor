@@ -91,8 +91,9 @@ checked in this order:
 - **A PR closed without merging.** A human read the work and said no; the row says
   `failed`. Read the rejection before you touch anything — most of the time a
   review comment is a spec change. Fold what it says into the issue, then release
-  the label so the next tick can attempt it again; the attempt counter still bounds
-  it. If the answer was "this should not be built", take it off the queue instead.
+  the label so the next tick can attempt it again; the failed-attempt budget still
+  bounds repeated implementation failures. If the answer was "this should not be
+  built", take it off the queue instead.
 - **An open PR that is green.** That worker finished; it just never got to report.
   This is the "already done" case above — handle it exactly the same way. Never
   release-and-re-claim it — a fresh worker would duplicate a finished run.
@@ -106,10 +107,10 @@ checked in this order:
   pushed work lives on the remote, and unpushed commits live on the run's branch
   in the mirror, which a re-claim deliberately reattaches so the next worker
   starts from them with a **continuation brief** (read the log/diff first; do
-  not recreate existing work). Note what exists and release the label; the
-  attempt counter still bounds a loop of deaths. A turns-cap kill with attempts
-  left is re-queued automatically by the daemon — you should still notice it on
-  drain, but you do not have to invent the continuation prompt.
+  not recreate existing work). Note what exists and release the label. Cap kills,
+  daemon orphans and answered blocks consume the separate bounded continuation
+  budget rather than failed implementation attempts. A turns-cap kill with room
+  left is re-queued automatically; you do not have to invent its prompt.
 - **Genuinely nothing** (clean tree, no commits, no PR). Release the label and let
   the next tick re-claim it clean.
 
