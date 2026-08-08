@@ -28,6 +28,7 @@ import { createInterface } from "node:readline";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { findProject, loadConfig, stateDir } from "./config.ts";
+import { probeCodeGraph, type CodeGraphHealth } from "./graph-health.ts";
 import { formatDispatchSummary, isPaused, setPaused, statusSnapshot, type StatusSnapshot } from "./daemon.ts";
 import {
   healthCheck,
@@ -873,12 +874,60 @@ export function fleetLayers(projectName?: string): FleetLayers {
   };
 }
 
+function codeGraphFromHealthz(body?: string): CodeGraphHealth | undefined {
+  if (body === undefined) return undefined;
+  try {
+    const parsed = JSON.parse(body) as Record<string, unknown>;
+    const graph = parsed["codeGraph"];
+    if (graph === null || typeof graph !== "object" || Array.isArray(graph)) return undefined;
+    const value = graph as Record<string, unknown>;
+    if (value["configured"] === false) return { configured: false };
+    if (
+      value["configured"] !== true ||
+      !["healthy", "degraded", "unknown"].includes(String(value["status"])) ||
+      typeof value["checkedAt"] !== "string" ||
+      value["prerequisites"] === null ||
+      typeof value["prerequisites"] !== "object" ||
+      !Array.isArray(value["repos"]) ||
+      value["timer"] === null ||
+      typeof value["timer"] !== "object" ||
+      value["refresh"] === null ||
+      typeof value["refresh"] !== "object" ||
+      !Array.isArray(value["reasons"])
+    ) {
+      return undefined;
+    }
+    return graph as CodeGraphHealth;
+  } catch {
+    return undefined;
+  }
+}
+
+export function formatCodeGraphHealth(graph: CodeGraphHealth, now = Date.now()): string | undefined {
+  if (!graph.configured) return undefined;
+  const indexed = graph.repos.filter((repo) => repo.index === "present").length;
+  let refresh: string = graph.refresh.result;
+  if (graph.refresh.lastSuccessAt !== undefined) {
+    const ageMs = Math.max(0, now - Date.parse(graph.refresh.lastSuccessAt));
+    refresh = `${graph.refresh.lastSuccessAt} (${Math.max(1, Math.ceil(ageMs / 60_000))}m ago)`;
+  }
+  return [
+    `code graph  ${graph.status}  ${indexed}/${graph.repos.length} repos indexed`,
+    `  indexer   ${graph.prerequisites.indexer}`,
+    `  MCP mount ${graph.prerequisites.mcpMount}`,
+    `  timer     ${graph.timer.enabled} / ${graph.timer.active}`,
+    `  refresh   ${refresh}`,
+    ...graph.reasons.map((reason) => `  - ${reason}`),
+  ].join("\n");
+}
+
 export function formatFleetStatus(
   s: StatusSnapshot,
   layers: FleetLayers,
   daemonHealth?: { ok: boolean; body?: string },
   telegram: TelegramHealth = { kind: "unprobed" },
   now = Date.now(),
+  codeGraph: CodeGraphHealth = { configured: false },
 ): string {
   const tickLine =
     layers.ticksDetail === undefined
@@ -917,7 +966,7 @@ export function formatFleetStatus(
       daemonHealth === undefined
         ? "unprobed"
         : daemonHealth.ok
-          ? `ok  ${daemonHealth.body ?? ""}`.trimEnd()
+          ? "ok"
           : "unreachable — the process is up but not serving";
     const rss = rssBytesFromHealthz(daemonHealth?.body);
     daemonBlock = [
@@ -930,6 +979,7 @@ export function formatFleetStatus(
     ].join("\n");
   }
 
+  const graphBlock = formatCodeGraphHealth(codeGraph, now);
   return [
     `dispatch  ${layers.dispatch}`,
     tickLine,
@@ -938,6 +988,7 @@ export function formatFleetStatus(
     recoveryLine,
     herdrLine,
     telegramLine,
+    ...(graphBlock === undefined ? [] : [graphBlock]),
     daemonBlock,
     "",
     formatProjectBody(s),
@@ -989,12 +1040,15 @@ function formatProjectBody(s: StatusSnapshot): string {
 export async function renderStatus(projectName?: string): Promise<string> {
   const s = statusSnapshot(projectName);
   const layers = fleetLayers(projectName);
+  const project = findProject(loadConfig(), projectName);
   const rec = livingDaemon();
   const [health, telegram] = await Promise.all([
     rec === undefined ? undefined : healthCheck(rec.port),
     probeTelegramHealth(projectName),
   ]);
-  return formatFleetStatus(s, layers, health, telegram);
+  const cached = codeGraphFromHealthz(health?.body);
+  const codeGraph = cached ?? (await probeCodeGraph(project));
+  return formatFleetStatus(s, layers, health, telegram, Date.now(), codeGraph);
 }
 
 // ---------------------------------------------------------------------------

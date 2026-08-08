@@ -777,10 +777,10 @@ defined" in one call instead of twenty greps.
 
 ### Two things this package does not do for you
 
-`omp-conductor` never installs, spawns, imports or depends on the indexer — with
-`graphProject` unset, nothing about dispatch, caps or escalation changes. That
-means a fresh host needs both of these before an index is worth anything, and
-`graph-setup` reports them as step 0:
+`omp-conductor` never installs, starts, imports, or depends on the indexer for
+dispatch. With `graphProject` unset, nothing about dispatch, caps, escalation, or
+status changes. A fresh host needs both of these before an index is worth
+anything, and `graph-setup` reports them as step 0:
 
 1. **`codebase-memory-mcp` on PATH** — a separate project,
    [DeusData/codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp).
@@ -791,11 +791,11 @@ means a fresh host needs both of these before an index is worth anything, and
 
 Say yes and the wizard asks for one root, then derives one clone per routed repo
 underneath it (default `~/.cache/conductor-graph/<org>/<repo>`) and writes it to
-each repo's [`graphProject`](#configuration). Nothing else changes: this package
-never runs an indexer, never imports one, and behaves identically with the graph
-server absent — dispatch, caps and escalation do not know it exists. On a fleet
-that was configured before this key existed, `/conductor setup` and the `code
-graph` area add it in two prompts — see
+each repo's [`graphProject`](#configuration). The only automatic interaction is
+a bounded, read-only health query; this package never clones, fetches, builds an
+index, or changes systemd. Dispatch, caps and escalation do not depend on graph
+health. On a fleet configured before this key existed, `/conductor setup` and
+the `code graph` area add it in two prompts — see
 [Changing one setting](#changing-one-setting).
 
 ### Why the clone, and not your checkout or the worktree
@@ -853,6 +853,18 @@ neither usefully: the indexer resolves its store from `HOME`, systemd's default
 `PATH` has no `~/.local/bin`, and the indexer shells out to `git`. Both are the
 user that ran `graph-setup`; the unit sets no `User=`, so check them if that is
 not the account the timer runs as.
+
+### Seeing whether the graph is usable
+
+When at least one routed repo has `graphProject`, `omp-conductor status` adds a
+`code graph` block. It proves the indexer is on `PATH`, the worker MCP config
+mounts it, every configured clone exists and exactly matches an indexed
+`root_path`, the refresh timer is enabled and active, and the last service run
+succeeded within 45 minutes. A running daemon refreshes this evidence every
+minute and publishes the cached result through `/healthz`; status probes the host
+directly when that cache is unavailable. Every command is read-only, runs with a
+one-second timeout, and graph degradation never changes `/healthz.ok` or blocks
+dispatch. Unconfigured projects omit the block entirely.
 
 ## Escalation tiers
 
@@ -1268,7 +1280,7 @@ omp-conductor help
 | `start` | Start `herdr-fleet.service` when that optional unit is installed, clearing a previous pane-recovery pin, then spawn the dispatch loop in the background and wait until it answers `GET /healthz` on `:8787`. Without systemd or that unit it keeps the standalone daemon behaviour. It never clears pause or arms ticks. Refuses if a daemon is already live, naming its pid; if the process dies or never serves, it cleans up and quotes the tail of `daemon.log`. |
 | `stop` | Prefer `systemctl stop omp-conductor.service` when that unit's MainPID is the live daemon — systemd then owns the stop and will not schedule a restart for the exit it just requested. Otherwise `SIGTERM`, then `SIGKILL` after a 10-second grace period. Prints `not running` when there is nothing to stop, and tags the confirmation with `(via systemctl)` when the unit path was used. |
 | `restart` | Prefer `systemctl restart` when the unit owns the live pid so the replacement stays supervised; otherwise `stop` then `start`, inheriting the running daemon's port and project unless a flag overrides them. The new process **salvages dirty live worktrees before orphaning** those rows — see [Deploying a new package onto a busy fleet](#deploying-a-new-package-onto-a-busy-fleet). |
-| `status [--project NAME]` | Layered fleet report first: `dispatch` / `ticks` / next scheduled tick / `pane` / `recovery` / `herdr` / `telegram` / `daemon`, then the project body. The project body includes the latest completed dispatch timestamp, ready/routed/admitted counts, and bounded hold groups; API failures are marked `DEGRADED` so queue starvation cannot look idle. The next tick comes from the live heartbeat process, not a guess from log timestamps. Telegram health uses `getMe` to prove API authentication without sending a message and reports inbound bridge configuration separately. The daemon block includes `rss` from `/healthz`; live workers add a busy-deploy warning. A `.conductor-stalled` marker adds an `orchestrator STALLED since …` line. |
+| `status [--project NAME]` | Layered fleet report first: `dispatch` / `ticks` / next scheduled tick / `pane` / `recovery` / `herdr` / `telegram` / optional `code graph` / `daemon`, then the project body. The project body includes the latest completed dispatch timestamp, ready/routed/admitted counts, and bounded hold groups; API failures are marked `DEGRADED` so queue starvation cannot look idle. The next tick comes from the live heartbeat process, not a guess from log timestamps. Telegram health uses `getMe` to prove API authentication without sending a message and reports inbound bridge configuration separately. Configured graphs report prerequisites, indexed repos, timer state, and refresh freshness without blocking dispatch. The daemon block includes `rss` from `/healthz`; live workers add a busy-deploy warning. A `.conductor-stalled` marker adds an `orchestrator STALLED since …` line. |
 | `hold [--project NAME]` | Soft stop: pause claiming **and** disarm ticks. Daemon and pane stay up. Prefer this over `pause` when the intent is "stop the conductor" without killing processes. See [Stop the conductor](#stop-the-conductor-hold--halt). |
 | `halt [--pane] [--project NAME]` | `hold`, then stop the dispatch daemon (systemctl-aware). Pane stays up unless `--pane` is passed. `halt --pane` also pins herdr-conductor recovery off for the conductor agent only — it does **not** stop `herdr-fleet.service` or any other herdr session. Fail-closed: exits nonzero unless the agent is proven gone. |
 | `arm [--project NAME]` | Proof-gated: send a Telegram challenge and write the arm marker only after your reply appears as a user turn in the orchestrator transcript. Never auto-armed by `resume` / `hold`. |
@@ -1325,13 +1337,36 @@ curl -s localhost:8787/healthz
     "holds": [
       { "reason": "parent-lookup-error", "count": 8, "issues": [321, 320, 318] }
     ]
+  },
+  "codeGraph": {
+    "configured": true,
+    "status": "degraded",
+    "checkedAt": "2026-08-08T13:00:00.000Z",
+    "prerequisites": { "indexer": "present", "mcpMount": "missing" },
+    "repos": [
+      {
+        "name": "api",
+        "path": "/home/fleet/.cache/conductor-graph/acme/api",
+        "clone": "present",
+        "index": "present"
+      }
+    ],
+    "timer": { "enabled": "enabled", "active": "active" },
+    "refresh": {
+      "result": "success",
+      "fresh": true,
+      "lastSuccessAt": "2026-08-08T12:50:00.000Z",
+      "ageMs": 600000
+    },
+    "reasons": ["worker MCP configuration does not mount the indexer"]
   }
 }
 ```
 
 Any other path or method returns `404`. `ok` reports process liveness only.
-Nonfatal admission errors keep it `true` so a supervisor does not restart-loop;
-inspect `dispatch.degraded` and its bounded reason groups for queue starvation.
+Nonfatal admission errors and graph degradation keep it `true` so a supervisor
+does not restart-loop. Inspect `dispatch.degraded` and its bounded reason groups
+for queue starvation; inspect `codeGraph` for configured graph health.
 `activeRuns` counts occupied issues — live workers plus green PRs awaiting merge.
 
 ## What a worker may and may not do

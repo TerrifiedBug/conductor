@@ -14,6 +14,7 @@ import {
   deliverSignal,
   disarmTicks,
   fleetLayers,
+  formatCodeGraphHealth,
   formatFleetStatus,
   halt,
   haltWithPane,
@@ -35,6 +36,7 @@ import {
 } from "./fleet.ts";
 import { setSystemctlForTest } from "./lifecycle.ts";
 import { TICK_CONFIG_FILE, TICK_STATUS_FILE } from "./orchestrator-tick.ts";
+import type { CodeGraphHealth } from "./graph-health.ts";
 import { statusSnapshot } from "./daemon.ts";
 
 const HOME_KEY = "HOME";
@@ -873,4 +875,45 @@ test("formatFleetStatus prints daemon rss from /healthz when present", () => {
 
   const without = formatFleetStatus(s, up, { ok: true, body: JSON.stringify({ ok: true }) });
   expect(without).not.toContain("rss");
+});
+
+test("configured code-graph status is concise and names degraded evidence", () => {
+  const graph: CodeGraphHealth = {
+    configured: true,
+    status: "degraded",
+    checkedAt: "2026-08-08T08:20:00.000Z",
+    prerequisites: { indexer: "present", mcpMount: "missing" },
+    repos: [
+      { name: "api", path: "/srv/graph/api", clone: "present", index: "present" },
+      { name: "web", path: "/srv/graph/web", clone: "missing", index: "missing" },
+    ],
+    timer: { enabled: "enabled", active: "active" },
+    refresh: {
+      result: "success",
+      fresh: true,
+      lastSuccessAt: "2026-08-08T08:10:00.000Z",
+      ageMs: 600_000,
+    },
+    reasons: ["worker MCP configuration does not mount the indexer", "web: configured clone is missing"],
+  };
+
+  const text = formatCodeGraphHealth(graph, Date.parse("2026-08-08T08:20:00.000Z"));
+  expect(text).toContain("code graph  degraded  1/2 repos indexed");
+  expect(text).toContain("timer     enabled / active");
+  expect(text).toContain("2026-08-08T08:10:00.000Z (10m ago)");
+  writeMinimalConfig();
+  const layers = fleetLayers();
+  const status = formatFleetStatus(
+    statusSnapshot(),
+    { ...layers, daemon: { running: true, pid: 4242, port: 7432 } },
+    { ok: true, body: JSON.stringify({ ok: true, codeGraph: graph }) },
+    { kind: "unprobed" },
+    Date.parse("2026-08-08T08:20:00.000Z"),
+    graph,
+  );
+  expect(status).toContain("code graph  degraded  1/2 repos indexed");
+  expect(status).toContain("healthz   ok");
+  expect(status).not.toContain('"codeGraph"');
+  expect(text).toContain("web: configured clone is missing");
+  expect(formatCodeGraphHealth({ configured: false })).toBeUndefined();
 });

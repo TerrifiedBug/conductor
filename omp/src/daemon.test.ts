@@ -58,6 +58,7 @@ import {
   verifyPushedGreenClaim,
 } from "./daemon.ts";
 import type { IntegrityGate, StallGate } from "./daemon.ts";
+import type { CodeGraphHealth } from "./graph-health.ts";
 import type { Routed } from "./routing.ts";
 import { openStore } from "./store.ts";
 import { DEFAULT_AUTHORITY, DEFAULT_CAPS } from "./types.ts";
@@ -626,15 +627,27 @@ describe("summarizeDispatch", () => {
       3_000,
     );
     store.recordDispatch(PROJECT, dispatch);
+    const codeGraph: CodeGraphHealth = {
+      configured: true,
+      status: "degraded",
+      checkedAt: "2026-08-08T12:00:00.000Z",
+      prerequisites: { indexer: "missing", mcpMount: "present" },
+      repos: [{ name: "api", path: "/srv/graph/api", clone: "present", index: "unknown" }],
+      timer: { enabled: "enabled", active: "active" },
+      refresh: { result: "success", fresh: true },
+      reasons: ["indexer is not present on PATH"],
+    };
 
-    expect(daemonHealthSnapshot(store, PROJECT, false, 123)).toEqual({
+    expect(daemonHealthSnapshot(store, PROJECT, false, 123, codeGraph)).toEqual({
       ok: true,
       paused: false,
       activeRuns: 0,
       project: PROJECT,
       rssBytes: 123,
       dispatch,
+      codeGraph,
     });
+    expect(daemonHealthSnapshot(store, PROJECT, false, 123, { configured: false })).not.toHaveProperty("codeGraph");
     store.close();
   });
 });
