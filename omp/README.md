@@ -703,7 +703,7 @@ rest. `0` is a real value (a hard stop), not "unset".
 | --- | --- | --- |
 | `maxConcurrentWorkers` | `2` (setup may write `1` on &lt;16 GiB hosts) | Parallel in-process omp sessions inside the daemon PID. Two, because **CI runner slots, not model tokens, are the usual throughput ceiling** — a third worker would starve its own PR checks on a small self-hosted runner pool. On hosts under ~16 GiB RAM, prefer `1` so the unit stays out of swap ([host sizing](#host-sizing-and-memory)). Raise it only if you actually have the runners *and* the RAM. |
 | `dailySpendUsd` | `25` | Rolling-day spend ceiling in USD, or `null` for no spend gate. `0` is a hard stop. Metered from assistant `usage.cost.total`. |
-| `workerMaxTurns` | `120` | Turn ceiling for one worker. Catches a session looping without converging. |
+| `workerMaxTurns` | `120` | Startup ceiling for each new worker. Catches a session looping without converging; use `omp-conductor extend` to raise one live run without changing this default. |
 | `workerWallClockMs` | `5400000` (90 minutes) | Wall-clock ceiling for one worker. A session that is merely stuck spends no turns, so turns alone cannot detect it. |
 | `maxAttemptsPerIssue` | `2` | Failed implementation or CI attempts before escalation. Operational stops do not consume this budget, so salvage can continue without stealing the retry needed for a real failure. |
 | `maxContinuationsPerIssue` | `2` | Cap-kill, daemon-orphan and answered-block resumes before escalation. This independently bounds crash/resume loops. |
@@ -716,8 +716,15 @@ pages at Tier 2**: a loop that is burning money has to halt itself, because
 waiting for someone to notice tomorrow is how a runaway becomes expensive.
 Work resumes only after `omp-conductor resume` (or `/conductor resume`).
 
-`workerMaxTurns` and `workerWallClockMs` are enforced inside the session driver: the
-run is aborted, recorded as `killed`, and the escalation names which ceiling fired.
+`workerMaxTurns` and `workerWallClockMs` are enforced inside the session driver.
+The daemon reads a live run's effective turn ceiling at every turn boundary. Use
+`omp-conductor extend <issue> --turns N [--project NAME]` to raise it without
+restarting or reconstructing the session. Extension is monotonic: equal or lower
+values are refused, as are runs whose live controller has already settled. The
+effective value is persisted and shown beside that active run in `status`; editing
+`config.json` changes defaults for future daemon starts, not workers already in
+flight. A cap that fires aborts the run, records it as `killed`, and names the
+ceiling in the escalation.
 
 ## Worker model
 
@@ -1224,6 +1231,7 @@ omp-conductor arm [--project NAME]
 omp-conductor disarm [--project NAME]
 omp-conductor release-pane [--project NAME]
 omp-conductor tail <issue> [--project NAME]
+omp-conductor extend <issue> --turns N [--project NAME]
 omp-conductor unblock <issue> [--project NAME]
 omp-conductor daemon [--once] [--port N] [--project NAME]
 omp-conductor pause
@@ -1245,6 +1253,7 @@ omp-conductor help
 | `disarm [--project NAME]` | Remove the arm marker so ticks skip. Processes untouched. |
 | `release-pane [--project NAME]` | Clear the `halt --pane` recovery pin so herdr-conductor may resume the fleet agent again. |
 | `tail <issue>` | Follow the newest run for that issue: the worker's assistant text as `assistant: …` and each tool it calls as `tool: <name>`, printed as they land. Workers are omp sessions inside the daemon rather than terminals, so this is the only way to watch one live — a herdr pane running it becomes an observation window. Starts from the top of the transcript, not the end, so attaching to a run that is already ten turns in shows those ten turns. Exits `1` with `no run recorded for #N` when the issue has never been dispatched, or `no transcript yet (state: …)` when the attempt has not opened one. Otherwise it runs until `Ctrl-C`, or until the run has finished and its transcript has been silent for five seconds, and prints `run ended: <state>`. |
+| `extend <issue> --turns N [--project NAME]` | Monotonically raise that live worker's effective turn ceiling through its owning daemon. The current omp session keeps running; no restart or continuation is created. The daemon persists the new ceiling for `status` and rejects missing, settled, cap-killed, equal, or lower requests instead of implying that an immutable session changed. |
 | `unblock <issue>` | Remove that issue's `blocked` and `failed` labels so an answered escalation can be claimed again. `agent:in-progress` is never touched. Run history remains intact: blocks consume the independent continuation budget, not failed implementation attempts. The output reports both budgets and warns when either will make the next tick escalate instead of dispatch. Exits `2` when the issue number is missing or malformed. |
 | `daemon` | Run the loop in the **foreground**, ticking every 5 minutes and serving `/healthz`. Admitted workers run in a tracked background pool, so settlement and capacity checks remain periodic while they work; shutdown drains the pool before closing the store. This is what `start` launches and what a systemd unit should call. |
 | `daemon --once` | Run a single tick, wait for workers admitted by that tick, and exit. No HTTP server or pidfile — a drill must not register itself as the daemon, or the next reader believes it and the real daemon's in-flight runs get reconciled as orphans. |

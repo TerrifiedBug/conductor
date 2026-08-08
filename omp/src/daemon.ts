@@ -75,6 +75,7 @@ interface Deps {
   tracker: Tracker;
   store: Store;
   escalate(e: Escalation): Promise<void>;
+  turnLimits: TurnLimitRegistry;
   integrity: IntegrityGate;
   stall: StallGate;
 }
@@ -509,6 +510,59 @@ export function hasContinuationBudget(stops: number, maxContinuations: number): 
   return stops <= maxContinuations;
 }
 
+export type ExtendTurnLimitResult =
+  | { kind: "extended"; runId: string; maxTurns: number }
+  | { kind: "not-increase"; runId: string; maxTurns: number }
+  | { kind: "not-active" };
+
+export interface TurnLimitController {
+  maxTurns(): number;
+  close(): void;
+}
+
+export interface TurnLimitRegistry {
+  open(project: string, issue: number, runId: string, maxTurns: number): TurnLimitController;
+  extend(project: string, issue: number, maxTurns: number): ExtendTurnLimitResult;
+}
+
+/**
+ * Authoritative live-run turn controls. Persistence happens synchronously
+ * before the in-memory ceiling changes, so no turn event can interleave.
+ */
+export function createTurnLimitRegistry(
+  persist: (runId: string, maxTurns: number) => void,
+): TurnLimitRegistry {
+  const active = new Map<string, { runId: string; maxTurns: number }>();
+  const key = (project: string, issue: number): string => `${project}\0${issue}`;
+  return {
+    open(project, issue, runId, maxTurns) {
+      const k = key(project, issue);
+      if (active.has(k)) throw new Error(`#${issue} already has a live turn controller`);
+      const entry = { runId, maxTurns };
+      active.set(k, entry);
+      return {
+        maxTurns: () => entry.maxTurns,
+        close: () => {
+          if (active.get(k) === entry) active.delete(k);
+        },
+      };
+    },
+    extend(project, issue, maxTurns) {
+      if (!Number.isSafeInteger(maxTurns) || maxTurns < 1) {
+        throw new RangeError(`turn ceiling must be a positive integer, got ${maxTurns}`);
+      }
+      const entry = active.get(key(project, issue));
+      if (entry === undefined) return { kind: "not-active" };
+      if (maxTurns <= entry.maxTurns) {
+        return { kind: "not-increase", runId: entry.runId, maxTurns: entry.maxTurns };
+      }
+      persist(entry.runId, maxTurns);
+      entry.maxTurns = maxTurns;
+      return { kind: "extended", runId: entry.runId, maxTurns };
+    },
+  };
+}
+
 export async function verifyPushedGreenClaim(
   tracker: Pick<Tracker, "verifyPr">,
   claim: Pick<WorkerResult, "prUrl" | "headSha">,
@@ -546,6 +600,7 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
   // mid-dispatch is one of the non-graceful ends whose uncommitted work has to
   // be salvaged too, and it is the path least likely to have committed first.
   let worktreePath: string | undefined;
+  let turnLimit: TurnLimitController | undefined;
 
   try {
     // Claim on the tracker FIRST, before any local work. The label — not the
@@ -565,9 +620,11 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
       attempt,
       turns: 0,
       spendUsd: 0,
+      maxTurns: caps.workerMaxTurns,
       startedAt: Date.now(),
     });
     const runId = run.id;
+    turnLimit = d.turnLimits.open(project.name, issue, runId, caps.workerMaxTurns);
 
     // A run's tree is <workspaceRoot>/<issue> and addWorktree refuses to reuse
     // an existing path, so a retry — or a tree kept from a failed attempt — has
@@ -598,23 +655,36 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
         (provisioned.reattached ? " (continuation: reattached existing branch)" : ""),
     );
 
-    const result = await runWorker({
-      brief: await buildBrief(project, r, branch, worktreePath, {
-        continuation: provisioned.reattached,
-        defaultBranch: r.repo.defaultBranch,
-      }),
-      cwd: worktreePath,
-      caps,
-      sessionDir,
-      ...(project.workerModel === undefined ? {} : { model: project.workerModel }),
-      onTurn: (n) => store.updateRun(runId, { turns: n }),
-      onSpend: (usd) => store.updateRun(runId, { spendUsd: usd }),
-      // Recorded the moment the session opens its transcript, not when the run
-      // ends: `omp-conductor tail` resolves an issue to a file through this row,
-      // and a path written at completion is a path nobody can follow live. The
-      // completion-time update below writes the same value again, harmlessly.
-      onSessionFile: (f) => store.updateRun(runId, { sessionFile: f }),
-    });
+    let result: WorkerResult;
+    try {
+      result = await runWorker({
+        brief: await buildBrief(project, r, branch, worktreePath, {
+          continuation: provisioned.reattached,
+          defaultBranch: r.repo.defaultBranch,
+        }),
+        cwd: worktreePath,
+        caps,
+        maxTurns: () => turnLimit?.maxTurns() ?? caps.workerMaxTurns,
+        sessionDir,
+        ...(project.workerModel === undefined ? {} : { model: project.workerModel }),
+        onTurn: (n) => store.updateRun(runId, { turns: n }),
+        onSpend: (usd) => store.updateRun(runId, { spendUsd: usd }),
+        onKilled: () => {
+          turnLimit?.close();
+          turnLimit = undefined;
+        },
+        // Recorded the moment the session opens its transcript, not when the run
+        // ends: `omp-conductor tail` resolves an issue to a file through this row,
+        // and a path written at completion is a path nobody can follow live. The
+        // completion-time update below writes the same value again, harmlessly.
+        onSessionFile: (f) => store.updateRun(runId, { sessionFile: f }),
+      });
+    } finally {
+      // This is the authoritative settlement edge for `extend`: close before
+      // PR verification or terminal row writes can leave stale `running` state.
+      turnLimit?.close();
+      turnLimit = undefined;
+    }
 
     // A configured model the harness could not honour means this run was done by
     // a different model than the operator chose. Logged per run, because it is
@@ -754,6 +824,8 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
     });
     // The worktree, if one was created, is deliberately left in place: this is
     // a failure path, and whatever it still held is now a commit on the branch.
+  } finally {
+    turnLimit?.close();
   }
 }
 
@@ -1310,6 +1382,67 @@ export function daemonHealthSnapshot(
   };
 }
 
+export async function turnLimitResponse(
+  req: Request,
+  project: string,
+  store: Pick<Store, "latestRun">,
+  registry: TurnLimitRegistry,
+): Promise<Response | undefined> {
+  const url = new URL(req.url);
+  const match = /^\/runs\/(\d+)\/turn-limit$/.exec(url.pathname);
+  if (req.method !== "PUT" || match === null) return undefined;
+  if (!req.headers.get("content-type")?.startsWith("application/json")) {
+    return Response.json({ error: "content-type must be application/json" }, { status: 415 });
+  }
+
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return Response.json({ error: "request body must be valid JSON" }, { status: 400 });
+  }
+  if (body === null || typeof body !== "object") {
+    return Response.json({ error: "request body must be a JSON object" }, { status: 400 });
+  }
+  const requestedProject = Reflect.get(body, "project");
+  if (typeof requestedProject !== "string" || requestedProject.length === 0) {
+    return Response.json({ error: "project must be a non-empty string" }, { status: 400 });
+  }
+  if (requestedProject !== project) {
+    return Response.json(
+      { error: `daemon serves project "${project}", not requested project "${requestedProject}"` },
+      { status: 409 },
+    );
+  }
+  const maxTurns = Reflect.get(body, "maxTurns");
+  if (!Number.isSafeInteger(maxTurns) || (maxTurns as number) < 1) {
+    return Response.json({ error: "maxTurns must be a positive integer" }, { status: 400 });
+  }
+
+  const issue = Number(match[1]);
+  const outcome = registry.extend(project, issue, maxTurns as number);
+  if (outcome.kind === "extended") return Response.json(outcome);
+  if (outcome.kind === "not-increase") {
+    return Response.json(
+      { error: `#${issue} already has a ${outcome.maxTurns}-turn ceiling` },
+      { status: 409 },
+    );
+  }
+
+  const latest = store.latestRun(project, issue);
+  if (latest === undefined) {
+    return Response.json({ error: `no run recorded for #${issue}` }, { status: 404 });
+  }
+  return Response.json(
+    {
+      error:
+        `#${issue} has no live worker controller; its session already settled ` +
+        `or belongs to another daemon (stored state: ${latest.state})`,
+    },
+    { status: 409 },
+  );
+}
+
 export interface StatusSnapshot {
   project: string;
   configPath: string;
@@ -1386,7 +1519,7 @@ export function formatStatus(s: StatusSnapshot): string {
     s.caps.dailySpendUsd === null
       ? `  spend today        $${s.spendTodayUsd.toFixed(2)} (no daily cap)`
       : `  spend today        $${s.spendTodayUsd.toFixed(2)} / $${s.caps.dailySpendUsd.toFixed(2)}`,
-    `  worker max turns   ${s.caps.workerMaxTurns}`,
+    `  new worker turns   ${s.caps.workerMaxTurns}`,
     `  worker wall clock  ${Math.round(s.caps.workerWallClockMs / 60_000)}m`,
     `  failed attempts    ${s.caps.maxAttemptsPerIssue}`,
     `  continuations      ${s.caps.maxContinuationsPerIssue}`,
@@ -1401,7 +1534,7 @@ export function formatStatus(s: StatusSnapshot): string {
     for (const r of s.activeRuns) {
       lines.push(
         `  #${r.issue}  ${r.repo}  ${r.state}  attempt ${r.attempt}  ` +
-          `${r.turns} turns  $${r.spendUsd.toFixed(2)}  ${r.branch}` +
+          `${r.turns}/${r.maxTurns} turns  $${r.spendUsd.toFixed(2)}  ${r.branch}` +
           (r.prUrl ? `  ${r.prUrl}` : ""),
       );
     }
@@ -1600,12 +1733,16 @@ export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
   }
 
   const escalator = createEscalator(project, tracker, store, orchestrator);
+  const turnLimits = createTurnLimitRegistry((runId, maxTurns) => {
+    store.updateRun(runId, { maxTurns });
+  });
   const d: Deps = {
     project,
     caps,
     tracker,
     store,
     escalate: (e) => escalator.escalate(e),
+    turnLimits,
     integrity,
     // Fresh per daemon run, like the integrity gate: a restart is entitled to
     // page again about a stall that is still on disk.
@@ -1635,13 +1772,15 @@ export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
   process.on("SIGTERM", stop);
 
   const server = Bun.serve({
+    hostname: "127.0.0.1",
     port: o.port ?? DEFAULT_PORT,
-    fetch(req) {
+    async fetch(req) {
       const url = new URL(req.url);
       if (req.method === "GET" && url.pathname === "/healthz") {
         return Response.json(daemonHealthSnapshot(store, project.name));
       }
-      return new Response("not found\n", { status: 404 });
+      const control = await turnLimitResponse(req, project.name, store, turnLimits);
+      return control ?? new Response("not found\n", { status: 404 });
     },
   });
   log(`serving /healthz on :${server.port}, project ${project.name}`);

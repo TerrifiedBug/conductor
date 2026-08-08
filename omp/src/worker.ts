@@ -45,6 +45,13 @@ export interface WorkerOpts {
    * the harness to pick, which is what an unconfigured project wants.
    */
   model?: string;
+  /**
+   * Reads the effective ceiling at each turn boundary. Omitted, the configured
+   * startup cap remains fixed for the run.
+   */
+  maxTurns?: () => number;
+  /** Synchronous cap latch; called before the session abort begins. */
+  onKilled?: (by: KilledBy) => void;
   onTurn?: (n: number) => void;
   /** Cumulative USD spend, reported as each cost-bearing message finishes. */
   onSpend?: (usd: number) => void;
@@ -158,8 +165,8 @@ export async function runWorker(
   o: WorkerOpts,
   deps: RunWorkerDeps = { createSession },
 ): Promise<WorkerResult> {
-  // Read the caps once, by value: `o.caps` belongs to the caller's config.
-  const { workerMaxTurns, workerWallClockMs } = o.caps;
+  const { workerWallClockMs } = o.caps;
+  const maxTurns = o.maxTurns ?? (() => o.caps.workerMaxTurns);
 
   const session = await deps.createSession({
     cwd: o.cwd,
@@ -208,6 +215,7 @@ export async function runWorker(
   const kill = (by: KilledBy) => {
     if (killedBy !== undefined) return;
     killedBy = by;
+    o.onKilled?.(by);
     clearWallClock();
     session.abort();
     // An aborted session may never reach a terminal `agent_end`. The cap is the
@@ -221,7 +229,7 @@ export async function runWorker(
     // `message_end`s and would burn the cap on a run that is behaving.
     turns += 1;
     o.onTurn?.(turns);
-    if (turns > workerMaxTurns) kill("turns");
+    if (turns > maxTurns()) kill("turns");
   });
 
   session.on("message_end", (event) => {

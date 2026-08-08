@@ -956,7 +956,7 @@ function formatProjectBody(s: StatusSnapshot): string {
     s.caps.dailySpendUsd === null
       ? `  spend today        $${s.spendTodayUsd.toFixed(2)} (no daily cap)`
       : `  spend today        $${s.spendTodayUsd.toFixed(2)} / $${s.caps.dailySpendUsd.toFixed(2)}`,
-    `  worker max turns   ${s.caps.workerMaxTurns}`,
+    `  new worker turns   ${s.caps.workerMaxTurns}`,
     `  worker wall clock  ${Math.round(s.caps.workerWallClockMs / 60_000)}m`,
     `  failed attempts    ${s.caps.maxAttemptsPerIssue}`,
     `  continuations      ${s.caps.maxContinuationsPerIssue}`,
@@ -971,7 +971,7 @@ function formatProjectBody(s: StatusSnapshot): string {
     for (const r of s.activeRuns) {
       lines.push(
         `  #${r.issue}  ${r.repo}  ${r.state}  attempt ${r.attempt}  ` +
-          `${r.turns} turns  $${r.spendUsd.toFixed(2)}  ${r.branch}` +
+          `${r.turns}/${r.maxTurns} turns  $${r.spendUsd.toFixed(2)}  ${r.branch}` +
           (r.prUrl ? `  ${r.prUrl}` : ""),
       );
     }

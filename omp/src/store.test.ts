@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { openStore } from "./store.ts";
+import { DEFAULT_CAPS } from "./types.ts";
 import type { DispatchSummary, RunRecord, Store } from "./types.ts";
 
 const PROJECT = "demo";
@@ -20,6 +21,7 @@ function draft(over: Partial<Omit<RunRecord, "id">> = {}): Omit<RunRecord, "id">
     state: "running",
     attempt: 1,
     turns: 0,
+    maxTurns: DEFAULT_CAPS.workerMaxTurns,
     spendUsd: 0,
     startedAt: 1_000,
     ...over,
@@ -139,6 +141,7 @@ describe("openStore", () => {
     });
   });
 
+
   it("sums spend at or after the bound and returns 0 when empty", () => {
     expect(store.spendSince(PROJECT, 0)).toBe(0);
 
@@ -187,7 +190,7 @@ describe("openStore", () => {
     expect(store.latestDispatch(PROJECT)?.admitted).toBe(1);
   });
 
-  it("adds headSha to a pre-0.3.19 run database without losing rows", () => {
+  it("adds headSha and maxTurns to a legacy run database without losing rows", () => {
     const dir = mkdtempSync(join(tmpdir(), "conductor-store-"));
     const path = join(dir, "runs.sqlite");
     const legacy = new Database(path);
@@ -200,9 +203,22 @@ describe("openStore", () => {
         startedAt INTEGER NOT NULL, endedAt INTEGER, lastError TEXT
       );
     `);
+    legacy
+      .query(
+        `INSERT INTO runs
+         (id, project, issue, repo, branch, worktree, state, attempt, turns,
+          spendUsd, startedAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run("legacy", PROJECT, 7, "api", "feat/legacy", "/tmp/legacy", "running", 1, 40, 2, 1_000);
     legacy.close();
 
     const migrated = openStore(path);
+    expect(migrated.getRun("legacy")).toMatchObject({
+      issue: 7,
+      turns: 40,
+      maxTurns: DEFAULT_CAPS.workerMaxTurns,
+    });
     const created = migrated.createRun(draft({ headSha: "a".repeat(40) }));
     expect(migrated.getRun(created.id)?.headSha).toBe("a".repeat(40));
     migrated.close();
