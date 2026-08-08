@@ -316,9 +316,16 @@ omp-conductor brief-upgrade --retrofit --apply
 ```
 
 - **Overlay already active** (`POLICY.md` present): protocol updates need no brief-upgrade.
-- **Legacy bannered brief**: `--migrate` lifts the owned half into `POLICY.md` and recomposes, with backups.
+- **Legacy bannered brief**: `--migrate` lifts the owned half into `POLICY.md`
+  and recomposes. Previous brief and policy versions go to
+  `$OMP_CONDUCTOR_HOME/backups/briefs/` (default
+  `~/.omp/conductor/backups/briefs/`), named with their source filename and
+  timestamp.
 - **Hand-written brief** (no banner): `--retrofit` inserts the banner before the first Releases / Project context / Reporting / Amendments heading; then `--migrate`.
 - **Legacy `--apply`**: still merges a bannered single-file brief when you need the old path.
+- **Existing sidecars**: a composed refresh relocates conductor-generated
+  `ORCHESTRATOR.md.bak-<timestamp>` and `POLICY.md.bak-<timestamp>` files into
+  that backup directory. Other `.bak` files stay untouched.
 
 `--file PATH` checks a brief that is not where the wizard would have put it.
 
@@ -907,7 +914,8 @@ The config lives at `$OMP_CONDUCTOR_HOME/config.json`, or
 `~/.omp/conductor/config.json` when that variable is unset. It is written with mode
 `0600` in a directory created `0700`, because it carries chat ids and clone URLs.
 That same directory holds the SQLite store (`conductor.db`), the `paused` sentinel,
-the `sessions/` worker transcripts, the `orchestrator/` session directory, and
+the `sessions/` worker transcripts, the `orchestrator/` session directory,
+`backups/briefs/` for timestamped brief and policy safety copies, and
 `release-policy-blocks.jsonl`, the append-only audit of mechanically rejected
 release/deploy calls.
 

@@ -29,8 +29,8 @@ import {
   POLICY_BRIEF_NAME,
   composeOrchestrator,
   policyPathForRoot,
+  refreshComposedBrief,
   renderBriefTemplate,
-  writeWithBackup,
 } from "./brief-upgrade.ts";
 import { configPath, resolveCaps, resolveReleasePolicy, stateDir } from "./config.ts";
 import { graphProjectPath, graphRepos } from "./graph.ts";
@@ -692,24 +692,15 @@ export function writeOrchestratorBrief(a: SetupAnswers): string {
  * Returns false when POLICY.md is missing (caller should migrate or set up).
  */
 export function refreshComposedBriefForProject(p: ProjectConfig): boolean {
-  const policyPath = policyPathForProject(p);
-  if (!existsSync(policyPath)) return false;
-  const orchestratorPath = briefPathForProject(p);
-  mkdirSync(dirname(orchestratorPath), { recursive: true });
-  writeFileSync(
-    orchestratorPath,
-    composeOrchestrator(renderFloorForProject(p), readFileSync(policyPath, "utf8")),
-  );
-  return true;
+  return refreshComposedBrief({
+    policyPath: policyPathForProject(p),
+    orchestratorPath: briefPathForProject(p),
+    floor: renderFloorForProject(p),
+  });
 }
 
 /** @internal test helper — expose compose banner for assertions. */
 export const BRIEF_COMPOSE_BANNER = COMPOSE_BANNER;
-
-/** Backup-aware POLICY write used by migrate paths that already computed text. */
-export function writePolicyFile(path: string, content: string): string | undefined {
-  return writeWithBackup(path, content);
-}
 
 /**
  * What can be told about an omp-telegram install without opening a socket.

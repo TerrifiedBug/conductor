@@ -10,8 +10,20 @@
  * banner can `retrofit` one at a classified cut before migrating.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
+import {
+  constants,
+  copyFileSync,
+  existsSync,
+  linkSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, join } from "node:path";
+import { stateDir } from "./config.ts";
 
 /**
  * The line that divides the two halves. Matched on this substring rather than
@@ -355,28 +367,84 @@ export function shippedDiff(before: string, after: string): string {
   return lines.join("\n");
 }
 
-/**
- * Writes content, leaving the previous file beside it when one existed.
- */
-export function writeWithBackup(path: string, content: string): string | undefined {
-  mkdirSync(dirname(path), { recursive: true });
-  let backup: string | undefined;
-  if (existsSync(path)) {
-    backup = `${path}.bak-${new Date().toISOString().replace(/[:.]/g, "-")}`;
-    writeFileSync(backup, readFileSync(path));
+/** Dedicated state-root directory for conductor-managed brief backups. */
+export function briefBackupDir(): string {
+  return join(stateDir(), "backups", "briefs");
+}
+
+function backupTimestamp(): string {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+function copyToUniqueBackup(source: string, backupRoot: string, stem: string): string {
+  mkdirSync(backupRoot, { recursive: true });
+  const temporary = join(backupRoot, `.${stem}.${process.pid}.${randomUUID()}.tmp`);
+  copyFileSync(source, temporary, constants.COPYFILE_EXCL);
+  try {
+    for (let suffix = 0; ; suffix += 1) {
+      const destination = join(backupRoot, suffix === 0 ? stem : `${stem}-${suffix}`);
+      try {
+        // Linking a complete temp file publishes the backup atomically without
+        // overwriting a backup created concurrently at the same millisecond.
+        linkSync(temporary, destination);
+        return destination;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "EEXIST") continue;
+        throw err;
+      }
+    }
+  } finally {
+    unlinkSync(temporary);
   }
+}
+
+/**
+ * Moves only conductor's timestamp-shaped legacy sidecar backups into state.
+ * Unknown `.bak` files remain operator-owned. Copy-before-unlink also works
+ * when the workspace and state root are on different filesystems.
+ */
+export function migrateLegacyBriefBackups(paths: readonly string[], backupRoot = briefBackupDir()): string[] {
+  const migrated: string[] = [];
+  for (const path of paths) {
+    const name = basename(path);
+    const pattern = new RegExp(
+      `^${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.bak-\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}-\\d{3}Z$`,
+    );
+    if (!existsSync(dirname(path))) continue;
+    for (const entry of readdirSync(dirname(path), { withFileTypes: true })) {
+      if (!entry.isFile() || !pattern.test(entry.name)) continue;
+      const source = join(dirname(path), entry.name);
+      const destination = copyToUniqueBackup(source, backupRoot, entry.name);
+      unlinkSync(source);
+      migrated.push(destination);
+    }
+  }
+  return migrated;
+}
+
+/** Writes content and stores any previous file under conductor state. */
+export function writeWithBackup(
+  path: string,
+  content: string,
+  backupRoot = briefBackupDir(),
+): string | undefined {
+  mkdirSync(dirname(path), { recursive: true });
+  migrateLegacyBriefBackups([path], backupRoot);
+  const backup = existsSync(path)
+    ? copyToUniqueBackup(path, backupRoot, `${basename(path)}.bak-${backupTimestamp()}`)
+    : undefined;
   writeFileSync(path, content);
   return backup;
 }
 
 /**
- * Writes the merged brief, leaving the previous one beside it.
+ * Writes the merged brief, storing the previous one under conductor state.
  *
  * @deprecated Prefer {@link migrateToPolicy} / overlay refresh. Kept for
  * pre-overlay `--apply` on bannered single-file briefs.
  */
-export function writeMergedBrief(path: string, merged: string): string {
-  const backup = writeWithBackup(path, merged);
+export function writeMergedBrief(path: string, merged: string, backupRoot?: string): string {
+  const backup = writeWithBackup(path, merged, backupRoot);
   return backup ?? `${path}.bak-missing`;
 }
 
@@ -399,6 +467,8 @@ export function migrateToPolicy(opts: {
   floor: string;
   /** When set, use this owned text instead of splitting the live file. */
   owned?: string;
+  /** Override the conductor backup directory (tests). */
+  backupRoot?: string;
 }): MigrateResult {
   const live = readFileSync(opts.orchestratorPath, "utf8");
   const owned = opts.owned ?? splitBrief(live)?.owned;
@@ -408,9 +478,13 @@ export function migrateToPolicy(opts: {
   // Strip banner footers that an older split may have left in owned — never let
   // package chrome become fleet policy.
   const policyBody = stripLeadingBannerCrumbs(owned).replace(/^\s+/, "");
-  const policyBackup = writeWithBackup(opts.policyPath, policyBody.endsWith("\n") ? policyBody : `${policyBody}\n`);
+  const policyBackup = writeWithBackup(
+    opts.policyPath,
+    policyBody.endsWith("\n") ? policyBody : `${policyBody}\n`,
+    opts.backupRoot,
+  );
   const composed = composeOrchestrator(opts.floor, readFileSync(opts.policyPath, "utf8"));
-  const orchestratorBackup = writeWithBackup(opts.orchestratorPath, composed);
+  const orchestratorBackup = writeWithBackup(opts.orchestratorPath, composed, opts.backupRoot);
   return {
     policyPath: opts.policyPath,
     orchestratorPath: opts.orchestratorPath,
@@ -430,6 +504,8 @@ export function repairPolicyBannerCrumbs(opts: {
   orchestratorPath: string;
   policyPath: string;
   floor: string;
+  /** Override the conductor backup directory (tests). */
+  backupRoot?: string;
 }): MigrateResult | undefined {
   if (!existsSync(opts.policyPath)) return undefined;
   const before = readFileSync(opts.policyPath, "utf8");
@@ -439,9 +515,13 @@ export function repairPolicyBannerCrumbs(opts: {
     writeFileSync(opts.orchestratorPath, composeOrchestrator(opts.floor, before));
     return undefined;
   }
-  const policyBackup = writeWithBackup(opts.policyPath, cleaned.endsWith("\n") ? cleaned : `${cleaned}\n`);
+  const policyBackup = writeWithBackup(
+    opts.policyPath,
+    cleaned.endsWith("\n") ? cleaned : `${cleaned}\n`,
+    opts.backupRoot,
+  );
   const composed = composeOrchestrator(opts.floor, readFileSync(opts.policyPath, "utf8"));
-  const orchestratorBackup = writeWithBackup(opts.orchestratorPath, composed);
+  const orchestratorBackup = writeWithBackup(opts.orchestratorPath, composed, opts.backupRoot);
   return {
     policyPath: opts.policyPath,
     orchestratorPath: opts.orchestratorPath,
@@ -459,7 +539,10 @@ export function refreshComposedBrief(opts: {
   orchestratorPath: string;
   policyPath: string;
   floor: string;
+  /** Override the conductor backup directory (tests). */
+  backupRoot?: string;
 }): boolean {
+  migrateLegacyBriefBackups([opts.policyPath, opts.orchestratorPath], opts.backupRoot);
   if (!existsSync(opts.policyPath)) return false;
   const policy = readFileSync(opts.policyPath, "utf8");
   writeFileSync(opts.orchestratorPath, composeOrchestrator(opts.floor, policy));
@@ -558,9 +641,9 @@ export function proposeRetrofit(live: string): RetrofitResult {
   };
 }
 
-/** Insert the banner into a hand-written brief (with backup). */
-export function applyRetrofit(path: string, proposal: RetrofitProposal): string {
-  const backup = writeWithBackup(path, proposal.retrofitted);
+/** Insert the banner into a hand-written brief (with a state-root backup). */
+export function applyRetrofit(path: string, proposal: RetrofitProposal, backupRoot?: string): string {
+  const backup = writeWithBackup(path, proposal.retrofitted, backupRoot);
   return backup ?? `${path}.bak-missing`;
 }
 
