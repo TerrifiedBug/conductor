@@ -1,157 +1,179 @@
 ---
 name: conductor-update
-description: Safely update an installed omp-conductor fleet as one maintenance operation across both separately installed halves: the npm omp plugin and the GitHub herdr-conductor plugin. Use when the user asks to update, upgrade, refresh, reinstall, or deploy a newly published conductor version, or when installed conductor code is behind npm/main. Quiesces work, preserves exact pane identity, performs a whole-version swap, restarts through the supported lifecycle, re-arms through Telegram proof, and verifies the live fleet.
+description: Update an installed conductor fleet through one operator request. Use when the user asks to update, upgrade, refresh, reinstall, or deploy conductor. Pins one npm release across the Bun-global CLI, omp plugin, and Herdr recovery plugin; converts a local Herdr link when needed; pauses claims, reloads processes, verifies the fleet, and restores the operator's prior pause state.
 ---
 
 # Update a conductor fleet
 
-Treat an update as one operation across two independently installed plugins:
+The operator interface is one request: **“update conductor.”** Do not hand them
+the implementation as a checklist unless execution is blocked.
 
-- `omp-conductor` comes from npm and owns dispatch, CLI, status, and heartbeat.
-- `herdr-conductor` comes from `TerrifiedBug/conductor/herdr` and owns exact-pane recovery.
+One release has three installed surfaces:
 
-Updating only one half can leave a version that starts but cannot recover correctly.
-This skill updates an installed fleet. It does **not** publish npm, merge a PR, tag a
-release, or edit files in an install directory.
+1. Bun-global `omp-conductor`: CLI and systemd daemon source.
+2. omp npm plugin `omp-conductor`: slash command and heartbeat loaded by sessions.
+3. Herdr plugin `herdr-conductor`: exact-pane recovery, pinned to the npm
+   release's `gitHead`.
+
+This skill performs the whole swap. It does not publish npm, merge, tag, edit an
+install root, or update unrelated Bun packages.
 
 ## Safety boundary
 
-Run this procedure from an operator shell or maintenance omp session that is not
-hosted by the target `herdr-fleet.service`. If the current working directory
-contains `.conductor-tick.json`, or stopping that unit would kill the session
-executing this skill, stop and move the update to an external maintenance
-session. A self-terminating updater cannot produce trustworthy verification.
+Run from an operator shell or maintenance omp session that is not hosted by the
+target `herdr-fleet.service`. If restarting that unit would kill this updater,
+move to an external session first. Never print npm, Telegram, or bot credentials.
 
-Use the configured target host. Do not assume a hostname, state directory, Herdr
-session name, project name, or systemd availability. Read them from the existing
-installation and `omp-conductor status`. Never print bot tokens, npm tokens, or
-authentication files.
+The normal update is:
 
-## 1. Establish the desired version
+```text
+inspect → pause claims → drain → pinned installs → reload → verify → restore pause state
+```
 
-Read, do not guess:
+Ticks stay in their existing armed or disarmed state. Do not use `hold`,
+`halt --pane`, `disarm`, `arm`, recovery pins, `pkill`, or manual install-root
+edits for a healthy update.
+
+## 1. Resolve one release and inspect every surface
+
+Use the registry latest unless the operator names another published version:
 
 ```bash
-omp-conductor --version
 version=$(npm view omp-conductor version)
 gitHead=$(npm view "omp-conductor@$version" gitHead)
 npm view "omp-conductor@$version" version gitHead --json
+```
+
+Require `$version` to be nonempty and `$gitHead` to be a full commit SHA before
+changing state.
+
+Inspect, without mutating:
+
+```bash
+omp-conductor --version
 omp plugin list --json
+herdr --session "$session" plugin list
 omp-conductor status [--project NAME]
 ```
 
-Use the registry latest as `$version` unless the user explicitly names another
-published version, then query that exact version as shown. Record its `gitHead`
-and require a full commit SHA: the npm spec and Herdr ref below are both pinned,
-so a concurrent release cannot mix two versions. If npm has no newer version, do
-not churn the fleet: report that it is current. Confirm that `herdr` and
-`systemctl` are present before taking anything down when status says Herdr
-manages the pane.
+Honor the installation's existing Herdr session and `HERDR_CONFIG_PATH`; discover
+them from the running unit/config rather than assuming `fleet` or a path.
 
-## 2. Quiesce without losing work
+Record:
 
-First stop new claims and heartbeat prompts:
+- Bun-global CLI version;
+- omp plugin version;
+- Herdr plugin source: GitHub revision, `local:<path>`, or missing;
+- initial dispatch state: running, paused, or stopped;
+- initial ticks state, which this update must not change;
+- active runs and layered health.
+
+Report “already current” only when **all** of these are true:
+
+- Bun-global CLI version equals `$version`;
+- omp plugin version equals `$version`;
+- Herdr source revision equals `$gitHead`;
+- layered status is healthy for the fleet's configured topology.
+
+A current npm version with a linked, missing, or stale Herdr plugin is a partial
+update, not a no-op. If all versions match but status is unhealthy, diagnose the
+reported layer; never call an unhealthy fleet current.
+
+## 2. Pause claims and drain
+
+If dispatch was running:
 
 ```bash
-omp-conductor hold [--project NAME]
+omp-conductor pause [--project NAME]
 ```
 
-Read status until `active runs (none)`. Do not kill workers to make the update
-faster. If a run does not drain, report the run and stop; ordinary update authority
-does not include discarding work.
+If it was already paused, preserve that state. If it was stopped, do not start it
+later merely because packages were updated.
 
-Then stop the exact conductor pane and dispatch daemon through the supported,
-fail-closed path:
+Wait for `active runs (none)`. Never kill workers for an update. If a run does not
+drain, stop and report it; leave any pause this skill added in place.
 
-```bash
-omp-conductor halt --pane [--project NAME]
-```
+## 3. Replace all three surfaces with the pinned release
 
-This writes the recovery pin before stopping the exact configured Herdr agent. If
-identity is invalid, missing, or ambiguous, it refuses rather than killing a guess.
-Do not bypass that refusal with `pkill`.
-
-When `herdr-fleet.service` is installed, stop it before replacing either plugin:
+Use exact versions. A broad `bun update` is prohibited.
 
 ```bash
-systemctl stop herdr-fleet.service
-```
-
-At this point the daemon is stopped, the pane is stopped, and recovery remains
-pinned. If any of those statements is false, do not modify the install.
-
-## 3. Replace both installed halves
-
-Refresh the exact npm version using omp's package installer:
-
-```bash
+bun add -g "omp-conductor@$version"
 omp plugin install "omp-conductor@$version"
 ```
 
-Then refresh the Herdr managed checkout from the exact npm release commit. Herdr
-requires the GitHub source before its options:
+For Herdr, inspect the source found in step 1:
+
+- `local:<path>`: unlink the plugin id first;
+- GitHub-managed or missing: do not unlink.
+
+Then install the exact npm release commit. Herdr requires the source argument
+before its options:
 
 ```bash
+herdr plugin unlink herdr-conductor  # only when step 1 reported local:<path>
 herdr plugin install TerrifiedBug/conductor/herdr --ref "$gitHead" --yes
 ```
 
-Do not use `git pull`, `scp`, a linked checkout, or edits under either plugin's
-install root. This is a whole-version swap. If either install fails, leave the
-fleet stopped and recovery pinned; report the failed command and do not continue
-with a mixed live version.
+If any install fails, do not reload processes and do not restore dispatch.
+Leave the fleet paused, report the failed surface, and give the one retry command.
+The still-running processes keep their already-loaded code until a successful
+reload.
 
-## 4. Start through the new lifecycle
+## 4. Reload the installed code
 
-Run the newly installed CLI:
+When Herdr is systemd-managed, restart its fleet unit. This reloads the managed
+recovery plugin and causes exact-identity recovery to resume the orchestrator pane
+with the new omp extension:
+
+```bash
+systemctl restart herdr-fleet.service
+```
+
+Wait until Herdr reports its unit active and the exact configured agent live.
+
+If the dispatch daemon was running or paused initially, restart it so its process
+and source-integrity baseline use the new Bun-global package:
+
+```bash
+omp-conductor restart [--project NAME]
+```
+
+Do not substitute `start` when the daemon was initially stopped.
+
+## 5. Verify before restoring claims
+
+Check every surface again:
 
 ```bash
 omp-conductor --version
-omp-conductor start [--project NAME]
-```
-
-`start` clears the recovery pin, starts the optional `herdr-fleet.service`, and
-starts the dispatch daemon after a real `/healthz` check. Herdr then recovers the
-exact orchestrator pane and requests an immediate tick; the verification below,
-not the `start` command alone, proves that recovery completed.
-
-Wait until `omp-conductor status` reports the exact pane `live`; `start` returning
-only proves the service and dispatch daemon. `hold` deliberately disarmed ticks,
-so restore unattended operation through the existing Telegram proof:
-
-```bash
-omp-conductor arm [--project NAME]
-```
-
-Wait for the operator's inbound Telegram reply. Never create the arm marker by
-hand and never treat an outbound challenge as proof.
-
-## 5. Verify the live result
-
-Require all of the following before reporting success:
-
-```bash
-omp-conductor --version
-npm view "omp-conductor@$version" version gitHead --json
 omp plugin list --json
-herdr plugin list
+herdr --session "$session" plugin list
 omp-conductor status [--project NAME]
 systemctl is-active herdr-fleet.service
 ```
 
-- installed version and the npm package entry both equal `$version`;
-- the Herdr plugin source revision equals the npm release `gitHead`;
-- `dispatch` is `running`;
-- `ticks` is `armed` and a next tick is shown;
-- `pane` is `live` for the exact configured Herdr agent;
-- `recovery` is `clear`;
-- `herdr` is `active` when managed;
-- Telegram is `ok` (or its exact supported degraded state is reported);
-- daemon `/healthz` is `ok`;
-- no unexpected active runs appeared during maintenance.
+Require:
 
-Run a second status check after the immediate recovery tick is consumed. A single
-healthy snapshot is not proof that recovery and heartbeat scheduling survived the
-swap.
+- global CLI and omp plugin both equal `$version`;
+- Herdr source equals `TerrifiedBug/conductor` at `$gitHead`;
+- exact pane is live and recovery is clear;
+- Herdr and daemon health are OK when managed;
+- ticks equal their initial state;
+- active runs remain empty;
+- dispatch remains paused if this skill paused it.
 
-Report the old and new versions, both plugin refreshes, the final layered status,
-and any supported degraded state. Do not report success for a partial update.
+Run status a second time after recovery settles. Any failed check leaves dispatch
+paused and is reported as a partial update.
+
+Only if dispatch was initially running and every check passed:
+
+```bash
+omp-conductor resume [--project NAME]
+```
+
+Verify `dispatch running` once more. If dispatch was initially paused or stopped,
+preserve that state and report it.
+
+Finish with one compact result: old → new version, all three installed surfaces,
+final layered status, and whether the original dispatch state was restored.

@@ -39,7 +39,7 @@ The package ships three deployables, plus two skills:
 | Standalone daemon | `omp-conductor` binary | The dispatch loop, managed as a background process (`start` / `stop` / `restart`) with a `/healthz` endpoint for a supervisor. |
 | Orchestrator heartbeat | omp extension, activated by `.conductor-tick.json` | Prompts a 24/7 orchestrator session on a fixed interval so its standing loop actually runs, and marks the session stalled when its prompts stop being consumed. Inert in every other session — including a second session opened in the fleet's own directory. See [Orchestrator tick](#orchestrator-tick). |
 | Onboarding skill | `skill://conductor-onboarding` | Directs an omp session to interview you, read your repos for real CI gates, and tailor `ORCHESTRATOR.md` — then finish through the wizard. Discovered automatically once the plugin is installed. See [Onboarding](#onboarding). |
-| Update skill | `skill://conductor-update` | Treats the npm and Herdr plugins as one maintenance operation: drain, halt, replace both halves, restart, re-arm through Telegram proof, and verify twice. See [Updating](#updating). |
+| Update skill | `skill://conductor-update` | Treats the Bun-global CLI, omp plugin, and Herdr plugin as one operation: pause claims, drain, install one pinned release, reload, verify twice, and restore the prior pause state. See [Updating](#updating). |
 
 The first two are thin wrappers over the same `daemon.ts`, so the plugin and the
 CLI cannot disagree about what a cap means or where the state lives. Claiming is
@@ -169,15 +169,20 @@ Also required on the host:
 ## Updating
 
 Say “update conductor” from an operator shell or maintenance omp session outside
-the target `herdr-fleet.service`. The bundled `skill://conductor-update` discovers
-the installed and registry versions, drains active work, pins exact-pane recovery,
-replaces both independently installed plugins, restarts through
-`omp-conductor start`, re-arms through the existing Telegram proof, and verifies
-the layered status twice.
+the target `herdr-fleet.service`. That is the whole operator interface. The bundled
+`skill://conductor-update` discovers the installed and registry versions, pauses
+new claims while active work drains, and pins one release across the Bun-global
+CLI, omp plugin, and Herdr plugin. It converts an old local Herdr link to a managed
+checkout when necessary, reloads the Herdr service and dispatch daemon, verifies
+the layered status twice, and restores the original dispatch state.
 
-The skill deliberately does not publish npm or edit an install root. It also
-refuses to run from the fleet pane it must replace: an updater that kills itself
-cannot verify the result. With skill commands enabled, invoke it directly with:
+Ticks remain in their existing armed or disarmed state, so an ordinary update
+does not halt the exact pane or require another Telegram arm challenge. Any
+installation, reload, or verification failure leaves dispatch paused instead of
+bringing up a mixed fleet. The skill does not publish npm or edit an install root.
+It also refuses to run from the fleet pane that Herdr must restart: an updater
+that kills itself cannot verify the result. With skill commands enabled, invoke
+it directly with:
 
 ```text
 /skill:conductor-update
