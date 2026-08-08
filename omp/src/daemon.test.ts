@@ -778,6 +778,42 @@ describe("admitCandidates", () => {
     );
   });
 
+  it("admits routed terminal runs through their retained open PR", async () => {
+    const states = ["blocked", "failed", "killed", "orphaned"] as const;
+    for (const [offset, state] of states.entries()) {
+      const issue = 288 + offset;
+      const pr = `https://github.com/acme/api/pull/${419 + offset}`;
+      store.createRun(draft({ issue, state, prUrl: pr, endedAt: 2_000 + offset }));
+      const { d } = deps(
+        store,
+        admissionTracker({ openCloserFor: async () => pr }),
+      );
+
+      const pass = await admitCandidates(d, [candidate(issue)], 1);
+
+      expect(pass.admitted).toEqual([{ r: candidate(issue), attempt: 2 }]);
+      expect(pass.holds).toEqual([]);
+    }
+  });
+
+  it("still holds a requeued terminal run when another open PR closes it", async () => {
+    store.createRun(draft({
+      issue: 288,
+      state: "failed",
+      prUrl: "https://github.com/acme/api/pull/418",
+      endedAt: 2_000,
+    }));
+    const { d } = deps(
+      store,
+      admissionTracker({ openCloserFor: async () => "https://github.com/acme/api/pull/419" }),
+    );
+
+    const pass = await admitCandidates(d, [candidate(288)], 1);
+
+    expect(pass.admitted).toEqual([]);
+    expect(pass.holds).toEqual([{ issue: 288, reason: "open-pr" }]);
+  });
+
   it("admits an issue whose closers are all merged or closed", async () => {
     const { d } = deps(store, admissionTracker());
 

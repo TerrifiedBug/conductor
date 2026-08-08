@@ -1240,9 +1240,19 @@ export async function admitCandidates(
       continue;
     }
     if (closer !== undefined) {
-      hold(issue, "open-pr");
-      log(`#${issue} skipped: open PR ${closer} already closes it`);
-      continue;
+      const latest = store.latestRun(project.name, issue);
+      const retainedContinuation =
+        latest?.prUrl === closer &&
+        (latest.state === "blocked" ||
+          latest.state === "failed" ||
+          latest.state === "killed" ||
+          latest.state === "orphaned");
+      if (!retainedContinuation) {
+        hold(issue, "open-pr");
+        log(`#${issue} skipped: open PR ${closer} already closes it`);
+        continue;
+      }
+      log(`#${issue} continuing retained PR ${closer} from ${latest.state} run`);
     }
 
     admitted.push({ r, attempt: priorRuns + 1 });
