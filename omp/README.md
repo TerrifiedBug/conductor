@@ -31,7 +31,7 @@ needs a human. It never edits product code and never pushes a branch; whether it
 may merge or release is a setup answer (`authority`), and both default to no. Only
 tier 2 pages you directly.
 
-The package ships three deployables, plus one skill:
+The package ships three deployables, plus two skills:
 
 | Deployable | Entry | What it is for |
 | --- | --- | --- |
@@ -39,6 +39,7 @@ The package ships three deployables, plus one skill:
 | Standalone daemon | `omp-conductor` binary | The dispatch loop, managed as a background process (`start` / `stop` / `restart`) with a `/healthz` endpoint for a supervisor. |
 | Orchestrator heartbeat | omp extension, activated by `.conductor-tick.json` | Prompts a 24/7 orchestrator session on a fixed interval so its standing loop actually runs, and marks the session stalled when its prompts stop being consumed. Inert in every other session — including a second session opened in the fleet's own directory. See [Orchestrator tick](#orchestrator-tick). |
 | Onboarding skill | `skill://conductor-onboarding` | Directs an omp session to interview you, read your repos for real CI gates, and tailor `ORCHESTRATOR.md` — then finish through the wizard. Discovered automatically once the plugin is installed. See [Onboarding](#onboarding). |
+| Update skill | `skill://conductor-update` | Treats the npm and Herdr plugins as one maintenance operation: drain, halt, replace both halves, restart, re-arm through Telegram proof, and verify twice. See [Updating](#updating). |
 
 The first two are thin wrappers over the same `daemon.ts`, so the plugin and the
 CLI cannot disagree about what a cap means or where the state lives. Claiming is
@@ -164,6 +165,23 @@ Also required on the host:
 
   With neither, tier 2 degrades to a comment on the issue. Nothing is broken in
   that configuration: it is supported, just slower to reach you.
+
+## Updating
+
+Say “update conductor” from an operator shell or maintenance omp session outside
+the target `herdr-fleet.service`. The bundled `skill://conductor-update` discovers
+the installed and registry versions, drains active work, pins exact-pane recovery,
+replaces both independently installed plugins, restarts through
+`omp-conductor start`, re-arms through the existing Telegram proof, and verifies
+the layered status twice.
+
+The skill deliberately does not publish npm or edit an install root. It also
+refuses to run from the fleet pane it must replace: an updater that kills itself
+cannot verify the result. With skill commands enabled, invoke it directly with:
+
+```text
+/skill:conductor-update
+```
 
 ## Onboarding
 

@@ -669,6 +669,30 @@ test("fleetLayers separates pane liveness from recovery pin", () => {
   expect(["live", "missing", "unknown"]).toContain(layers.pane);
 });
 
+test("fleetLayers does not guess a pane identity from an invalid tick config", () => {
+  writeMinimalConfig();
+  writeFileSync(join(process.env[COND_KEY]!, TICK_CONFIG_FILE), "{");
+  const bin = join(home, "bin");
+  const herdr = join(bin, "herdr");
+  mkdirSync(bin);
+  writeFileSync(
+    herdr,
+    '#!/bin/sh\nprintf \'%s\\n\' \'{"agents":[{"name":"fleet","pane_id":"2","agent":"omp"}]}\'\n',
+  );
+  chmodSync(herdr, 0o755);
+  const path = process.env["PATH"];
+  process.env["PATH"] = `${bin}:${path ?? ""}`;
+  try {
+    const layers = fleetLayers();
+    expect(layers.ticks).toBe("invalid-heartbeat-config");
+    expect(layers.pane).toBe("unknown");
+    expect(layers.paneDetail).toContain("tick config invalid");
+  } finally {
+    if (path === undefined) delete process.env["PATH"];
+    else process.env["PATH"] = path;
+  }
+});
+
 test("pane status uses the configured Herdr identity, not unrelated omp processes", () => {
   const agents = [
     { name: "other", paneId: "1", agent: "omp" },

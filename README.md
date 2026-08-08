@@ -24,7 +24,8 @@ From a checkout, one script does both halves:
 ```
 
 It checks every prerequisite before installing anything and prints the fix beside
-each failure. Re-running it is the refresh path.
+each failure. For a running fleet, use the update skill below rather than
+replacing live plugin files with this setup command.
 
 Or install each half by hand. They are useful separately, and share no runtime,
 config file, or state directory:
@@ -41,6 +42,11 @@ herdr plugin install TerrifiedBug/conductor/herdr
 Herdr plugins v1 has no npm install path: `herdr plugin install herdr-conductor`
 is not a thing, and there is no `plugin update`. Reinstalling from GitHub is how
 you refresh the managed checkout.
+
+After the first install, say “update conductor” from an external maintenance omp
+session. The bundled `skill://conductor-update` drains work, stops the exact fleet
+pane, refreshes both install surfaces, restarts, re-arms through Telegram proof,
+and verifies the resulting version and live status.
 
 ### Prerequisites
 

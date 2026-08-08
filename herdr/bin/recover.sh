@@ -328,6 +328,10 @@ event_pane_id() {
   printf '%s' "$1" | jq -r '(.data // {}).pane_id // empty' 2>/dev/null
 }
 
+event_released_agent() {
+  printf '%s' "$1" | jq -e '(.data // {}).released == true' >/dev/null 2>&1
+}
+
 # Saved panes that could be the fleet, in two tiers.
 #
 # The snapshot writes `agent_name` and `managed_agent_kind` straight from the
@@ -930,6 +934,15 @@ run_recovery() {
     # Paging still works without jq for the toast; say so plainly either way.
     page 'jq is not installed on this host' \
       'herdr-conductor reads Herdr session state and CLI responses with jq; install jq and re-run the startup hook.'
+    return 0
+  fi
+
+  # pane.agent_detected fires for both disappearance and appearance. Appearance
+  # is the result of a successful resume; treating it as another failure races
+  # Herdr's converging agent state and can start the same session repeatedly.
+  if [[ ${HERDR_PLUGIN_EVENT:-} == pane.agent_detected ]] &&
+    ! event_released_agent "${HERDR_PLUGIN_EVENT_JSON:-}"; then
+    decide 'skip: pane.agent_detected did not release an agent'
     return 0
   fi
 
