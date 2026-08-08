@@ -411,6 +411,25 @@ Four control planes used to answer "stop" differently. The package verbs:
 
 `status` prints a layered header (`dispatch` / `ticks` / next tick time / `pane` / `recovery` / `herdr` / `telegram` / `daemon`) so a paused fleet cannot hide an armed orchestrator still spending turns. The Telegram line calls the official `getMe` endpoint to prove the token and API are usable without sending a message, then separately reports whether the inbound bridge is configured.
 
+`omp-conductor board [--project NAME]` opens the same facts as a live terminal
+kanban instead of a scrolling wall of status text. Its columns are Queue,
+Claimed, Running, Green, Blocked, Failed, and Merged. Queue cards are the
+bounded per-issue hold sample recorded by the latest dispatch; the Queue count
+is the authoritative ready count even when there are more ready issues than
+sampled cards. Run columns show the newest attempt for each issue. Merged keeps
+only the last 24 hours so the board stays operational rather than becoming an
+analytics archive.
+
+The board refreshes run, spend, turn, and dispatch values from SQLite every
+second. It refreshes the slower daemon, Herdr, Telegram, and code-graph health
+layer every ten seconds or immediately with `r`. Use arrow keys or `h/j/k/l` to
+select a card, `Enter` to inspect and follow its worker transcript, `u` to run
+the normal unblock workflow, `i` / `p` to open the issue / pull request, `?` for
+help, and `q`, `Esc`, or `Ctrl-C` to go back and quit. Narrow terminals show a
+sliding subset of columns around the selection; terminals below 50×20 get a
+single resize instruction instead of a broken layout. The board is read-only
+except for the explicit `u` action: it never claims work or changes stages.
+
 `halt --pane` is **fail-closed**: it exits `0` only when the conductor agent is
 *proven* gone. It writes the recovery pin first, so a failed stop still cannot be
 undone by `herdr-conductor` respawning the agent, and then refuses (nonzero exit,
@@ -1259,6 +1278,7 @@ omp-conductor --version
 omp-conductor stop
 omp-conductor restart [--port N] [--project NAME]
 omp-conductor status [--project NAME]
+omp-conductor board [--project NAME]
 omp-conductor hold [--project NAME]
 omp-conductor halt [--pane] [--project NAME]
 omp-conductor arm [--project NAME]
@@ -1281,6 +1301,7 @@ omp-conductor help
 | `stop` | Prefer `systemctl stop omp-conductor.service` when that unit's MainPID is the live daemon — systemd then owns the stop and will not schedule a restart for the exit it just requested. Otherwise `SIGTERM`, then `SIGKILL` after a 10-second grace period. Prints `not running` when there is nothing to stop, and tags the confirmation with `(via systemctl)` when the unit path was used. |
 | `restart` | Prefer `systemctl restart` when the unit owns the live pid so the replacement stays supervised; otherwise `stop` then `start`, inheriting the running daemon's port and project unless a flag overrides them. The new process **salvages dirty live worktrees before orphaning** those rows — see [Deploying a new package onto a busy fleet](#deploying-a-new-package-onto-a-busy-fleet). |
 | `status [--project NAME]` | Layered fleet report first: `dispatch` / `ticks` / next scheduled tick / `pane` / `recovery` / `herdr` / `telegram` / optional `code graph` / `daemon`, then the project body. The project body includes the latest completed dispatch timestamp, ready/routed/admitted counts, and bounded hold groups; API failures are marked `DEGRADED` so queue starvation cannot look idle. The next tick comes from the live heartbeat process, not a guess from log timestamps. Telegram health uses `getMe` to prove API authentication without sending a message and reports inbound bridge configuration separately. Configured graphs report prerequisites, indexed repos, timer state, and refresh freshness without blocking dispatch. The daemon block includes `rss` from `/healthz`; live workers add a busy-deploy warning. A `.conductor-stalled` marker adds an `orchestrator STALLED since …` line. |
+| `board [--project NAME]` | Live keyboard-driven kanban over the same SQLite and `/healthz` truth as `status`: Queue, Claimed, Running, Green, Blocked, Failed, and the last 24 hours of Merged. Refreshes run/spend/turn values every second and slower health every ten seconds. `Enter` follows the selected transcript in place; `u` invokes the existing unblock workflow; `i` / `p` open the issue / PR; `r` refreshes health; `?` shows all keys. Requires an interactive terminal of at least 50×20. |
 | `hold [--project NAME]` | Soft stop: pause claiming **and** disarm ticks. Daemon and pane stay up. Prefer this over `pause` when the intent is "stop the conductor" without killing processes. See [Stop the conductor](#stop-the-conductor-hold--halt). |
 | `halt [--pane] [--project NAME]` | `hold`, then stop the dispatch daemon (systemctl-aware). Pane stays up unless `--pane` is passed. `halt --pane` also pins herdr-conductor recovery off for the conductor agent only — it does **not** stop `herdr-fleet.service` or any other herdr session. Fail-closed: exits nonzero unless the agent is proven gone. |
 | `arm [--project NAME]` | Proof-gated: send a Telegram challenge and write the arm marker only after your reply appears as a user turn in the orchestrator transcript. Never auto-armed by `resume` / `hold`. |

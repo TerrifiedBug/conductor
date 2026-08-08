@@ -1569,28 +1569,35 @@ export interface StatusSnapshot {
   dispatch?: DispatchSummary;
 }
 
-/** Opens and closes its own store handle so the CLI and the plugin can read
- *  status while a daemon in another process is writing (the store runs in WAL
- *  mode for exactly this). */
+/** Builds a status reading from an already-open store. Long-lived operator
+ * surfaces use this path so a one-second refresh does not repeatedly open and
+ * initialise SQLite connections. */
+export function statusSnapshotFromStore(p: ProjectConfig, caps: Caps, store: Store): StatusSnapshot {
+  const since = startOfToday();
+  const dispatch = store.latestDispatch(p.name);
+  return {
+    project: p.name,
+    configPath: configPath(),
+    stateDir: stateDir(),
+    paused: isPaused(),
+    caps,
+    activeRuns: store.activeRuns(p.name),
+    liveWorkers: store.liveRuns(p.name).length,
+    runsToday: store.runsStartedSince(p.name, since),
+    spendTodayUsd: store.spendSince(p.name, since),
+    ...(dispatch === undefined ? {} : { dispatch }),
+  };
+}
+
+/** Opens and closes its own store handle so one-shot CLI and plugin readers can
+ * read status while a daemon in another process is writing (the store runs in
+ * WAL mode for exactly this). */
 export function statusSnapshot(project?: string): StatusSnapshot {
   const cfg = loadConfig();
   const p = findProject(cfg, project);
   const store = openStore(dbPath());
   try {
-    const since = startOfToday();
-    const dispatch = store.latestDispatch(p.name);
-    return {
-      project: p.name,
-      configPath: configPath(),
-      stateDir: stateDir(),
-      paused: isPaused(),
-      caps: resolveCaps(p, cfg.defaults),
-      activeRuns: store.activeRuns(p.name),
-      liveWorkers: store.liveRuns(p.name).length,
-      runsToday: store.runsStartedSince(p.name, since),
-      spendTodayUsd: store.spendSince(p.name, since),
-      ...(dispatch === undefined ? {} : { dispatch }),
-    };
+    return statusSnapshotFromStore(p, resolveCaps(p, cfg.defaults), store);
   } finally {
     store.close();
   }

@@ -7,6 +7,7 @@
  */
 import { closeSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { runBoard } from "./board.ts";
 import {
   applyRetrofit,
   checkBrief,
@@ -52,6 +53,7 @@ import {
   shippedBriefTemplate,
 } from "./setup.ts";
 import { LIVE_STATES, openStore } from "./store.ts";
+import { formatTranscriptLine } from "./transcript.ts";
 import { makeTracker } from "./tracker/github.ts";
 import type { ProjectConfig } from "./types.ts";
 import { formatUnblock, unblockIssue } from "./unblock.ts";
@@ -73,6 +75,7 @@ usage:
   omp-conductor --version
   omp-conductor stop
   omp-conductor restart [--port N] [--project NAME]
+  omp-conductor board [--project NAME]
   omp-conductor status [--project NAME]
   omp-conductor hold [--project NAME]
   omp-conductor halt [--pane] [--project NAME]
@@ -103,6 +106,9 @@ usage:
   status   layered fleet report: dispatch (running|paused|stopped), ticks and
            next due time, pane, herdr, Telegram bot/API health, daemon, caps
            and active runs.
+  board    open the live keyboard-driven fleet board. It renders queue holds,
+           every run lifecycle stage, recent merges, spend and health; Enter
+           follows a selected transcript without leaving the board.
   hold     soft stop: pause claiming AND disarm ticks. Daemon and pane stay up.
            This is "stop the conductor overnight" without killing processes.
   halt     hold, then stop the dispatch daemon (systemctl-aware). Pane stays up
@@ -272,55 +278,6 @@ function issueArg(verb: string, raw: string | undefined): number {
   return issue;
 }
 
-/** Read one property off an unvalidated transcript entry. */
-function prop(source: unknown, key: string): unknown {
-  if (source === null || typeof source !== "object") return undefined;
-  return Reflect.get(source, key);
-}
-
-/**
- * One transcript line rendered for somebody watching, or `undefined` for the
- * lines not worth a row: thinking blocks, tool results, session metadata, and
- * anything this parser does not recognise.
- *
- * Defensive throughout. The transcript is written by the harness, not by this
- * package, so its shape is a peer dependency's business and can gain entry
- * types without warning. A `tail` that dies on one unfamiliar line is strictly
- * worse than one that skips it — the operator is watching a run they have no
- * other window onto.
- */
-function formatTranscriptLine(line: string): string | undefined {
-  let entry: unknown;
-  try {
-    entry = JSON.parse(line);
-  } catch {
-    return undefined;
-  }
-  if (prop(entry, "type") !== "message") return undefined;
-  const message = prop(entry, "message");
-  if (prop(message, "role") !== "assistant") return undefined;
-
-  const content = prop(message, "content");
-  // The harness writes an array of blocks; a bare string is the degenerate form
-  // some sessions still produce, and dropping it would silently lose the text.
-  if (typeof content === "string") {
-    return content.trim() === "" ? undefined : `assistant: ${content.trim()}`;
-  }
-
-  const blocks: readonly unknown[] = Array.isArray(content) ? content : [];
-  const out: string[] = [];
-  for (const block of blocks) {
-    const type = prop(block, "type");
-    if (type === "text") {
-      const text = prop(block, "text");
-      if (typeof text === "string" && text.trim() !== "") out.push(`assistant: ${text.trim()}`);
-    } else if (type === "toolCall") {
-      const name = prop(block, "name");
-      if (typeof name === "string" && name !== "") out.push(`tool: ${name}`);
-    }
-  }
-  return out.length === 0 ? undefined : out.join("\n");
-}
 
 /**
  * Follow one run's transcript the way `tail -f` follows a log.
@@ -516,6 +473,10 @@ try {
       process.stdout.write(`${text}${stalled === undefined ? "\n" : `\n\n${stalled}\n`}`);
       break;
     }
+
+    case "board":
+      await runBoard(flag(argv, "project"));
+      break;
 
     case "hold": {
       const r = hold(flag(argv, "project"));

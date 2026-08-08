@@ -242,6 +242,16 @@ export function openStore(dbPath: string): Store {
         AND worktree <> ''
       ORDER BY endedAt ASC, startedAt ASC`,
   );
+  const selectRecentRuns = db.query<RunRow, [string, number]>(
+    `SELECT * FROM runs
+      WHERE rowid IN (
+        SELECT MAX(rowid) FROM runs
+        WHERE project = ?
+        GROUP BY issue
+      )
+        AND (state <> 'merged' OR COALESCE(endedAt, startedAt) >= ?)
+      ORDER BY startedAt DESC`,
+  );
   const countAttempts = db.query<{ n: number }, [string, number]>(
     `SELECT COUNT(*) AS n FROM runs WHERE project = ? AND issue = ?`,
   );
@@ -343,6 +353,10 @@ export function openStore(dbPath: string): Store {
 
     retainedRuns(project: string): RunRecord[] {
       return selectRetained.all(project).map(toRecord);
+    },
+
+    recentRuns(project: string, mergedSinceEpochMs: number): RunRecord[] {
+      return selectRecentRuns.all(project, mergedSinceEpochMs).map(toRecord);
     },
 
     attemptsFor(project: string, issue: number): number {

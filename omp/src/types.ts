@@ -406,6 +406,9 @@ export interface Store {
   liveRuns(project: string): RunRecord[];
   /** Failed/killed/orphaned rows whose retained tree has not been reaped. */
   retainedRuns(project: string): RunRecord[];
+  /** Newest attempt per issue for the live board. Non-merged work remains
+   * visible; merged rows are bounded by the supplied recent-history cutoff. */
+  recentRuns(project: string, mergedSinceEpochMs: number): RunRecord[];
   /** Total run segments, used only for the monotonically increasing run number. */
   attemptsFor(project: string, issue: number): number;
   /** Terminal implementation failures that consume `maxAttemptsPerIssue`. */

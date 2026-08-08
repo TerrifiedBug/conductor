@@ -143,6 +143,28 @@ describe("openStore", () => {
     expect(store.latestRun(PROJECT, 7)?.id).toBe(sameMs.id);
   });
 
+  it("lists each issue's newest attempt and bounds merged history", () => {
+    const oldMerged = store.createRun(
+      draft({ issue: 1, state: "merged", startedAt: 1_000, endedAt: 2_000 }),
+    );
+    const recentMerged = store.createRun(
+      draft({ issue: 2, state: "merged", startedAt: 4_000, endedAt: 5_000 }),
+    );
+    store.createRun(draft({ issue: 3, attempt: 1, state: "failed", startedAt: 2_000, endedAt: 3_000 }));
+    const retry = store.createRun(draft({ issue: 3, attempt: 2, state: "running", startedAt: 6_000 }));
+    const blocked = store.createRun(
+      draft({ issue: 4, state: "blocked", startedAt: 500, endedAt: 600 }),
+    );
+    store.createRun(draft({ project: "other", issue: 5, state: "running", startedAt: 7_000 }));
+
+    expect(store.recentRuns(PROJECT, 3_000).map((run) => run.id)).toEqual([
+      retry.id,
+      recentMerged.id,
+      blocked.id,
+    ]);
+    expect(store.recentRuns(PROJECT, 0).map((run) => run.id)).toContain(oldMerged.id);
+  });
+
   it("patches only the fields given to updateRun", () => {
     const created = store.createRun(draft({ turns: 4, spendUsd: 1.25, branch: "fix/thing" }));
 
