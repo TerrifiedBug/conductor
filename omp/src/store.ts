@@ -13,6 +13,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
+import { DEFAULT_CAPS } from "./types.ts";
 import type { DispatchSummary, RunRecord, RunState, Store } from "./types.ts";
 
 /**
@@ -51,6 +52,7 @@ const UPDATABLE_COLUMNS: Record<string, true> = {
   state: true,
   attempt: true,
   turns: true,
+  maxTurns: true,
   spendUsd: true,
   sessionFile: true,
   prUrl: true,
@@ -74,6 +76,7 @@ interface RunRow {
   state: string;
   attempt: number;
   turns: number;
+  maxTurns: number;
   spendUsd: number;
   sessionFile: string | null;
   prUrl: string | null;
@@ -94,6 +97,7 @@ CREATE TABLE IF NOT EXISTS runs (
   state       TEXT    NOT NULL,
   attempt     INTEGER NOT NULL,
   turns       INTEGER NOT NULL,
+  maxTurns    INTEGER NOT NULL,
   spendUsd    REAL    NOT NULL,
   sessionFile TEXT,
   prUrl       TEXT,
@@ -141,6 +145,7 @@ function toRecord(row: RunRow): RunRecord {
     state: row.state as RunState,
     attempt: row.attempt,
     turns: row.turns,
+    maxTurns: row.maxTurns,
     spendUsd: row.spendUsd,
     startedAt: row.startedAt,
   };
@@ -199,9 +204,16 @@ export function openStore(dbPath: string): Store {
   db.exec("PRAGMA foreign_keys = ON;");
   db.exec("PRAGMA busy_timeout = 5000;");
   db.exec(SCHEMA);
-  // v0.3.18 and earlier created `runs` without the worker-observed PR head.
-  // This additive migration is idempotent and preserves every existing row.
+  // Additive migrations are idempotent and preserve every existing row.
+  // Historical rows predate per-run ceilings, so the package default is the
+  // only truthful recoverable value; every new run persists its actual cap.
   const columns = db.query<{ name: string }, []>("PRAGMA table_info(runs)").all();
+  if (!columns.some((column) => column.name === "maxTurns")) {
+    db.exec(
+      `ALTER TABLE runs ADD COLUMN maxTurns INTEGER NOT NULL DEFAULT ${DEFAULT_CAPS.workerMaxTurns}`,
+    );
+  }
+  // v0.3.18 and earlier created `runs` without the worker-observed PR head.
   if (!columns.some((column) => column.name === "headSha")) {
     db.exec("ALTER TABLE runs ADD COLUMN headSha TEXT");
   }
@@ -209,8 +221,8 @@ export function openStore(dbPath: string): Store {
   const insertRun = db.query<unknown, SqlValue[]>(
     `INSERT INTO runs (
        id, project, issue, repo, branch, worktree, state, attempt, turns,
-       spendUsd, sessionFile, prUrl, headSha, startedAt, endedAt, lastError
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       maxTurns, spendUsd, sessionFile, prUrl, headSha, startedAt, endedAt, lastError
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const selectRun = db.query<RunRow, [string]>(`SELECT * FROM runs WHERE id = ?`);
   const selectActive = db.query<RunRow, SqlValue[]>(
@@ -280,6 +292,7 @@ export function openStore(dbPath: string): Store {
         record.state,
         record.attempt,
         record.turns,
+        record.maxTurns,
         record.spendUsd,
         toSql(record.sessionFile),
         toSql(record.prUrl),
@@ -337,6 +350,7 @@ export function openStore(dbPath: string): Store {
       const row = selectLatestRun.get(project, issue);
       return row ? toRecord(row) : undefined;
     },
+
 
     runsStartedSince(project: string, sinceEpochMs: number): number {
       return countStartedSince.get(project, sinceEpochMs)?.n ?? 0;

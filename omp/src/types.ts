@@ -317,6 +317,8 @@ export interface RunRecord {
   /** 1-based attempt number, checked against `Caps.maxAttemptsPerIssue`. */
   attempt: number;
   turns: number;
+  /** Effective turn ceiling for this run; operators may only raise it. */
+  maxTurns: number;
   spendUsd: number;
   /** omp session transcript, so a human can read what the worker actually did. */
   sessionFile?: string;
@@ -361,6 +363,7 @@ export interface DispatchSummary {
   degraded: boolean;
   holds: AdmissionHoldSummary[];
 }
+
 
 /**
  * Bookkeeping only — GitHub labels remain the source of truth. The store

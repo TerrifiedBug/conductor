@@ -80,6 +80,7 @@ usage:
   omp-conductor disarm [--project NAME]
   omp-conductor release-pane [--project NAME]
   omp-conductor tail <issue> [--project NAME]
+  omp-conductor extend <issue> --turns N [--project NAME]
   omp-conductor unblock <issue> [--project NAME]
   omp-conductor daemon [--once] [--port N] [--project NAME]
   omp-conductor pause
@@ -121,6 +122,8 @@ usage:
            the daemon rather than terminals, so this is the only way to watch
            one live. Runs until Ctrl-C, or until the run has finished and its
            transcript has stopped growing.
+  extend   monotonically raise a live run's turn ceiling without restarting its
+           session. Refuses settled runs and values at or below its current cap.
   unblock  clear <issue>'s blocked and failed labels so the next tick can claim
            it again — the supported way back for an escalation you answered,
            and why the brief's "never hand-edit a state label" rule can stay
@@ -185,6 +188,17 @@ function portFlag(argv: string[]): number | undefined {
     process.exit(2);
   }
   return port;
+}
+
+/** Required positive integer for `extend`; no partial parses such as `180x`. */
+function turnsFlag(argv: string[]): number {
+  const raw = flag(argv, "turns");
+  const turns = raw === undefined ? Number.NaN : Number(raw);
+  if (!Number.isSafeInteger(turns) || turns < 1) {
+    process.stderr.write(`omp-conductor: extend needs --turns with a positive integer, got "${raw ?? ""}"\n`);
+    process.exit(2);
+  }
+  return turns;
 }
 
 function humanDuration(ms: number): string {
@@ -580,6 +594,44 @@ try {
     case "tail": {
       const issue = issueArg("tail", argv[1]);
       await tailRun(findProject(loadConfig(), flag(argv, "project")).name, issue);
+      break;
+    }
+
+    case "extend": {
+      const issue = issueArg("extend", argv[1]);
+      const maxTurns = turnsFlag(argv);
+      const project = findProject(loadConfig(), flag(argv, "project"));
+      const daemon = livingDaemon();
+      if (daemon === undefined) throw new Error("daemon is not running");
+      if (daemon.project !== undefined && daemon.project !== project.name) {
+        throw new Error(
+          `daemon serves project "${daemon.project}", not requested project "${project.name}"`,
+        );
+      }
+      const response = await fetch(
+        `http://127.0.0.1:${daemon.port}/runs/${issue}/turn-limit`,
+        {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ maxTurns }),
+        },
+      );
+      const payload = (await response.json()) as {
+        error?: unknown;
+        runId?: unknown;
+        maxTurns?: unknown;
+      };
+      if (!response.ok) {
+        throw new Error(
+          typeof payload.error === "string" ? payload.error : `daemon returned HTTP ${response.status}`,
+        );
+      }
+      if (typeof payload.runId !== "string" || typeof payload.maxTurns !== "number") {
+        throw new Error("daemon returned an invalid turn-extension response");
+      }
+      process.stdout.write(
+        `#${issue} turn ceiling extended to ${payload.maxTurns} (run ${payload.runId})\n`,
+      );
       break;
     }
 

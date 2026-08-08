@@ -53,6 +53,7 @@ function draft(over: Partial<Omit<RunRecord, "id">> = {}): Omit<RunRecord, "id">
     state: "blocked",
     attempt: 1,
     turns: 12,
+    maxTurns: DEFAULT_CAPS.workerMaxTurns,
     spendUsd: 1.5,
     startedAt: 1_000,
     ...over,

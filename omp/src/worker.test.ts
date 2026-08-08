@@ -76,6 +76,37 @@ function fakeHarness(opts?: {
   };
 }
 
+function controlledTurnHarness(onAbort: () => void = () => {}) {
+  const handlers = new Map<string, ((e: unknown) => void)[]>();
+  const entered = Promise.withResolvers<void>();
+  const stopped = Promise.withResolvers<void>();
+  let aborts = 0;
+  const session = {
+    prompt: async () => {
+      entered.resolve();
+      await stopped.promise;
+    },
+    on: (event: string, cb: (e: unknown) => void) => {
+      const list = handlers.get(event) ?? [];
+      list.push(cb);
+      handlers.set(event, list);
+    },
+    abort: () => {
+      onAbort();
+      aborts += 1;
+      stopped.resolve();
+    },
+  };
+  return {
+    started: entered.promise,
+    emitTurn: () => {
+      for (const cb of handlers.get("turn_start") ?? []) cb({});
+    },
+    aborts: () => aborts,
+    deps: { createSession: async () => session as never },
+  };
+}
+
 const workerOpts = (over: Partial<WorkerOpts> = {}): WorkerOpts => ({
   brief: "Fix the flaky gate.",
   cwd: "/tmp/worktree",
@@ -258,6 +289,58 @@ describe("shouldComplete", () => {
 });
 
 
+describe("runWorker turn ceiling", () => {
+  test("observes an extension immediately before the old boundary", async () => {
+    const harness = controlledTurnHarness();
+    let maxTurns = 2;
+    const run = runWorker(
+      workerOpts({
+        caps: { ...DEFAULT_CAPS, workerMaxTurns: 2 },
+        maxTurns: () => maxTurns,
+      }),
+      harness.deps,
+    );
+    await harness.started;
+
+    harness.emitTurn();
+    harness.emitTurn();
+    maxTurns = 3;
+    harness.emitTurn();
+    expect(harness.aborts()).toBe(0);
+
+    harness.emitTurn();
+    expect(await run).toMatchObject({ state: "killed", killedBy: "turns", turns: 4 });
+    expect(harness.aborts()).toBe(1);
+  });
+
+  test("latches the cap before abort begins", async () => {
+    let latched = false;
+    let abortSawLatch = false;
+    const harness = controlledTurnHarness(() => {
+      abortSawLatch = latched;
+    });
+    const run = runWorker(
+      workerOpts({
+        caps: { ...DEFAULT_CAPS, workerMaxTurns: 2 },
+        onKilled: () => {
+          latched = true;
+        },
+      }),
+      harness.deps,
+    );
+    await harness.started;
+
+    harness.emitTurn();
+    harness.emitTurn();
+    harness.emitTurn();
+    expect(abortSawLatch).toBe(true);
+
+    expect(latched).toBe(true);
+    expect(await run).toMatchObject({ state: "killed", killedBy: "turns", turns: 3 });
+    expect(harness.aborts()).toBe(1);
+  });
+});
+
 describe("costUsdFromMessage", () => {
   test("reads usage.cost.total from a live-shaped assistant message", () => {
     expect(
@@ -335,6 +418,7 @@ describe("runWorker spend metering", () => {
       state: "running",
       attempt: 1,
       turns: 0,
+      maxTurns: DEFAULT_CAPS.workerMaxTurns,
       spendUsd: 0,
       startedAt: 1_000,
     });

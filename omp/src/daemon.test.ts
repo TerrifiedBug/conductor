@@ -40,6 +40,7 @@ import {
   checkIntegrity,
   checkStall,
   createWorkerPool,
+  createTurnLimitRegistry,
   dispatchAdmissions,
   daemonHealthSnapshot,
   formatDispatchSummary,
@@ -51,6 +52,7 @@ import {
   salvageLines,
   summarizeDispatch,
   tick,
+  turnLimitResponse,
   settlePushedGreen,
   verifyPushedGreenClaim,
 } from "./daemon.ts";
@@ -80,6 +82,7 @@ function draft(over: Partial<Omit<RunRecord, "id">> = {}): Omit<RunRecord, "id">
     state: "running",
     attempt: 1,
     turns: 0,
+    maxTurns: DEFAULT_CAPS.workerMaxTurns,
     spendUsd: 0,
     startedAt: 1_000,
     ...over,
@@ -403,6 +406,9 @@ function deps(store: Store, tracker: Tracker, caps: Partial<Caps> = {}) {
       caps: { ...DEFAULT_CAPS, ...caps },
       tracker,
       store,
+      turnLimits: createTurnLimitRegistry(() => {}),
+      integrity: { baseline: packageManifest(), paged: false },
+      stall: { paged: false },
       escalate: async (e: Escalation): Promise<void> => {
         escalated.push(e);
       },
@@ -468,6 +474,85 @@ describe("dispatchAdmissions", () => {
     release.resolve();
     await dispatch;
     expect(finished).toBe(true);
+  });
+});
+
+describe("live turn-limit control", () => {
+  const request = (issue: number, maxTurns: number): Request =>
+    new Request(`http://127.0.0.1/runs/${issue}/turn-limit`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ maxTurns }),
+    });
+
+  it("raises the controller and persisted effective ceiling together", async () => {
+    const store = openStore(":memory:");
+    const run = store.createRun(draft({ maxTurns: 120 }));
+    const registry = createTurnLimitRegistry((runId, maxTurns) => {
+      store.updateRun(runId, { maxTurns });
+    });
+    registry.open(PROJECT, run.issue, run.id, 120);
+
+    const response = await turnLimitResponse(request(run.issue, 180), PROJECT, store, registry);
+
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toMatchObject({
+      kind: "extended",
+      runId: run.id,
+      maxTurns: 180,
+    });
+    expect(store.getRun(run.id)?.maxTurns).toBe(180);
+    store.close();
+  });
+
+  it("refuses equal or lower values", async () => {
+    const store = openStore(":memory:");
+    const run = store.createRun(draft({ maxTurns: 180 }));
+    const registry = createTurnLimitRegistry(() => {});
+    registry.open(PROJECT, run.issue, run.id, 180);
+
+    const response = await turnLimitResponse(request(run.issue, 180), PROJECT, store, registry);
+
+    expect(response?.status).toBe(409);
+    expect(await response?.json()).toEqual({
+      error: `#${run.issue} already has a 180-turn ceiling`,
+    });
+    store.close();
+  });
+
+  it("cannot report success after the live controller settles", async () => {
+    const store = openStore(":memory:");
+    const run = store.createRun(draft({ state: "running", maxTurns: 120 }));
+    const registry = createTurnLimitRegistry((runId, maxTurns) => {
+      store.updateRun(runId, { maxTurns });
+    });
+    const controller = registry.open(PROJECT, run.issue, run.id, 120);
+    controller.close();
+
+    const response = await turnLimitResponse(request(run.issue, 180), PROJECT, store, registry);
+
+    expect(response?.status).toBe(409);
+    expect(await response?.json()).toEqual({
+      error:
+        `#${run.issue} has no live worker controller; its session already settled ` +
+        "or belongs to another daemon (stored state: running)",
+    });
+    expect(store.getRun(run.id)?.maxTurns).toBe(120);
+    store.close();
+  });
+
+  it("distinguishes an unknown issue from a settled run", async () => {
+    const store = openStore(":memory:");
+    const response = await turnLimitResponse(
+      request(404, 180),
+      PROJECT,
+      store,
+      createTurnLimitRegistry(() => {}),
+    );
+
+    expect(response?.status).toBe(404);
+    expect(await response?.json()).toEqual({ error: "no run recorded for #404" });
+    store.close();
   });
 });
 
@@ -547,6 +632,7 @@ describe("tick dispatch summary", () => {
             tracker,
             store,
             escalate: async () => {},
+            turnLimits: createTurnLimitRegistry(() => {}),
             integrity: { baseline: packageManifest(), paged: false },
             stall: { paged: false },
           },

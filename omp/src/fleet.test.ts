@@ -803,6 +803,37 @@ test("status distinguishes degraded admission from idle capacity", () => {
   expect(text).toContain("active runs  (none)");
 });
 
+test("status distinguishes each live ceiling from the new-worker default", () => {
+  writeMinimalConfig();
+  writeTick();
+  const s = statusSnapshot();
+  const text = formatFleetStatus(
+    {
+      ...s,
+      activeRuns: [
+        {
+          id: "run-84",
+          project: s.project,
+          issue: 84,
+          repo: "api",
+          branch: "feat/live-turn-extension",
+          worktree: "/tmp/84",
+          state: "running",
+          attempt: 1,
+          turns: 120,
+          maxTurns: 180,
+          spendUsd: 3.25,
+          startedAt: 1_000,
+        },
+      ],
+    },
+    fleetLayers(),
+  );
+
+  expect(text).toContain("new worker turns   120");
+  expect(text).toContain("#84  api  running  attempt 1  120/180 turns");
+});
+
 test("status prints the next scheduled tick and Telegram health", () => {
   writeMinimalConfig();
   const cwd = writeTick();
