@@ -13,10 +13,11 @@ A Herdr plugin: one manifest, one Bash script, no build step.
 | --- | --- | --- |
 | `[[startup]]` | every Herdr server start and live handoff | resume the fleet session, or page |
 | `[[events]] on = "pane.exited"` | a pane's own process dies | ignore other panes; for the fleet pane, resume or page |
-| `[[events]] on = "pane.agent_detected"` | an agent appears in or disappears from a pane | same, and this is the hook that catches omp exiting |
+| `[[events]] on = "pane.agent_detected"` | an agent appears in or disappears from a pane | ignore appearance; on a release, recover the exact fleet pane or page |
 
-All three entry points run the same idempotent flow, so extra invocations cost one
-`agent list` plus one `pane process-info` call and change nothing.
+Startup, pane exit, and agent-release entry points run the same idempotent flow.
+An appearance event exits before any Herdr call: it is the result of recovery,
+not another reason to resume the same session while Herdr state is converging.
 
 ## Why it exists
 
@@ -170,10 +171,12 @@ collisions impossible; the suffix is there for the day it does not.
    exits); else what this plugin last remembered in its identity file. More than one
    candidate in a tier, or two sources naming different panes, is a page. A pane
    saved under a *different* agent name is never a candidate.
-4. **Event filter.** The event's pane id from `HERDR_PLUGIN_EVENT_JSON` is compared
-   with that pane id. A different pane exits 0 without a single Herdr call. With no
-   resolvable identity there is no evidence the event was about the fleet, so an
-   event skips silently — the next startup hook is where absence gets paged.
+4. **Event filter.** A `pane.agent_detected` event must carry
+   `data.released = true`; appearance events skip before any Herdr call. The
+   released event's pane id from `HERDR_PLUGIN_EVENT_JSON` is then compared with
+   the resolved fleet pane. A different pane exits 0 without a Herdr call. With
+   no resolvable identity there is no evidence the event was about the fleet, so
+   an event skips silently — the next startup hook is where absence gets paged.
 5. **Liveness.** `herdr agent list` for `AGENT_NAME`, then
    `herdr pane process-info` on each pane that claims it. Three signals, in order:
    - the call itself fails when the pane has no live terminal

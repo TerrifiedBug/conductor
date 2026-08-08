@@ -372,6 +372,10 @@ agent_released_event() { # <pane_id>
   printf '{"event":"pane_agent_detected","data":{"type":"pane_agent_detected","pane_id":"%s","workspace_id":"w1","released":true,"final_status":"idle"}}\n' "$1"
 }
 
+agent_appeared_event() { # <pane_id>
+  printf '{"event":"pane_agent_detected","data":{"type":"pane_agent_detected","pane_id":"%s","workspace_id":"w1","released":false,"final_status":"working"}}\n' "$1"
+}
+
 # A pane whose saved agent name outlived its process: `agent list` still reports
 # the entry, but with no `agent` field, because the label is only serialized
 # while Herdr detects the process (src/api/schema/agents.rs:188-189 +
@@ -666,7 +670,19 @@ check 'a release event for the fleet pane recovers' \
   "plan: $tmp/herdr agent start 'fleet' --kind omp --pane w1:p1 -- --resume=$REF" "$out"
 assert_inert 'a release event for the fleet pane recovers' "$d"
 
-# case 9h — and a release in someone else's pane costs nothing
+# case 9h — the same event also fires when an agent appears. That is the result
+# of recovery, not another reason to recover the same pane.
+d=$(newcase agent-appeared-event)
+saved_session_json fleet "$REF" >"$d/session/session.json"
+empty_agent_list >"$d/agent-list.json"
+pane_list_json "$(free_pane 'w1:p1' "$REF")" >"$d/pane-list.json"
+process_info_json 'w1:p1' >"$d/process-info-w1:p1.json"
+out=$(run_recover "$d" 'pane.agent_detected' "$(agent_appeared_event 'w1:p1')")
+check 'an appearance event does not trigger another resume' \
+  'skip: pane.agent_detected did not release an agent' "$out"
+assert_inert 'an appearance event does not trigger another resume' "$d"
+
+# case 9i — and a release in someone else's pane costs nothing
 d=$(newcase agent-released-elsewhere)
 saved_session_json fleet "$REF" >"$d/session/session.json"
 out=$(run_recover "$d" 'pane.agent_detected' "$(agent_released_event 'w2:p4')")

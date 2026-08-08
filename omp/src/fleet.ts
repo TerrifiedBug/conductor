@@ -1238,6 +1238,14 @@ function probeOmpPane(
   | { kind: "missing" }
   | { kind: "unknown"; reason: string } {
   const tick = resolveTickConfig(projectName);
+  if (tick.kind === "invalid") {
+    return {
+      kind: "unknown",
+      reason:
+        `tick config invalid at ${tick.path} (${tick.problem}) — ` +
+        "the conductor agent name cannot be read",
+    };
+  }
   const agentName =
     tick.kind === "ok" ? (tick.config.agentName ?? DEFAULT_FLEET_AGENT_NAME) : DEFAULT_FLEET_AGENT_NAME;
   const session = process.env["HERDR_SESSION"] ?? "fleet";
