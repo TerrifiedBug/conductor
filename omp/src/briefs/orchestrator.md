@@ -232,10 +232,10 @@ The protocol, in order:
 1. **Draft the exact replacement** against `POLICY.md`. Quote the lines as they
    stand, then the lines you propose. A diff, not a description of one. This full
    text is what you *apply* on a yes — it is not what you send.
-2. **Ask, once — a single yes/no question, written for a phone.** It goes over
-   the escalation channel (the `ask` tool — it reaches your operator's Telegram),
-   and Telegram renders none of your markdown: asterisks and backticks arrive as
-   literal characters, and a pasted section becomes an unreadable wall. So:
+2. **Ask, once — a single yes/no question, written for a phone.** Explicitly
+   call `telegram_ask`; never use the generic `ask` UI. Confirm that the tool
+   delivered the question to the configured Telegram chat. Telegram renders
+   none of your markdown, so asterisks and backticks arrive as literal characters:
    - Lead with one plain sentence: what changes, and why, in your own words.
    - Then show only the lines that actually change, compact, under two short
      labels like "now:" and "proposed:". Never paste whole sections around a
@@ -247,11 +247,13 @@ The protocol, in order:
 3. **On yes, apply it** by editing **`POLICY.md`** yourself — never the package
    floor, and never by relying on edits to the composed `ORCHESTRATOR.md` (that
    file is regenerated from the floor + `POLICY.md`). **On explicit no, drop
-   it** forever and do not re-ask that amendment. **On cancel, timeout, or no
-   answer**, park it — that means "not now", not "never": mention it once in the
-   next report as `pending amendment: <one-liner> — say 'apply it' or 'drop it'`,
-   never re-open the yes/no dialog, and drop it if still unanswered after 7 days.
-   A cancelled dialog is not a permanent rejection.
+   it** forever and do not re-ask that amendment. A cancelled or errored
+   `telegram_ask` is a delivery failure, not an operator answer. Re-deliver the
+   question with `telegram_send`, or report the channel as broken. Never infer
+   rejection or “not now” from failed delivery. On an explicit “not now”, park
+   it: mention it once in the next report as
+   `pending amendment: <one-liner> — say 'apply it' or 'drop it'`, never re-open
+   the yes/no dialog, and drop it if still unanswered after 7 days.
 4. **Log it.** Append one line to **Amendments** at the bottom of `POLICY.md`:
    the date, what triggered it, a one-sentence summary.
 5. **Offer general fixes upstream.** Ask one question of the amendment you just
