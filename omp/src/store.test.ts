@@ -1,4 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { Database } from "bun:sqlite";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { openStore } from "./store.ts";
 import type { RunRecord, Store } from "./types.ts";
@@ -34,7 +38,9 @@ describe("openStore", () => {
   });
 
   it("creates a run with a generated id that reads back intact", () => {
-    const created = store.createRun(draft({ sessionFile: "/tmp/session.jsonl" }));
+    const created = store.createRun(
+      draft({ sessionFile: "/tmp/session.jsonl", headSha: "a".repeat(40) }),
+    );
 
     expect(created.id).toBeString();
     expect(created.id.length).toBeGreaterThan(0);
@@ -49,6 +55,9 @@ describe("openStore", () => {
     store.createRun(draft({ issue: 2, state: "merged" }));
     store.createRun(draft({ issue: 3, state: "failed" }));
     const claimed = store.createRun(draft({ issue: 4, state: "claimed", startedAt: 2_000 }));
+    const pending = store.createRun(
+      draft({ issue: 7, state: "pushed-pending", startedAt: 2_500 }),
+    );
     const pushed = store.createRun(draft({ issue: 5, state: "pushed-green", startedAt: 3_000 }));
     // Another project's work must never consume this project's slots.
     store.createRun(draft({ project: "other", issue: 6, state: "running" }));
@@ -56,6 +65,7 @@ describe("openStore", () => {
     expect(store.activeRuns(PROJECT).map((r) => r.id)).toEqual([
       live.id,
       claimed.id,
+      pending.id,
       pushed.id,
     ]);
   });
@@ -143,6 +153,28 @@ describe("openStore", () => {
     // Re-marking is the whole point of the guard: it must stay idempotent.
     expect(() => store.markNotified("demo/42/tier2")).not.toThrow();
     expect(store.wasNotified("demo/42/tier2")).toBe(true);
+  });
+
+  it("adds headSha to a pre-0.3.19 run database without losing rows", () => {
+    const dir = mkdtempSync(join(tmpdir(), "conductor-store-"));
+    const path = join(dir, "runs.sqlite");
+    const legacy = new Database(path);
+    legacy.exec(`
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY, project TEXT NOT NULL, issue INTEGER NOT NULL,
+        repo TEXT NOT NULL, branch TEXT NOT NULL, worktree TEXT NOT NULL,
+        state TEXT NOT NULL, attempt INTEGER NOT NULL, turns INTEGER NOT NULL,
+        spendUsd REAL NOT NULL, sessionFile TEXT, prUrl TEXT,
+        startedAt INTEGER NOT NULL, endedAt INTEGER, lastError TEXT
+      );
+    `);
+    legacy.close();
+
+    const migrated = openStore(path);
+    const created = migrated.createRun(draft({ headSha: "a".repeat(40) }));
+    expect(migrated.getRun(created.id)?.headSha).toBe("a".repeat(40));
+    migrated.close();
+    rmSync(dir, { recursive: true, force: true });
   });
 
   it("ignores an update for an unknown id instead of throwing", () => {

@@ -217,6 +217,12 @@ export interface ReadyIssue {
  */
 export type PrState = "merged" | "closed" | "open";
 
+/** Result of independently checking a worker's claimed green pull request. */
+export interface PrVerification {
+  status: "green" | "pending" | "failed";
+  reason: string;
+}
+
 /**
  * Deliberately narrow so a Gitea or local-file tracker can drop in later.
  * Nothing here is GitHub-shaped; the GitHub adapter owns `gh` entirely.
@@ -265,6 +271,11 @@ export interface Tracker {
    * is how a PR a human rejected gets recorded as merged.
    */
   prState(url: string): Promise<PrState | undefined>;
+  /**
+   * Verify that a worker's pull request is open, ready, still at the reported
+   * head, and has a non-empty terminal-success check rollup.
+   */
+  verifyPr(url: string, expectedHead: string): Promise<PrVerification | undefined>;
 }
 
 /**
@@ -276,6 +287,8 @@ export type RunState =
   | "claimed"
   | "running"
   | "pushed-green"
+  /** Worker finished, but GitHub has not yet produced a terminal check verdict. */
+  | "pushed-pending"
   /** Its PR landed. Written by the tick's settle sweep, never by a worker: only
    *  the tracker knows, and it knows minutes to days after the run ended. */
   | "merged"
@@ -305,6 +318,8 @@ export interface RunRecord {
   /** omp session transcript, so a human can read what the worker actually did. */
   sessionFile?: string;
   prUrl?: string;
+  /** Pull request head the worker observed after its deterministic CI watcher exited. */
+  headSha?: string;
   startedAt: number;
   endedAt?: number;
   /** Last failure text, surfaced verbatim in escalations. */

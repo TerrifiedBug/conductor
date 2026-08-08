@@ -112,7 +112,11 @@ or the full test suite on this host. It is shared, and CI owns the heavy gates.
    ```bash
    gh pr checks <pr> --repo {{REPO}} --watch --interval 30
    ```
-5. **Green** → stop and report `pushed-green`.
+5. After the watcher exits, read the exact remote head for the final report:
+   ```bash
+   gh pr view <pr> --repo {{REPO}} --json headRefOid --jq .headRefOid
+   ```
+6. **Green** → stop and report `pushed-green`.
    **Red** → diagnose the real cause and make **one** corrective push. Red a
    second time → stop, do not push again, and report `failed` with the failure
    digest (job name plus the decisive log lines).
@@ -148,11 +152,12 @@ Escalating is a successful outcome. Guessing is not.
 
 ## Your final report
 
-End with exactly these six lines, evidence only — no narration:
+End with exactly these seven lines, evidence only — no narration:
 
 ```
 issue:   {{TRACKER_REPO}}#{{ISSUE_NUMBER}}
 pr:      <url or "none">
+head:    <40-character head SHA or "none">
 state:   pushed-green | blocked | failed
 gates:   <exact commands run and their results>
 changed: <files touched, one line>

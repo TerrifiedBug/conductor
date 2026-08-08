@@ -45,6 +45,7 @@ import {
   reconcileOrphanedRuns,
   salvageLines,
   settlePushedGreen,
+  verifyPushedGreenClaim,
 } from "./daemon.ts";
 import type { IntegrityGate, StallGate } from "./daemon.ts";
 import type { Routed } from "./routing.ts";
@@ -363,6 +364,7 @@ function fakeTracker(over: Partial<Tracker>): Tracker {
     parentOf: off("parentOf"),
     openCloserFor: off("openCloserFor"),
     prState: off("prState"),
+    verifyPr: off("verifyPr"),
     ...over,
   };
 }
@@ -646,6 +648,46 @@ describe("admitCandidates", () => {
   });
 });
 
+describe("verifyPushedGreenClaim", () => {
+  const claim = {
+    prUrl: "https://github.com/acme/api/pull/293",
+    headSha: "a".repeat(40),
+  };
+
+  it("accepts only a tracker-verified green claim", async () => {
+    expect(
+      await verifyPushedGreenClaim(
+        { verifyPr: async () => ({ status: "green", reason: "2 checks succeeded" }) },
+        claim,
+      ),
+    ).toEqual({ state: "pushed-green" });
+  });
+
+  it("keeps missing and nonterminal verification pending", async () => {
+    expect(
+      await verifyPushedGreenClaim({ verifyPr: async () => undefined }, claim),
+    ).toEqual({
+      state: "pushed-pending",
+      reason: "GitHub PR verification unavailable; retrying",
+    });
+    expect(
+      await verifyPushedGreenClaim(
+        { verifyPr: async () => ({ status: "pending", reason: "Checks pending: test" }) },
+        claim,
+      ),
+    ).toEqual({ state: "pushed-pending", reason: "Checks pending: test" });
+  });
+
+  it("rejects a tracker failure with its digest", async () => {
+    expect(
+      await verifyPushedGreenClaim(
+        { verifyPr: async () => ({ status: "failed", reason: "Checks failed: test" }) },
+        claim,
+      ),
+    ).toEqual({ state: "failed", reason: "Checks failed: test" });
+  });
+});
+
 // --------------------------------------------------------- settlePushedGreen
 
 describe("settlePushedGreen", () => {
@@ -706,6 +748,55 @@ describe("settlePushedGreen", () => {
     expect(store.getRun(run.id)?.state).toBe("pushed-green");
     expect(store.getRun(run.id)?.endedAt).toBeUndefined();
     expect(store.activeRuns(PROJECT).map((r) => r.id)).toEqual([run.id]);
+  });
+
+  it("promotes a pending push only after a fresh green verification", async () => {
+    const run = store.createRun(
+      draft({
+        issue: 266,
+        state: "pushed-pending",
+        prUrl: PR,
+        headSha: "a".repeat(40),
+        lastError: "Checks pending: test",
+      }),
+    );
+    const { d } = deps(
+      store,
+      fakeTracker({
+        prState: async () => "open",
+        verifyPr: async () => ({ status: "green", reason: "2 checks succeeded" }),
+      }),
+    );
+
+    await settlePushedGreen(d);
+
+    expect(store.getRun(run.id)?.state).toBe("pushed-green");
+    expect(store.getRun(run.id)?.lastError).toBeUndefined();
+    expect(store.activeRuns(PROJECT).map((r) => r.id)).toEqual([run.id]);
+  });
+
+  it("fails a pending push when the fresh verification turns red", async () => {
+    const run = store.createRun(
+      draft({
+        issue: 267,
+        state: "pushed-pending",
+        prUrl: PR,
+        headSha: "a".repeat(40),
+      }),
+    );
+    const { d } = deps(
+      store,
+      fakeTracker({
+        prState: async () => "open",
+        verifyPr: async () => ({ status: "failed", reason: "Checks failed: test" }),
+      }),
+    );
+
+    await settlePushedGreen(d);
+
+    expect(store.getRun(run.id)?.state).toBe("failed");
+    expect(store.getRun(run.id)?.lastError).toBe("Checks failed: test");
+    expect(store.activeRuns(PROJECT)).toEqual([]);
   });
 
   it("leaves a row alone when the tracker cannot tell", async () => {
