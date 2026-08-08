@@ -7,17 +7,16 @@ tiers: first to an orchestrator session that can re-brief the worker, then to yo
 ## What it is
 
 You label an issue. Within one tick the conductor claims it on the tracker, cuts a
-worktree, hands one omp session a self-contained brief, watches it to a green PR —
-and then stops. Merging is a human act; the conductor never performs it.
+worktree, hands one omp worker a self-contained brief, and watches it to a green
+PR. The worker then stops: it never merges, tags, publishes or deploys.
 
 ### Scope
 
-One issue, one green PR. That is the whole remit.
-
-Merging is a human act, and so is releasing. Releases are **batched**: cut from a
-coherent group of merged work by a human-supervised decision, never one per PR. So
-nothing in this package tags, pins, deploys or publishes, and no worker is ever
-asked to. A worker whose change needs releasing reports that and stops.
+One issue, one green PR. That is the worker's whole remit. A change that needs a
+merge or release is reported to the orchestrator, whose `merge` and `release`
+authority are chosen during setup and default to `human`. Granting either action
+to the orchestrator never grants it to a worker or the dispatch daemon. Releases
+remain batched from coherent groups of merged work, never cut one per worker PR.
 
 Code counts every limit that decides whether work starts: concurrency, dollars per
 day, turns and wall clock per worker, attempts per issue. None of it is left to the
@@ -29,8 +28,8 @@ When a run does get stuck, the first responder is not you. A tier-1 escalation i
 injected into a long-lived **orchestrator session** that can read the issue and the
 run's transcript and then either re-brief the worker or decide the problem genuinely
 needs a human. It never edits product code and never pushes a branch; whether it
-may *merge* is a setup answer (`authority`), and it defaults to no. Only tier 2
-pages you directly.
+may merge or release is a setup answer (`authority`), and both default to no. Only
+tier 2 pages you directly.
 
 The package ships three deployables, plus one skill:
 
@@ -225,7 +224,7 @@ the file behind instead. So a re-run against a project that is already configure
 opens with one question:
 
 ```text
-"veltro" is already configured — what would you like to do?
+"platform" is already configured — what would you like to do?
 > Change one area
     asks one area's questions; every other answer is carried through from the saved config
   Walk every question again
@@ -237,14 +236,14 @@ says right now, so the row you want is the row you can see:
 
 ```text
 Which area? Each row shows what it says now
-  tracker & repos — veltrosecurity/veltro, queue "ready-for-agent", "repo:" → veltro, chad, warden, vectorflow
-  gates — veltro: none; chad: ruff check . @ backend, pnpm lint @ frontend; warden: ruff check . @ backen…
+  tracker & repos — acme/platform, queue "ready-for-agent", "repo:" → platform, api, web, worker
+  gates — platform: bun run check; api: ruff check . @ backend; web: pnpm lint…
   caps & worker model — 2 workers, 120 turns, 90m, $25/day, 2 attempts (all defaults) — harness default model
   code graph — not configured — workers grep
   authority — merge=orchestrator, release=orchestrator
-  escalation & triage — tier 2 pages Telegram 8236653927, comments too, triage external
+  escalation & triage — tier 2 pages Telegram 123456789, comments too, triage external
   reporting scope — material — escalations, plus green PRs, second failures, and anything that stops the fleet
-  orchestrator brief — none at /root/.omp/conductor/worktrees/ORCHESTRATOR.md
+  orchestrator brief — none at ~/.omp/conductor/worktrees/ORCHESTRATOR.md
 ```
 
 Only that area's questions are asked. Every other answer is read back out of
@@ -254,11 +253,11 @@ writes a config, and it still writes nothing before you agree. The consent scree
 leads with the delta and then shows the whole project as it would be written:
 
 ```text
-amending       code graph  —  project veltro
+amending       code graph  —  project platform
   was            not configured — workers grep
-  now            /root/.cache/conductor-graph/veltrosecurity — 4 clone(s): veltro, chad, warden, vectorflow
+  now            ~/.cache/conductor-graph/acme — 4 clone(s): platform, api, web, worker
   carried over   tracker & repos, gates, caps & worker model, authority, escalation & triage, reporting scope, orchestrator brief
-                 read back from /root/.omp/conductor/config.json and rewritten unchanged
+                 read back from ~/.omp/conductor/config.json and rewritten unchanged
 ```
 
 A first run, or a project name this config has never seen, never sees either
@@ -1043,7 +1042,7 @@ indistinguishable from the first:
 ```text
 [omp-conductor] orchestrator tick inactive: pane w1:p1 (agent "fleet") owns the fleet tick here — this session will not tick
 [omp-conductor] orchestrator tick inactive: this pane is agent "scratch", not the fleet agent "fleet" — this session will not tick
-[omp-conductor] orchestrator tick inactive: pid 4147344 (claimed 2026-08-07T07:55:36.001Z, session …/fleet.jsonl) owns the fleet tick in /root/.omp/conductor — this session will not tick
+[omp-conductor] orchestrator tick inactive: pid 12345 (claimed 2026-01-02T03:04:05.000Z, session …/fleet.jsonl) owns the fleet tick in /home/conductor/.omp/conductor — this session will not tick
 ```
 
 A `herdr agent list` that does not answer also declines, for the same reason the
@@ -1368,8 +1367,9 @@ Known and deliberate in this version:
   `slots = maxConcurrentWorkers - live workers`, admits at most that many issues
   per tick, and dispatches them together. To see them, read `omp-conductor
   status`, which lists every occupied issue, or follow `daemon.log`.
-- **Merges, releases and deploys are human-only, by design.** The conductor
-  produces green PRs and stops.
+- **Workers stop at green PRs.** They never merge, release or deploy. Those
+  actions default to a human, but setup may grant either to the orchestrator;
+  `authority` never grants them to a worker or the dispatch daemon.
 - **Worker confinement is partial.** Structured `write` / `edit` / `read` /
   `grep` / `glob` calls are blocked outside the worktree by an inline harness
   extension (`confineToCwd`). `bash` is not: a shell one-liner can still leave

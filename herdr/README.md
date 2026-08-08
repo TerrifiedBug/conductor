@@ -114,11 +114,9 @@ current session.
   socket path next to `session.json`.
 - **[omp-telegram](https://www.npmjs.com/package/omp-telegram)**, installed and
   paired, if you want to hear about a fleet that is down. This plugin holds no
-  credentials of its own; it borrows omp-telegram's files: the bot token from
-  `TELEGRAM_ENV` (default `/root/.omp/agent/telegram/.env`) and the chat id from
-  the first `allowFrom` entry in `ACCESS_JSON` (default
-  `/root/.omp/agent/telegram/access.json`). Both paths are overridable in
-  `config.env`.
+  credentials of its own; it borrows omp-telegram's bot token from
+  `TELEGRAM_ENV` and the first `allowFrom` chat id from `ACCESS_JSON`. Set both
+  paths explicitly in `config.env` for a new deployment.
 
   Without them, recovery still runs and still logs; only the page is skipped, and
   the log line says which file was missing. A Herdr notification is always raised
@@ -133,17 +131,19 @@ herdr plugin log list --plugin herdr-conductor
 
 ## Configuration
 
-Optional. Write `config.env` into the directory printed by
+Write `config.env` into the directory printed by
 `herdr plugin config-dir herdr-conductor`. It is plain shell, sourced, so comments
-and quoting work. A missing file means "all defaults".
+and quoting work. New deployments should set `FLEET_CWD`, `TELEGRAM_ENV` and
+`ACCESS_JSON` explicitly. A missing file still uses the legacy fallbacks for
+compatibility with existing installs.
 
 | Key | Default | Notes |
 | --- | --- | --- |
 | `TARGET_SESSION` | `fleet` | The Herdr session that owns the fleet. Runs in any other session skip immediately. Empty disables the guard — see [Session scoping](#session-scoping). |
 | `AGENT_NAME` | `fleet` | The Herdr agent name of the fleet session. This is the identity everything else hangs off; Herdr keeps live agent names unique. |
-| `FLEET_CWD` | `/root/fleet` | The fleet session's working directory. Reported in pages; a saved pane whose cwd has drifted logs a warning rather than blocking recovery. |
-| `TELEGRAM_ENV` | `/root/.omp/agent/telegram/.env` | Read for `TELEGRAM_BOT_TOKEN` (`export` and quotes tolerated). Owned by omp-telegram; this plugin only borrows the token. |
-| `ACCESS_JSON` | `/root/.omp/agent/telegram/access.json` | The paged chat is `.allowFrom[0]` — the owner omp-telegram is paired with. |
+| `FLEET_CWD` | legacy fallback | The fleet session's working directory. Set it to the directory containing `.conductor-tick.json`; it is reported in pages, and a saved pane whose cwd has drifted logs a warning rather than blocking recovery. |
+| `TELEGRAM_ENV` | legacy fallback | Path to omp-telegram's `.env`, read for `TELEGRAM_BOT_TOKEN` (`export` and quotes tolerated). |
+| `ACCESS_JSON` | legacy fallback | Path to omp-telegram's `access.json`; the paged chat is `.allowFrom[0]`. |
 | `SESSION_JSON` | derived | Escape hatch. By default the snapshot is found next to `HERDR_SOCKET_PATH`, because Herdr keeps `herdr.sock` and `session.json` in the same session data directory. |
 | `RECOVER_RECHECK_SECONDS` | `2` | How long to wait before re-reading a name claim whose process is gone. Herdr releases the name a beat after it observes the exit, and this keeps that window from paging. `0` disables the wait. |
 | `BOOTSTRAP_RESUME` | unset | First provisioning only: an exact omp session ref (absolute `.jsonl` path or session id) to resume when **no** fleet pane has ever been saved. Used at most once — a marker retires it — so a later loss of identity pages instead of quietly provisioning a second fleet. |
@@ -253,7 +253,7 @@ overridable with `SESSION_JSON` for a named one.
 Run it against the live server to see exactly what the next restart would do:
 
 ```text
-herdr-conductor: dry-run: plan: herdr agent start 'fleet' --kind omp --pane w1:p1 -- --resume=/root/.omp/agent/sessions/….jsonl (ref kind: path)
+herdr-conductor: dry-run: plan: herdr agent start 'fleet' --kind omp --pane w1:p1 -- --resume=/home/conductor/.omp/agent/sessions/….jsonl (ref kind: path)
 ```
 
 ## The one Herdr setting that matters
