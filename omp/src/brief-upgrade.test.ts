@@ -8,9 +8,9 @@
  */
 
 import { expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import {
   checkBrief,
   composeOrchestrator,
@@ -19,6 +19,7 @@ import {
   formatRetrofitRefusal,
   COMPOSE_BANNER,
   migrateToPolicy,
+  migrateLegacyBriefBackups,
   missingSections,
   proposeRetrofit,
   refreshComposedBrief,
@@ -121,6 +122,7 @@ test("migrateToPolicy strips leftover banner crumbs from owned", () => {
       policyPath,
       floor: "# Floor\n\n## Duty 1\nnew.\n",
       owned: crumbOwned,
+      backupRoot: join(dir, "backups"),
     });
     const policy = readFileSync(policyPath, "utf8");
     expect(policy.trimStart()).toMatch(/^## Releases/);
@@ -136,6 +138,7 @@ test("repairPolicyBannerCrumbs cleans an already-migrated POLICY.md", () => {
   try {
     const orchestratorPath = join(dir, "ORCHESTRATOR.md");
     const policyPath = join(dir, "POLICY.md");
+    const backupRoot = join(dir, "backups");
     writeFileSync(
       policyPath,
       [
@@ -152,8 +155,12 @@ test("repairPolicyBannerCrumbs cleans an already-migrated POLICY.md", () => {
       orchestratorPath,
       policyPath,
       floor: "# Floor\n\n## Duty 1\nx.\n",
+      backupRoot,
     });
     expect(result).toBeDefined();
+    expect(result?.policyBackup?.startsWith(`${backupRoot}/POLICY.md.bak-`)).toBe(true);
+    expect(result?.orchestratorBackup?.startsWith(`${backupRoot}/ORCHESTRATOR.md.bak-`)).toBe(true);
+    expect(readdirSync(dir).some((name) => name.includes(".bak-"))).toBe(false);
     const policy = readFileSync(policyPath, "utf8");
     expect(policy.trimStart()).toMatch(/^## Releases/);
     expect(policy).not.toContain("<!--");
@@ -234,6 +241,7 @@ test("migrateToPolicy keeps an unrelated leading operator comment", () => {
       orchestratorPath,
       policyPath,
       floor: "# Floor\n\n## Duty 1\nnew.\n",
+      backupRoot: join(dir, "backups"),
       owned,
     });
     const policy = readFileSync(policyPath, "utf8");
@@ -268,6 +276,7 @@ test("repairPolicyBannerCrumbs does not delete an unrelated leading operator com
       orchestratorPath,
       policyPath,
       floor: "# Floor\n\n## Duty 1\nx.\n",
+      backupRoot: join(dir, "backups"),
     });
     expect(result).toBeDefined();
     const policy = readFileSync(policyPath, "utf8");
@@ -406,19 +415,59 @@ test("shippedDiff shows what left and what arrived, ignoring blank lines", () =>
   expect(diff).not.toContain("kept");
 });
 
-test("writeMergedBrief leaves the previous brief on disk", () => {
+test("a brief backup lives under conductor state rather than beside the live file", () => {
   const dir = mkdtempSync(join(tmpdir(), "conductor-brief-"));
-  const path = join(dir, "ORCHESTRATOR.md");
+  const path = join(dir, "worktrees", "8182", "ORCHESTRATOR.md");
+  const backupRoot = join(dir, "state", "backups", "briefs");
+  mkdirSync(join(dir, "worktrees", "8182"), { recursive: true });
   writeFileSync(path, "original policy\n");
 
   try {
-    const backup = writeMergedBrief(path, "upgraded policy\n");
+    const backup = writeMergedBrief(path, "upgraded policy\n", backupRoot);
 
-    // Not optional and not configurable: this file is a standing prompt someone
-    // may have spent an hour on, and an upgrade must never be why it is gone.
     expect(readFileSync(path, "utf8")).toBe("upgraded policy\n");
     expect(readFileSync(backup, "utf8")).toBe("original policy\n");
-    expect(backup.startsWith(`${path}.bak-`)).toBe(true);
+    expect(backup.startsWith(`${backupRoot}/ORCHESTRATOR.md.bak-`)).toBe(true);
+    expect(readdirSync(join(dir, "worktrees", "8182"))).toEqual(["ORCHESTRATOR.md"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("composed refresh relocates only recognizable legacy sidecar backups", () => {
+  const dir = mkdtempSync(join(tmpdir(), "conductor-brief-legacy-"));
+  const workspace = join(dir, "worktrees", "8182");
+  const orchestratorPath = join(workspace, "ORCHESTRATOR.md");
+  const policyPath = join(workspace, "POLICY.md");
+  const backupRoot = join(dir, "state", "backups", "briefs");
+  const orchestratorBackup = `${orchestratorPath}.bak-2026-08-07T10-18-10-912Z`;
+  const policyBackup = `${policyPath}.bak-2026-08-07T10-18-11-012Z`;
+  mkdirSync(workspace, { recursive: true });
+  const operatorBackup = `${policyPath}.bak-before-my-edit`;
+  writeFileSync(orchestratorPath, "stale\n");
+  writeFileSync(policyPath, "## Releases\nlive policy.\n");
+  writeFileSync(orchestratorBackup, "old orchestrator\n");
+  writeFileSync(policyBackup, "old policy\n");
+  writeFileSync(operatorBackup, "operator copy\n");
+
+  try {
+    expect(
+      refreshComposedBrief({
+        orchestratorPath,
+        policyPath,
+        floor: "# Floor\n",
+        backupRoot,
+      }),
+    ).toBe(true);
+
+    expect(existsSync(orchestratorBackup)).toBe(false);
+    expect(existsSync(policyBackup)).toBe(false);
+    expect(existsSync(operatorBackup)).toBe(true);
+    const migrated = readdirSync(backupRoot).sort();
+    expect(migrated).toEqual([basename(orchestratorBackup), basename(policyBackup)].sort());
+    expect(readFileSync(join(backupRoot, basename(orchestratorBackup)), "utf8")).toBe("old orchestrator\n");
+    expect(readFileSync(join(backupRoot, basename(policyBackup)), "utf8")).toBe("old policy\n");
+    expect(migrateLegacyBriefBackups([orchestratorPath, policyPath], backupRoot)).toEqual([]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -474,6 +523,7 @@ test("migrateToPolicy lifts owned half into POLICY.md and recomposes", () => {
       orchestratorPath,
       policyPath,
       floor: "# Floor\n\n## Duty 1\nnew drain.\n",
+      backupRoot: join(dir, "backups"),
     });
     expect(existsSync(policyPath)).toBe(true);
     expect(readFileSync(policyPath, "utf8")).toContain("MY POLICY.");
