@@ -43,6 +43,8 @@ export interface WorkerOpts {
    */
   model?: string;
   onTurn?: (n: number) => void;
+  /** Cumulative USD spend, reported as each cost-bearing message finishes. */
+  onSpend?: (usd: number) => void;
   /**
    * The transcript path, handed over the moment the session opens it rather
    * than at the end with {@link WorkerResult.sessionFile}. Both report the same
@@ -223,16 +225,25 @@ export async function runWorker(
     // transcripts, 2026-08-07). The earlier agent_end.telemetry path never
     // fired, so every run recorded $0 and the daily cap was theater (#46).
     const cost = costUsdFromMessage(message);
-    if (cost !== undefined) spendUsd += cost;
+    if (cost !== undefined) {
+      spendUsd += cost;
+      o.onSpend?.(spendUsd);
+    }
   });
 
   session.on("agent_end", (event) => {
     // Fallback for harnesses that only attach cost on the terminal event.
     const estimated = field(field(field(event, "telemetry"), "cost"), "estimatedUsd");
-    if (typeof estimated === "number" && Number.isFinite(estimated) && estimated > 0) {
+    if (
+      spendUsd === 0 &&
+      typeof estimated === "number" &&
+      Number.isFinite(estimated) &&
+      estimated > 0
+    ) {
       // Prefer message totals when both exist — do not double-count a run that
       // already accumulated per-message costs.
-      if (spendUsd === 0) spendUsd += estimated;
+      spendUsd = estimated;
+      o.onSpend?.(spendUsd);
     }
 
     // Anything that is not literally `false` — including garbage or nothing at
