@@ -874,10 +874,11 @@ export function fleetLayers(projectName?: string): FleetLayers {
   };
 }
 
-function codeGraphFromHealthz(body?: string): CodeGraphHealth | undefined {
+export function codeGraphFromHealthz(body: string | undefined, project: string): CodeGraphHealth | undefined {
   if (body === undefined) return undefined;
   try {
     const parsed = JSON.parse(body) as Record<string, unknown>;
+    if (parsed["project"] !== project) return undefined;
     const graph = parsed["codeGraph"];
     if (graph === null || typeof graph !== "object" || Array.isArray(graph)) return undefined;
     const value = graph as Record<string, unknown>;
@@ -1046,7 +1047,7 @@ export async function renderStatus(projectName?: string): Promise<string> {
     rec === undefined ? undefined : healthCheck(rec.port),
     probeTelegramHealth(projectName),
   ]);
-  const cached = codeGraphFromHealthz(health?.body);
+  const cached = codeGraphFromHealthz(health?.body, project.name);
   const codeGraph = cached ?? (await probeCodeGraph(project));
   return formatFleetStatus(s, layers, health, telegram, Date.now(), codeGraph);
 }

@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   armTicks,
+  codeGraphFromHealthz,
   classifyKillError,
   clearPaneHalt,
   deliverSignal,
@@ -913,6 +914,9 @@ test("configured code-graph status is concise and names degraded evidence", () =
   );
   expect(status).toContain("code graph  degraded  1/2 repos indexed");
   expect(status).toContain("healthz   ok");
+  const body = JSON.stringify({ project: "demo", codeGraph: graph });
+  expect(codeGraphFromHealthz(body, "demo")).toEqual(graph);
+  expect(codeGraphFromHealthz(body, "other")).toBeUndefined();
   expect(status).not.toContain('"codeGraph"');
   expect(text).toContain("web: configured clone is missing");
   expect(formatCodeGraphHealth({ configured: false })).toBeUndefined();
