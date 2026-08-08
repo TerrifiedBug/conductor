@@ -31,6 +31,7 @@ import { findProject, loadConfig, stateDir } from "./config.ts";
 import { isPaused, setPaused, statusSnapshot, type StatusSnapshot } from "./daemon.ts";
 import {
   healthCheck,
+  isAlive,
   livingDaemon,
   stopDaemon,
   type StopResult,
@@ -39,6 +40,7 @@ import {
 import { formatRss, rssBytesFromHealthz } from "./host.ts";
 import {
   readTickConfig,
+  readTickRuntimeStatus,
   TICK_CONFIG_FILE,
   type TickConfig,
   type TickConfigResult,
@@ -304,6 +306,66 @@ export function clearPaneHalt(projectName?: string): { path: string; wasHalted: 
   return { path, wasHalted };
 }
 
+export type HerdrStartResult =
+  | { kind: "active"; unit: string; recoveryReleased: boolean }
+  | { kind: "unmanaged"; unit: string; reason: string };
+
+export interface HerdrStartDeps {
+  systemctl?: (args: string[]) => { ok: boolean; stdout: string; stderr: string; missing?: boolean };
+}
+
+/**
+ * Starts the dedicated Herdr fleet unit when it is installed. Hosts without
+ * systemd or without that optional unit keep the standalone daemon behaviour.
+ */
+export function startHerdrFleet(projectName?: string, deps: HerdrStartDeps = {}): HerdrStartResult {
+  const run: NonNullable<HerdrStartDeps["systemctl"]> =
+    deps.systemctl ??
+    ((args: string[]) => {
+      const res = spawnSync("systemctl", args, { encoding: "utf8", timeout: 15_000, env: process.env });
+      if (res.error) {
+        const err = res.error as NodeJS.ErrnoException;
+        return {
+          ok: false,
+          stdout: "",
+          stderr: err.message,
+          ...(err.code === "ENOENT" ? { missing: true } : {}),
+        };
+      }
+      return { ok: res.status === 0, stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
+    });
+
+  const shown = run(["show", DEFAULT_HERDR_UNIT, "--property=LoadState", "--value"]);
+  if (shown.missing) return { kind: "unmanaged", unit: DEFAULT_HERDR_UNIT, reason: "no systemctl" };
+  if (!shown.ok) {
+    const detail = (shown.stderr.trim() || shown.stdout.trim() || "systemctl show failed").split("\n")[0]!;
+    throw new Error(`cannot inspect ${DEFAULT_HERDR_UNIT}: ${detail}`);
+  }
+  const loadState = shown.stdout.trim();
+  if (loadState === "not-found" || loadState === "") {
+    return { kind: "unmanaged", unit: DEFAULT_HERDR_UNIT, reason: "unit not installed" };
+  }
+  if (loadState !== "loaded") {
+    throw new Error(`${DEFAULT_HERDR_UNIT} is ${loadState}, not startable`);
+  }
+
+  const halt = resolvePaneHaltPath(projectName);
+  const recoveryReleased = halt.kind === "ok" && existsSync(halt.path);
+  if (halt.kind === "ok") rmSync(halt.path, { force: true });
+
+  const started = run(["start", DEFAULT_HERDR_UNIT]);
+  if (!started.ok) {
+    const detail = (started.stderr.trim() || started.stdout.trim() || "systemctl start failed").split("\n")[0]!;
+    throw new Error(`systemctl start ${DEFAULT_HERDR_UNIT} failed: ${detail}`);
+  }
+  const active = run(["is-active", DEFAULT_HERDR_UNIT]);
+  if (!active.ok || active.stdout.trim() !== "active") {
+    const detail = (active.stderr.trim() || active.stdout.trim() || "not active").split("\n")[0]!;
+    throw new Error(`${DEFAULT_HERDR_UNIT} did not become active: ${detail}`);
+  }
+  return { kind: "active", unit: DEFAULT_HERDR_UNIT, recoveryReleased };
+}
+
 export interface HerdrAgent {
   name: string;
   paneId: string;
@@ -565,11 +627,13 @@ async function herdrAgentList(deps: PaneStopDeps): Promise<HerdrAgent[]> {
   if (res.status !== 0) {
     throw new Error((res.stderr ?? res.stdout ?? `herdr exit ${String(res.status)}`).trim());
   }
-  // Everything below is fail-closed: only an explicit `agents: []` means "no
-  // agents". Empty output, unparseable JSON, a missing `agents` key or a row
-  // we cannot read is uncertainty — collapsing any of it to `[]` would report
-  // a live conductor pane as `already-gone`.
-  const raw = (res.stdout ?? "").trim();
+  return parseHerdrAgentList(res.stdout ?? "");
+}
+
+export function parseHerdrAgentList(rawOutput: string): HerdrAgent[] {
+  // Only an explicit `agents: []` means no agents. Every malformed answer is
+  // uncertainty, never permission to report the conductor pane missing.
+  const raw = rawOutput.trim();
   if (raw.length === 0) {
     throw new Error("herdr agent list printed nothing — cannot tell whether the pane is running");
   }
@@ -590,38 +654,35 @@ async function herdrAgentList(deps: PaneStopDeps): Promise<HerdrAgent[]> {
     if (row === null || typeof row !== "object") {
       throw new Error("herdr agent list contains a non-object agent row — unrecognized schema");
     }
-    const a = row as { readonly [key: string]: unknown };
-    const name = a["name"];
-    const paneId = a["pane_id"];
+    const agent = row as { readonly [key: string]: unknown };
+    const name = agent["name"];
+    const paneId = agent["pane_id"];
     if (typeof name !== "string" || typeof paneId !== "string") {
       throw new Error(
         "herdr agent list row is missing a string `name`/`pane_id` — " +
           "cannot tell whether it is the conductor pane",
       );
     }
-    // An absent (or null) `agent` is how herdr reports a sticky claim whose
-    // agent has exited — recover.sh reads the same field as `(.agent // "")`,
-    // and the released-agent fixture omits the key entirely. A *present* value
-    // of any other type is a row we cannot read: coercing it to `undefined`
-    // would report a live pane as already-gone.
-    const rawAgent = a["agent"];
+    const rawAgent = agent["agent"];
     if (rawAgent !== undefined && rawAgent !== null && typeof rawAgent !== "string") {
       throw new Error(
         `herdr agent list row for ${name} has a non-string \`agent\` (${typeof rawAgent}) — ` +
           `cannot tell whether an agent is live`,
       );
     }
-    const agent = typeof rawAgent === "string" ? rawAgent : undefined;
+    const liveAgent = typeof rawAgent === "string" ? rawAgent : undefined;
     let sessionPath: string | undefined;
-    const sess = a["agent_session"];
-    if (sess !== null && typeof sess === "object") {
-      const s = sess as { readonly [key: string]: unknown };
-      if (s["source"] === "herdr:omp" && typeof s["value"] === "string") sessionPath = s["value"];
+    const session = agent["agent_session"];
+    if (session !== null && typeof session === "object") {
+      const value = session as { readonly [key: string]: unknown };
+      if (value["source"] === "herdr:omp" && typeof value["value"] === "string") {
+        sessionPath = value["value"];
+      }
     }
     out.push({
       name,
       paneId,
-      ...(agent === undefined ? {} : { agent }),
+      ...(liveAgent === undefined ? {} : { agent: liveAgent }),
       ...(sessionPath === undefined ? {} : { sessionPath }),
     });
   }
@@ -709,11 +770,18 @@ export type PaneLayer = "live" | "missing" | "unknown";
 /** `unpinnable`: no tick config, so FLEET_CWD — the only path recovery reads — is unknown. */
 export type RecoveryLayer = "pinned" | "clear" | "unpinnable";
 export type HerdrLayer = "active" | "inactive" | "unknown";
+export type TelegramLayer = "ok" | "degraded" | "down" | "unconfigured" | "unprobed";
+
+export interface TelegramHealth {
+  kind: TelegramLayer;
+  detail?: string;
+}
 
 export interface FleetLayers {
   dispatch: DispatchLayer;
   ticks: TicksLayer;
   ticksDetail?: string;
+  nextTickAt?: string;
   pane: PaneLayer;
   paneDetail?: string;
   recovery: RecoveryLayer;
@@ -735,6 +803,7 @@ export function fleetLayers(projectName?: string): FleetLayers {
   const tick = resolveTickConfig(projectName);
   let ticks: TicksLayer;
   let ticksDetail: string | undefined;
+  let nextTickAt: string | undefined;
   let armedPath: string | undefined;
   let tickConfigPath: string | undefined;
   if (tick.kind === "absent") {
@@ -756,6 +825,8 @@ export function fleetLayers(projectName?: string): FleetLayers {
       ticks = "disarmed";
       ticksDetail = tick.config.armedFile;
     }
+    const runtime = readTickRuntimeStatus(tick.cwd);
+    if (runtime !== undefined && isAlive(runtime.pid)) nextTickAt = runtime.nextTickAt;
   }
   if (armedPath === undefined) armedPath = armedMarkerPath(projectName);
 
@@ -764,7 +835,7 @@ export function fleetLayers(projectName?: string): FleetLayers {
   const resolvedHalt = resolvePaneHaltPath(projectName);
   const haltPath = resolvedHalt.kind === "ok" ? resolvedHalt.path : undefined;
   const recoveryPinned = haltPath !== undefined && existsSync(haltPath);
-  const omp = probeOmpPane();
+  const omp = probeOmpPane(projectName);
   let pane: PaneLayer;
   let paneDetail: string | undefined;
   if (omp.kind === "live") {
@@ -783,6 +854,7 @@ export function fleetLayers(projectName?: string): FleetLayers {
     dispatch,
     ticks,
     ...(ticksDetail === undefined ? {} : { ticksDetail }),
+    ...(nextTickAt === undefined ? {} : { nextTickAt }),
     pane,
     ...(paneDetail === undefined ? {} : { paneDetail }),
     recovery: haltPath === undefined ? "unpinnable" : recoveryPinned ? "pinned" : "clear",
@@ -805,11 +877,21 @@ export function formatFleetStatus(
   s: StatusSnapshot,
   layers: FleetLayers,
   daemonHealth?: { ok: boolean; body?: string },
+  telegram: TelegramHealth = { kind: "unprobed" },
+  now = Date.now(),
 ): string {
   const tickLine =
     layers.ticksDetail === undefined
       ? `ticks     ${layers.ticks}`
       : `ticks     ${layers.ticks}  (${layers.ticksDetail})`;
+  let nextTickLine: string | undefined;
+  if (layers.nextTickAt !== undefined) {
+    const delta = Date.parse(layers.nextTickAt) - now;
+    const minutes = Math.max(1, Math.ceil(Math.abs(delta) / 60_000));
+    nextTickLine =
+      `next tick ${layers.nextTickAt}  ` +
+      `(${delta >= 0 ? `in ${minutes}m` : `overdue by ${minutes}m`})`;
+  }
   const paneLine =
     layers.paneDetail === undefined
       ? `pane      ${layers.pane}`
@@ -822,6 +904,10 @@ export function formatFleetStatus(
     layers.herdrDetail === undefined
       ? `herdr     ${layers.herdr}`
       : `herdr     ${layers.herdr}  (${layers.herdrDetail})`;
+  const telegramLine =
+    telegram.detail === undefined
+      ? `telegram  ${telegram.kind}`
+      : `telegram  ${telegram.kind}  (${telegram.detail})`;
 
   let daemonBlock: string;
   if (!layers.daemon.running || layers.daemon.pid === undefined) {
@@ -847,9 +933,11 @@ export function formatFleetStatus(
   return [
     `dispatch  ${layers.dispatch}`,
     tickLine,
+    ...(nextTickLine === undefined ? [] : [nextTickLine]),
     paneLine,
     recoveryLine,
     herdrLine,
+    telegramLine,
     daemonBlock,
     "",
     formatProjectBody(s),
@@ -898,10 +986,12 @@ function formatProjectBody(s: StatusSnapshot): string {
 export async function renderStatus(projectName?: string): Promise<string> {
   const s = statusSnapshot(projectName);
   const layers = fleetLayers(projectName);
-  let health: { ok: boolean; body?: string } | undefined;
   const rec = livingDaemon();
-  if (rec !== undefined) health = await healthCheck(rec.port);
-  return formatFleetStatus(s, layers, health);
+  const [health, telegram] = await Promise.all([
+    rec === undefined ? undefined : healthCheck(rec.port),
+    probeTelegramHealth(projectName),
+  ]);
+  return formatFleetStatus(s, layers, health, telegram);
 }
 
 // ---------------------------------------------------------------------------
@@ -947,6 +1037,57 @@ function readBotToken(): string | undefined {
     return undefined;
   }
   return undefined;
+}
+
+export async function probeTelegramHealth(
+  projectName?: string,
+  request: (input: string, init?: RequestInit) => Promise<Response> = fetch,
+): Promise<TelegramHealth> {
+  const tick = resolveTickConfig(projectName);
+  const accessPath =
+    tick.kind === "ok" && tick.config.accessFile !== undefined
+      ? tick.config.accessFile
+      : join(telegramStateDir(), "access.json");
+  const channel = readPairedChannel(accessPath);
+  const token = readBotToken();
+  if (token === undefined) {
+    return {
+      kind: "unconfigured",
+      detail: `no TELEGRAM_BOT_TOKEN; inbound ${channel.kind === "up" ? "configured" : channel.reason}`,
+    };
+  }
+
+  let response: Response;
+  let body: unknown;
+  try {
+    response = await request(`https://api.telegram.org/bot${token}/getMe`, {
+      signal: AbortSignal.timeout(5_000),
+    });
+    body = await response.json();
+  } catch {
+    return {
+      kind: "down",
+      detail: `Telegram API request failed; inbound ${channel.kind === "up" ? "configured" : channel.reason}`,
+    };
+  }
+
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    return { kind: "down", detail: "Telegram API returned an invalid response" };
+  }
+  const result = body as Record<string, unknown>;
+  if (!response.ok || result["ok"] !== true) {
+    const description =
+      typeof result["description"] === "string" ? result["description"] : `HTTP ${response.status}`;
+    return { kind: "down", detail: `${description}; inbound ${channel.kind === "up" ? "configured" : channel.reason}` };
+  }
+
+  const user =
+    result["result"] !== null && typeof result["result"] === "object" && !Array.isArray(result["result"])
+      ? (result["result"] as Record<string, unknown>)
+      : undefined;
+  const username = typeof user?.["username"] === "string" ? `@${user["username"]}` : "authenticated";
+  if (channel.kind === "down") return { kind: "degraded", detail: `${username}; inbound ${channel.reason}` };
+  return { kind: "ok", detail: `${username}; inbound configured` };
 }
 
 export function sessionDirForCwd(cwd: string): string {
@@ -1067,33 +1208,55 @@ function probeHerdrUnit(unit = DEFAULT_HERDR_UNIT): { kind: HerdrLayer; detail?:
   }
 }
 
-function probeOmpPane():
+export function paneLayerFromAgents(
+  agents: HerdrAgent[],
+  agentName: string,
+):
   | { kind: "live"; summary: string }
   | { kind: "missing" }
   | { kind: "unknown"; reason: string } {
+  const matches = agents.filter((agent) => agent.name === agentName);
+  if (matches.length === 0) return { kind: "missing" };
+  if (matches.length > 1) {
+    return { kind: "unknown", reason: `${matches.length} herdr agents named ${agentName}` };
+  }
+  const match = matches[0]!;
+  if (match.agent === "omp") {
+    return { kind: "live", summary: `agent ${agentName} pane ${match.paneId}` };
+  }
+  if (match.agent === undefined || match.agent === "") return { kind: "missing" };
+  return {
+    kind: "unknown",
+    reason: `agent ${agentName} pane ${match.paneId} is ${match.agent}, not omp`,
+  };
+}
+
+function probeOmpPane(
+  projectName?: string,
+):
+  | { kind: "live"; summary: string }
+  | { kind: "missing" }
+  | { kind: "unknown"; reason: string } {
+  const tick = resolveTickConfig(projectName);
+  const agentName =
+    tick.kind === "ok" ? (tick.config.agentName ?? DEFAULT_FLEET_AGENT_NAME) : DEFAULT_FLEET_AGENT_NAME;
+  const session = process.env["HERDR_SESSION"] ?? "fleet";
   try {
-    const res = spawnSync("pgrep", ["-af", String.raw`bun .*/omp( |$)`], {
+    const res = spawnSync("herdr", ["--session", session, "agent", "list"], {
       encoding: "utf8",
-      timeout: 5_000,
+      timeout: 8_000,
       env: process.env,
     });
     if (res.error) {
       const err = res.error as NodeJS.ErrnoException;
-      if (err.code === "ENOENT") return { kind: "unknown", reason: "no pgrep" };
+      if (err.code === "ENOENT") return { kind: "unknown", reason: "no herdr" };
       return { kind: "unknown", reason: err.message };
     }
-    const lines = (res.stdout ?? "")
-      .split("\n")
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0)
-      .filter((l) => !l.includes("omp-conductor"));
-    if (lines.length === 0) return { kind: "missing" };
-    const first = lines[0]!;
-    const summary = first.length > 100 ? `${first.slice(0, 97)}…` : first;
-    return {
-      kind: "live",
-      summary: lines.length === 1 ? summary : `${summary} (+${lines.length - 1} more)`,
-    };
+    if (res.status !== 0) {
+      const detail = (res.stderr ?? res.stdout ?? `herdr exit ${String(res.status)}`).trim();
+      return { kind: "unknown", reason: detail };
+    }
+    return paneLayerFromAgents(parseHerdrAgentList(res.stdout ?? ""), agentName);
   } catch (err) {
     return { kind: "unknown", reason: err instanceof Error ? err.message : String(err) };
   }

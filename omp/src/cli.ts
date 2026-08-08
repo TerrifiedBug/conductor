@@ -31,6 +31,7 @@ import {
   hold,
   releaseHold,
   renderStatus,
+  startHerdrFleet,
 } from "./fleet.ts";
 import { formatGraphSetup, graphRepos, writeGraphSetup, type GraphSetupWrite } from "./graph.ts";
 import {
@@ -55,10 +56,21 @@ import { makeTracker } from "./tracker/github.ts";
 import type { ProjectConfig } from "./types.ts";
 import { formatUnblock, unblockIssue } from "./unblock.ts";
 
+function packageVersion(): string {
+  const parsed = JSON.parse(readFileSync(join(import.meta.dir, "..", "package.json"), "utf8")) as {
+    version?: unknown;
+  };
+  if (typeof parsed.version !== "string" || parsed.version.length === 0) {
+    throw new Error("installed package.json has no version");
+  }
+  return parsed.version;
+}
+
 const USAGE = `omp-conductor — dispatch ready issues to omp coding sessions
 
 usage:
   omp-conductor start [--port N] [--project NAME]
+  omp-conductor --version
   omp-conductor stop
   omp-conductor restart [--port N] [--project NAME]
   omp-conductor status [--project NAME]
@@ -76,9 +88,9 @@ usage:
   omp-conductor brief-upgrade [--migrate|--retrofit] [--apply] [--file PATH] [--project NAME]
   omp-conductor help
 
-  start    run the dispatch loop in the background and wait until it answers
-           GET /healthz on :8787 (override with --port). Refuses if one is
-           already running.
+  start    start the installed herdr-fleet.service when present, then run the
+           dispatch loop in the background and wait until it answers GET
+           /healthz on :8787 (override with --port). Refuses if one is running.
   stop     stop the running daemon. Uses systemctl when the omp-conductor
            unit owns the process (so Restart=on-failure cannot bring it back);
            otherwise SIGTERM then SIGKILL.
@@ -87,8 +99,9 @@ usage:
            dirty live worktrees before orphaning those rows — see README
            "Deploying a new package onto a busy fleet". Goes through systemctl
            when the unit owns the live pid.
-  status   layered fleet report: dispatch (running|paused|stopped), ticks
-           (armed|disarmed|…), pane, herdr, daemon — then caps and active runs.
+  status   layered fleet report: dispatch (running|paused|stopped), ticks and
+           next due time, pane, herdr, Telegram bot/API health, daemon, caps
+           and active runs.
   hold     soft stop: pause claiming AND disarm ticks. Daemon and pane stay up.
            This is "stop the conductor overnight" without killing processes.
   halt     hold, then stop the dispatch daemon (systemctl-aware). Pane stays up
@@ -133,6 +146,8 @@ usage:
            --apply still merges a bannered single-file brief. --file checks a
            brief that is not where the wizard would have put it.
   help     print this text (also --help, -h).
+  --version
+           print the installed omp-conductor package version (also -V, version).
 
 Pause is a flag file under the state directory, so it applies to every project
 and survives a daemon restart. Hold also removes the arm marker the heartbeat
@@ -378,6 +393,11 @@ const cmd = argv[0];
 
 try {
   switch (cmd) {
+    case "--version":
+    case "-V":
+    case "version":
+      process.stdout.write(`${packageVersion()}\n`);
+      break;
     case "daemon": {
       // Until now only `lifecycle.startDaemon()` — the spawn path — wrote the
       // pidfile, which left a daemon started in the foreground (which is how
@@ -429,10 +449,14 @@ try {
     }
 
     case "start": {
-      const rec = await startDaemon({ port: portFlag(argv), project: flag(argv, "project") });
+      const project = flag(argv, "project");
+      const herdr = startHerdrFleet(project);
+      const rec = await startDaemon({ port: portFlag(argv), project });
       process.stdout.write(
         `started — pid ${rec.pid}, /healthz on :${rec.port}` +
-          `${rec.project === undefined ? "" : `, project ${rec.project}`}\nlog ${rec.logFile}\n`,
+          `${rec.project === undefined ? "" : `, project ${rec.project}`}\n` +
+          `herdr ${herdr.kind === "active" ? `active (${herdr.unit})${herdr.recoveryReleased ? "; recovery pin cleared" : ""}` : `unmanaged (${herdr.reason})`}\n` +
+          `log ${rec.logFile}\n`,
       );
       break;
     }

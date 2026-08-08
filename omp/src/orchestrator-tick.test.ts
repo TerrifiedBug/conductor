@@ -18,10 +18,12 @@ import orchestratorTickExtension, {
   DEFAULT_FLEET_AGENT_NAME,
   MIN_INTERVAL_SECONDS,
   readTickConfig,
+  readTickRuntimeStatus,
   STALL_MARKER_FILE,
   STALL_TICKS,
   TICK_CONFIG_FILE,
   TICK_REQUESTED_FILE,
+  TICK_STATUS_FILE,
   TICK_CUSTOM_TYPE,
   TICK_DELIVERY_RULE,
   TICK_OWNER_FILE,
@@ -361,6 +363,22 @@ test("firing the captured callback sends one tick with the documented delivery",
   expect(tick?.options).toEqual({ triggerTurn: true, deliverAs: "followUp" });
   expect(tick?.message.content).toContain("ORCHESTRATOR.md");
   expect(pi.logs.join("\n")).toContain("tick sent");
+});
+
+test("heartbeat publishes its next due time for out-of-process status", () => {
+  writeTickConfig({ intervalSeconds: 600 });
+  const before = Date.now();
+  const pi = fakeHost();
+  orchestratorTickExtension(pi);
+  pi.start();
+
+  const status = readTickRuntimeStatus(cwd);
+  expect(status?.pid).toBe(process.pid);
+  expect(status?.intervalSeconds).toBe(600);
+  const due = Date.parse(status?.nextTickAt ?? "");
+  expect(due).toBeGreaterThanOrEqual(before + 600_000);
+  expect(due).toBeLessThanOrEqual(Date.now() + 600_000);
+  expect(existsSync(join(cwd, TICK_STATUS_FILE))).toBe(true);
 });
 
 test("a recover tick request fires immediately on arm and clears the sentinel", () => {
