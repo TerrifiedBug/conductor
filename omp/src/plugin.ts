@@ -32,7 +32,6 @@ import {
 } from "./daemon.ts";
 import {
   armTicks,
-  armedMarkerPath,
   clearPaneHalt,
   disarmTicks,
   halt,
@@ -836,6 +835,17 @@ export interface CollectedSetup {
   amend?: { area: AmendAreaId; before: ProjectConfig };
 }
 
+
+export async function ensureSetupArm(
+  projectName: string,
+  arm: typeof armTicks = armTicks,
+): Promise<string> {
+  const armed = await arm(projectName);
+  return armed.alreadyArmed
+    ? `existing heartbeat arm revalidated for owner ${armed.owner} at ${armed.path}`
+    : `heartbeat armed for owner ${armed.owner} at ${armed.path}`;
+}
+
 /**
  * The whole conversation, from the amend question to the last prompt, and not one
  * byte further: no `gh`, no dry run, nothing written.
@@ -1020,26 +1030,20 @@ async function setup(ctx: CommandContext, projectArg: string | undefined): Promi
 
   let armLine = "embedded orchestrator — no heartbeat arm marker";
   if (project.escalation.orchestrator === "external") {
-    const marker = armedMarkerPath(project.name);
-    if (existsSync(marker)) {
-      armLine = `existing heartbeat arm preserved at ${marker}`;
-    } else {
-      ctx.ui.notify("Setup smoke passed. Sending the inbound Telegram arm challenge…", "info");
-      try {
-        const armed = await armTicks(project.name);
-        armLine = `heartbeat armed for owner ${armed.owner} at ${armed.path}`;
-      } catch (err) {
-        ctx.ui.notify(
-          [
-            "Setup files passed the paused daemon smoke, but the fleet remains held.",
-            err instanceof Error ? err.message : String(err),
-            `Start the external orchestrator in ${project.workspaceRoot}, then run \`omp-conductor arm --project ${project.name}\`.`,
-            "After the arm proof succeeds, run `omp-conductor resume`.",
-          ].join("\n"),
-          "warning",
-        );
-        return;
-      }
+    ctx.ui.notify("Setup smoke passed. Proving the external heartbeat channel…", "info");
+    try {
+      armLine = await ensureSetupArm(project.name);
+    } catch (err) {
+      ctx.ui.notify(
+        [
+          "Setup files passed the paused daemon smoke, but the fleet remains held.",
+          err instanceof Error ? err.message : String(err),
+          `Start the external orchestrator in ${project.workspaceRoot}, then run \`omp-conductor arm --project ${project.name}\`.`,
+          "After the arm proof succeeds, run `omp-conductor resume`.",
+        ].join("\n"),
+        "warning",
+      );
+      return;
     }
   }
   setPaused(false);

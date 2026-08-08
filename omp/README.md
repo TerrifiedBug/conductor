@@ -370,7 +370,7 @@ time Telegram approval, `POLICY.md`-only edit, Hard-boundary prohibition, and
    - runs `daemon --once` while dispatch is paused;
    - starts a temporary daemon and proves `/healthz` and stored status;
    - stops the temporary daemon;
-   - proves the inbound Telegram path before it arms an external heartbeat;
+   - proves the current inbound Telegram path before it arms or resumes an external heartbeat;
    - clears the dispatch pause only after all required gates pass.
 
    If the arm proof cannot complete, setup keeps dispatch paused. The result shows the exact recovery commands.

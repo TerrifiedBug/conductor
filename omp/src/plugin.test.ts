@@ -17,7 +17,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, saveConfig } from "./config.ts";
-import { collectSetup } from "./plugin.ts";
+import { collectSetup, ensureSetupArm } from "./plugin.ts";
 import {
   ORCHESTRATOR_BRIEF_NAME,
   POLICY_BRIEF_NAME,
@@ -495,4 +495,15 @@ test("a select answered with a label nobody offered falls back to asking everyth
   expect(amend).toBeUndefined();
   expect(d.notices.some((n) => n.includes("Unrecognised choice"))).toBe(true);
   expect(d.asked).toContain("input: Project name");
+});
+
+test("an existing arm cannot bypass the current channel proof", async () => {
+  let armCalls = 0;
+  await expect(
+    ensureSetupArm("veltro", async () => {
+      armCalls += 1;
+      throw new Error("escalation channel is not up");
+    }),
+  ).rejects.toThrow("escalation channel is not up");
+  expect(armCalls).toBe(1);
 });

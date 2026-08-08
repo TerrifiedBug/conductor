@@ -572,8 +572,8 @@ The end of the wizard is load-bearing:
   runs one daemon tick, proves `/healthz`, reads stored status, and stops the
   temporary daemon. A running daemon is health-checked and safely restarted only
   when no worker is live.
-- **External arming proves the real channel.** Setup preserves a valid arm marker.
-  If none exists, it sends the inbound Telegram challenge. A failed proof leaves
+- **External arming proves the real channel.** Every setup run sends the inbound
+  Telegram challenge, even when an arm marker exists. A failed proof leaves
   dispatch paused and prints the recovery commands.
 
 Ask the operator to approve the `ORCHESTRATOR.md` and `POLICY.md` write. After
