@@ -332,6 +332,9 @@ test("the rendered brief ships the amendment protocol above the operator's half"
   // rewriting its own boundaries.
   expect(text).toContain("single yes/no question");
   expect(text).toContain("## Amendments");
+  expect(text).toContain("call `telegram_ask`");
+  expect(text).not.toContain("the `ask` tool");
+  expect(text).toContain("delivery failure, not an operator answer");
   // Hard boundaries stay hand-edited, or the loop can widen its own mandate.
   expect(text).toContain("You never propose relaxing **Hard boundaries**");
   // A human's question is answered as a question, not folded into tick narration.
