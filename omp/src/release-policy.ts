@@ -22,6 +22,9 @@ export interface ReleaseBlock {
 
 export type ReleaseDecision = { block: true; reason: string };
 
+const GIT_PUSH_TAG_SHAPE =
+  /(?:--tags\b|--follow-tags\b|refs\/tags\/|(?:^|\s)(?:tag\s+)?v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?(?=[:\s]|$))/;
+
 function commandSegments(command: string): string[] {
   return command
     .split(/(?:&&|\|\||[;\n|])/)
@@ -43,7 +46,7 @@ export function releaseShapeFromCommand(command: string): ReleaseShape | undefin
     if (/^git(?:\s+-[Cc]\s+\S+)*\s+tag(?:\s|$)/.test(segment)) return "git-tag";
     if (
       /^git(?:\s+-[Cc]\s+\S+)*\s+push\b/.test(segment) &&
-      /(?:--tags\b|--follow-tags\b|refs\/tags\/)/.test(segment)
+      GIT_PUSH_TAG_SHAPE.test(segment)
     ) {
       return "git-push-tags";
     }

@@ -27,6 +27,8 @@ describe("release policy tripwire", () => {
   test("recognises the promised release and deploy command shapes", () => {
     expect(releaseShapeFromCommand("git tag v1.2.3")).toBe("git-tag");
     expect(releaseShapeFromCommand("git push origin --follow-tags")).toBe("git-push-tags");
+    expect(releaseShapeFromCommand("git push origin v1.2.3")).toBe("git-push-tags");
+    expect(releaseShapeFromCommand("git push origin tag v1.2.3")).toBe("git-push-tags");
     expect(releaseShapeFromCommand("npm publish --provenance")).toBe("package-publish");
     expect(releaseShapeFromCommand("gh release create v1.2.3")).toBe("github-release");
     expect(releaseShapeFromCommand("kubectl apply -f deploy.yml")).toBe("deploy");
@@ -35,6 +37,7 @@ describe("release policy tripwire", () => {
 
   test("does not confuse ordinary source pushes and package installs with releases", () => {
     expect(releaseShapeFromCommand("git push -u origin feat/widget")).toBeUndefined();
+    expect(releaseShapeFromCommand("git push origin feat/v1.2.3")).toBeUndefined();
     expect(releaseShapeFromCommand("npm install")).toBeUndefined();
     expect(releaseShapeFromCommand("bun run deploy:test")).toBeUndefined();
   });
