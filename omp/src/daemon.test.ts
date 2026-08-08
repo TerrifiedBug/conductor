@@ -37,6 +37,7 @@ import { dirname, join } from "node:path";
 import {
   admitCandidates,
   buildBrief,
+  cleanupRetainedRuns,
   checkIntegrity,
   checkStall,
   createWorkerPool,
@@ -381,6 +382,7 @@ function fakeTracker(over: Partial<Tracker>): Tracker {
     linkParent: off("linkParent"),
     parentOf: off("parentOf"),
     openCloserFor: off("openCloserFor"),
+    issueState: off("issueState"),
     prState: off("prState"),
     verifyPr: off("verifyPr"),
     ...over,
@@ -1083,6 +1085,156 @@ describe("verifyPushedGreenClaim", () => {
         claim,
       ),
     ).toEqual({ state: "failed", reason: "Checks failed: test" });
+  });
+});
+
+describe("cleanupRetainedRuns", () => {
+  let store!: Store;
+
+  beforeEach(() => {
+    store = openStore(":memory:");
+  });
+
+  afterEach(() => {
+    store.close();
+  });
+
+  it("reaps merged and closed-unmerged PR trees", async () => {
+    const merged = store.createRun(
+      draft({ issue: 701, state: "failed", endedAt: 2_000, prUrl: "https://github.com/acme/api/pull/701" }),
+    );
+    const closed = store.createRun(
+      draft({ issue: 702, state: "killed", endedAt: 3_000, prUrl: "https://github.com/acme/api/pull/702" }),
+    );
+    const removed: string[] = [];
+    const tracker = fakeTracker({
+      prState: async (url) => (url.endsWith("/701") ? "merged" : "closed"),
+    });
+
+    await cleanupRetainedRuns(
+      { project: project(), tracker, store },
+      new Set(),
+      { next: 0 },
+      async (_mirror, worktree) => {
+        removed.push(worktree);
+        return { kind: "removed" };
+      },
+    );
+
+    expect(removed.sort()).toEqual([merged.worktree, closed.worktree].sort());
+    expect(store.getRun(merged.id)?.worktree).toBe("");
+    expect(store.getRun(closed.id)?.worktree).toBe("");
+  });
+
+  it("does not let an older resolved attempt delete the newest failed attempt's evidence", async () => {
+    const old = store.createRun(
+      draft({ issue: 709, state: "failed", endedAt: 2_000, prUrl: "https://github.com/acme/api/pull/709" }),
+    );
+    const latest = store.createRun(
+      draft({ issue: 709, state: "failed", startedAt: 2_500, endedAt: 3_000 }),
+    );
+    let removed = 0;
+    const tracker = fakeTracker({
+      prState: async () => "closed",
+      issueState: async () => "open",
+    });
+
+    await cleanupRetainedRuns(
+      { project: project(), tracker, store },
+      new Set(),
+      { next: 0 },
+      async () => {
+        removed += 1;
+        return { kind: "removed" };
+      },
+    );
+
+    expect(removed).toBe(0);
+    expect(store.getRun(old.id)?.worktree).toBe(old.worktree);
+    expect(store.getRun(latest.id)?.worktree).toBe(latest.worktree);
+  });
+
+  it("reaps a no-PR tree only after the issue itself closes", async () => {
+    const run = store.createRun(draft({ issue: 703, state: "orphaned", endedAt: 2_000 }));
+    let removed = 0;
+    const tracker = fakeTracker({ issueState: async () => "closed" });
+
+    await cleanupRetainedRuns(
+      { project: project(), tracker, store },
+      new Set(),
+      { next: 0 },
+      async () => {
+        removed += 1;
+        return { kind: "removed" };
+      },
+    );
+
+    expect(removed).toBe(1);
+    expect(store.getRun(run.id)?.worktree).toBe("");
+  });
+
+  it("keeps a still-open queued follow-up and a newer active run", async () => {
+    const queued = store.createRun(draft({ issue: 704, state: "failed", endedAt: 2_000 }));
+    const owned = store.createRun(draft({ issue: 705, state: "failed", endedAt: 2_000 }));
+    store.createRun(draft({ issue: 705, state: "running", startedAt: 3_000 }));
+    let removed = 0;
+
+    await cleanupRetainedRuns(
+      { project: project(), tracker: fakeTracker({}), store },
+      new Set([704]),
+      { next: 0 },
+      async () => {
+        removed += 1;
+        return { kind: "removed" };
+      },
+    );
+
+    expect(removed).toBe(0);
+    expect(store.getRun(queued.id)?.worktree).toBe(queued.worktree);
+    expect(store.getRun(owned.id)?.worktree).toBe(owned.worktree);
+  });
+
+  it("keeps dirty work explicit and leaves ambiguous tracker state untouched", async () => {
+    const dirty = store.createRun(
+      draft({ issue: 706, state: "failed", endedAt: 2_000, prUrl: "https://github.com/acme/api/pull/706" }),
+    );
+    const unknown = store.createRun(
+      draft({ issue: 707, state: "failed", endedAt: 3_000, prUrl: "https://github.com/acme/api/pull/707" }),
+    );
+    let cleanupCalls = 0;
+    const tracker = fakeTracker({
+      prState: async (url) => (url.endsWith("/706") ? "closed" : undefined),
+    });
+
+    await cleanupRetainedRuns(
+      { project: project(), tracker, store },
+      new Set(),
+      { next: 0 },
+      async () => {
+        cleanupCalls += 1;
+        return { kind: "retained", reason: "dirty", detail: "worktree has uncommitted changes" };
+      },
+    );
+
+    expect(cleanupCalls).toBe(1);
+    expect(store.getRun(dirty.id)?.worktree).toBe(dirty.worktree);
+    expect(store.getRun(unknown.id)?.worktree).toBe(unknown.worktree);
+  });
+
+  it("marks an already-removed tree once and is idempotent on the next sweep", async () => {
+    const run = store.createRun(draft({ issue: 708, state: "failed", endedAt: 2_000 }));
+    let cleanupCalls = 0;
+    const tracker = fakeTracker({ issueState: async () => "closed" });
+    const cleanup = async () => {
+      cleanupCalls += 1;
+      return { kind: "removed" as const };
+    };
+
+    await cleanupRetainedRuns({ project: project(), tracker, store }, new Set(), { next: 0 }, cleanup);
+    await cleanupRetainedRuns({ project: project(), tracker, store }, new Set(), { next: 0 }, cleanup);
+
+    expect(cleanupCalls).toBe(1);
+    expect(store.getRun(run.id)?.worktree).toBe("");
   });
 });
 

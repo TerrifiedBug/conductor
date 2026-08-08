@@ -7,6 +7,7 @@ import type { RepoTarget } from "./types.ts";
 import {
   addWorktree,
   ensureMirror,
+  cleanupRetainedWorktree,
   mergeExclude,
   mirrorPathFor,
   removeWorktree,
@@ -483,6 +484,63 @@ describe("salvageWip", () => {
       expect(healed).toContain(".scratch*/");
       expect(healed).not.toContain(".env.local");
       expect(healed).not.toContain("*.local.sh");
+    },
+    TIMEOUT_MS,
+  );
+});
+
+describe("cleanupRetainedWorktree", () => {
+  it(
+    "removes a clean tree and its local branch once every commit exists remotely",
+    async () => {
+      const { mirrorRoot, workspaceRoot } = sandbox("cleanup-pushed");
+      const branch = "conductor/issue-1501";
+      const tree = (await addWorktree(repo, mirrorRoot, workspaceRoot, 1501, branch)).path;
+      const mirror = mirrorPathFor(repo, mirrorRoot);
+      writeFileSync(join(tree, "done.txt"), "done\n");
+      git(["add", "done.txt"], tree);
+      git(["commit", "-m", "done"], tree);
+      git(["push", "origin", branch], tree);
+
+      expect(await cleanupRetainedWorktree(mirror, tree, branch)).toEqual({ kind: "removed" });
+      expect(existsSync(tree)).toBe(false);
+      expect(() => git(["show-ref", "--verify", `refs/heads/${branch}`], mirror)).toThrow();
+      expect(await cleanupRetainedWorktree(mirror, tree, branch)).toEqual({ kind: "removed" });
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "retains a dirty tree explicitly",
+    async () => {
+      const { mirrorRoot, workspaceRoot } = sandbox("cleanup-dirty");
+      const branch = "conductor/issue-1502";
+      const tree = (await addWorktree(repo, mirrorRoot, workspaceRoot, 1502, branch)).path;
+      writeFileSync(join(tree, "unsaved.txt"), "only copy\n");
+
+      expect(await cleanupRetainedWorktree(mirrorPathFor(repo, mirrorRoot), tree, branch)).toEqual({
+        kind: "retained",
+        reason: "dirty",
+        detail: "worktree has uncommitted changes",
+      });
+      expect(existsSync(tree)).toBe(true);
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "retains a clean branch with uniquely local commits",
+    async () => {
+      const { mirrorRoot, workspaceRoot } = sandbox("cleanup-unpushed");
+      const branch = "conductor/issue-1503";
+      const tree = (await addWorktree(repo, mirrorRoot, workspaceRoot, 1503, branch)).path;
+      writeFileSync(join(tree, "local.txt"), "not pushed\n");
+      git(["add", "local.txt"], tree);
+      git(["commit", "-m", "local only"], tree);
+
+      const outcome = await cleanupRetainedWorktree(mirrorPathFor(repo, mirrorRoot), tree, branch);
+      expect(outcome).toMatchObject({ kind: "retained", reason: "unpushed" });
+      expect(existsSync(tree)).toBe(true);
     },
     TIMEOUT_MS,
   );

@@ -10,10 +10,17 @@
  * ~200-400ms) and failure classification by matching human-readable stderr
  * instead of reading a status code. Upgrade path when either bites: replace the
  * body of `gh()` with `fetch("https://api.github.com/...")` using a token from
- * `gh auth token`; the nine Tracker methods above it stay untouched.
+ * `gh auth token`; the eleven Tracker methods above it stay untouched.
  */
 
-import type { PrState, PrVerification, ProjectConfig, ReadyIssue, Tracker } from "../types.ts";
+import type {
+  IssueState,
+  PrState,
+  PrVerification,
+  ProjectConfig,
+  ReadyIssue,
+  Tracker,
+} from "../types.ts";
 
 /** The subset of `gh issue list --json` output this adapter reads. Fields the
  *  API can return as null are typed as such so the mapping has to handle it. */
@@ -303,6 +310,18 @@ export function prStateFrom(raw: string): PrState | undefined {
   }
 }
 
+/** GitHub's issue state spelling, kept fail-closed for cleanup decisions. */
+export function issueStateFrom(raw: string): IssueState | undefined {
+  switch (raw.trim()) {
+    case "OPEN":
+      return "open";
+    case "CLOSED":
+      return "closed";
+    default:
+      return undefined;
+  }
+}
+
 /**
  * Parent number from a raw GraphQL response, or undefined when the issue has
  * no parent. Throws when the issue or claimed parent is malformed — admission
@@ -435,6 +454,16 @@ export function makeTracker(p: ProjectConfig, runGh: typeof gh = gh): Tracker {
       ]);
 
       return firstOpenCloser(raw);
+    },
+
+    async issueState(issue: number): Promise<IssueState | undefined> {
+      try {
+        return issueStateFrom(
+          await runGh(["issue", "view", String(issue), "--repo", repo, "--json", "state", "--jq", ".state"]),
+        );
+      } catch {
+        return undefined;
+      }
     },
 
     async prState(url: string): Promise<PrState | undefined> {

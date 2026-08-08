@@ -87,6 +87,21 @@ describe("openStore", () => {
     expect(store.liveRuns(PROJECT).map((r) => r.id)).toEqual([running.id, claimed.id]);
   });
 
+  it("lists only retained failure-path rows that still name a tree", () => {
+    const failed = store.createRun(draft({ issue: 10, state: "failed", endedAt: 2_000 }));
+    const killed = store.createRun(draft({ issue: 11, state: "killed", endedAt: 3_000 }));
+    const orphaned = store.createRun(draft({ issue: 12, state: "orphaned", endedAt: 4_000 }));
+    store.createRun(draft({ issue: 13, state: "blocked", endedAt: 5_000 }));
+    store.createRun(draft({ issue: 14, state: "failed", worktree: "", endedAt: 6_000 }));
+    store.createRun(draft({ project: "other", issue: 15, state: "failed", endedAt: 7_000 }));
+
+    expect(store.retainedRuns(PROJECT).map((run) => run.id)).toEqual([
+      failed.id,
+      killed.id,
+      orphaned.id,
+    ]);
+  });
+
   it("counts every attempt for an issue, including terminal ones", () => {
     store.createRun(draft({ issue: 7, attempt: 1, state: "failed" }));
     store.createRun(draft({ issue: 7, attempt: 2, state: "merged" }));
