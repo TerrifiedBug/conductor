@@ -12,6 +12,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync
 import { dirname, join, relative } from "node:path";
 import { configPath, findProject, loadConfig, resolveCaps, resolveReleasePolicy, stateDir } from "./config.ts";
 import { createEscalator, escalationIssueRef } from "./escalate.ts";
+import { pendingCodeGraph, probeCodeGraph, type CodeGraphHealth } from "./graph-health.ts";
 import { graphHint } from "./graph.ts";
 import { livingDaemon } from "./lifecycle.ts";
 import { STALL_MARKER_FILE } from "./orchestrator-tick.ts";
@@ -51,6 +52,7 @@ import {
 /** Long enough that the tracker is not polled raw, short enough that a human
  *  who labels an issue sees it picked up within a coffee break. */
 const TICK_INTERVAL_MS = 5 * 60_000;
+const GRAPH_HEALTH_INTERVAL_MS = 60_000;
 const DEFAULT_PORT = 8787;
 const BRIEF_TEMPLATE_PATH = join(import.meta.dir, "briefs", "worker.md");
 
@@ -1469,6 +1471,7 @@ export interface DaemonHealthSnapshot {
   /** Resident set of this daemon; workers are in-process omp sessions. */
   rssBytes: number;
   dispatch?: DispatchSummary;
+  codeGraph?: CodeGraphHealth;
 }
 
 export function daemonHealthSnapshot(
@@ -1476,6 +1479,7 @@ export function daemonHealthSnapshot(
   project: string,
   paused = isPaused(),
   rssBytes = process.memoryUsage().rss,
+  codeGraph?: CodeGraphHealth,
 ): DaemonHealthSnapshot {
   const dispatch = store.latestDispatch(project);
   return {
@@ -1485,6 +1489,7 @@ export function daemonHealthSnapshot(
     project,
     rssBytes,
     ...(dispatch === undefined ? {} : { dispatch }),
+    ...(codeGraph?.configured === true ? { codeGraph } : {}),
   };
 }
 
@@ -1875,6 +1880,27 @@ export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
     return;
   }
 
+  // Graphs are optional, so their bounded probes run beside dispatch and feed
+  // a cache. /healthz remains an in-memory answer and never blocks liveness on
+  // the indexer or systemd.
+  let codeGraph = pendingCodeGraph(project);
+  let graphProbe: Promise<void> | undefined;
+  const refreshCodeGraph = (): void => {
+    if (graphProbe !== undefined) return;
+    graphProbe = probeCodeGraph(project)
+      .then((health) => {
+        codeGraph = health;
+      })
+      .catch(() => {
+        log("code-graph health probe failed unexpectedly; retaining the previous bounded result");
+      })
+      .finally(() => {
+        graphProbe = undefined;
+      });
+  };
+  refreshCodeGraph();
+  const graphTimer = setInterval(refreshCodeGraph, GRAPH_HEALTH_INTERVAL_MS);
+
   const workers = createWorkerPool();
   let stopping = false;
   let wake: (() => void) | undefined;
@@ -1893,7 +1919,7 @@ export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
     async fetch(req) {
       const url = new URL(req.url);
       if (req.method === "GET" && url.pathname === "/healthz") {
-        return Response.json(daemonHealthSnapshot(store, project.name));
+        return Response.json(daemonHealthSnapshot(store, project.name, undefined, undefined, codeGraph));
       }
       const control = await turnLimitResponse(req, project.name, store, turnLimits);
       return control ?? new Response("not found\n", { status: 404 });
@@ -1923,6 +1949,7 @@ export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
   } finally {
     process.off("SIGINT", stop);
     process.off("SIGTERM", stop);
+    clearInterval(graphTimer);
     await workers.drain();
     await server.stop(true);
     // Before the store closes: a queued injection that rejects on the way out

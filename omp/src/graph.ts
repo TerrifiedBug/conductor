@@ -11,12 +11,12 @@
  *
  * Two hard boundaries hold everything here together:
  *
- * - **This package never runs an indexer, and never depends on one.** Nothing
- *   below spawns the graph server, imports it, or checks for it; the daemon's
- *   dispatch, caps and escalation paths do not mention it. `graph-setup` prints
- *   commands, and with `--write` writes two systemd units — it does not even run
- *   `systemctl`, because the wizard and the CLI are not root and a package that
- *   silently writes root-level state is not one you can trust with a fleet.
+ * - **This package never builds or mutates an index, and never depends on the
+ *   indexer for dispatch.** The optional health surface runs the indexer's
+ *   read-only `list_projects` query; nothing spawns the graph server or imports
+ *   it. `graph-setup` prints commands, and with `--write` writes two systemd
+ *   units — it does not enable them, because a package that silently writes
+ *   root-level state is not one you can trust with a fleet.
  * - **A worker never queries its own worktree.** An index is keyed by the
  *   realpath of the directory it was built from, with no git-worktree awareness,
  *   so a run's `worktrees/<issue>` path is always an empty project. Workers are
