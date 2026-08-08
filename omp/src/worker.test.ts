@@ -13,6 +13,13 @@ import { openStore } from "./store.ts";
 import { costUsdFromMessage, deriveResult, renderBrief, runWorker, shouldComplete, type WorkerOpts } from "./worker.ts";
 import { DEFAULT_CAPS } from "./types.ts";
 
+const HEAD_SHA = "a".repeat(40);
+const GREEN_REPORT = [
+  "pr: https://github.com/acme/api/pull/1487",
+  `head: ${HEAD_SHA}`,
+  "state: pushed-green",
+].join("\n");
+
 /**
  * A session that settles immediately with the report it was handed. Records the
  * options it was created with, which is the only way to prove `runWorker` passes
@@ -39,7 +46,7 @@ function fakeHarness(opts?: {
       entered.resolve();
       if (opts?.gated === true) await gate.promise;
       for (const cb of handlers.get("message_end") ?? []) {
-        cb({ message: { role: "assistant", content: opts?.report ?? "state: pushed-green" } });
+        cb({ message: { role: "assistant", content: opts?.report ?? GREEN_REPORT } });
       }
       for (const cb of handlers.get("agent_end") ?? []) cb({ isTerminal: true });
     },
@@ -189,15 +196,19 @@ describe("renderBrief", () => {
 });
 
 describe("deriveResult", () => {
-  test("reads pushed-green and the PR url out of a green report", () => {
-    const report = [
-      "state: pushed-green",
-      "pr: https://github.com/acme/api/pull/1487",
-      "gates: all green",
-    ].join("\n");
-
-    expect(deriveResult(report)).toEqual({
+  test("reads structured green evidence from the final report", () => {
+    expect(deriveResult(GREEN_REPORT)).toEqual({
       state: "pushed-green",
+      prUrl: "https://github.com/acme/api/pull/1487",
+      headSha: HEAD_SHA,
+    });
+  });
+
+  test("a textual pushed-green claim without a PR head fails closed", () => {
+    expect(
+      deriveResult("Everything is pushed-green.\nstate: pushed-green\npr: https://github.com/acme/api/pull/1487"),
+    ).toEqual({
+      state: "failed",
       prUrl: "https://github.com/acme/api/pull/1487",
     });
   });
@@ -289,7 +300,7 @@ describe("runWorker spend metering", () => {
           cb({
             message: {
               role: "assistant",
-              content: "state: pushed-green",
+              content: GREEN_REPORT,
               usage: { cost: { total: 0.08 } },
             },
           });

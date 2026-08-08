@@ -12,7 +12,7 @@
 
 import { expect, test } from "bun:test";
 import { DEFAULT_AUTHORITY } from "../types.ts";
-import { firstOpenCloser, makeTracker, parentNumberFrom, prStateFrom } from "./github.ts";
+import { firstOpenCloser, makeTracker, parentNumberFrom, prStateFrom, prVerificationFrom } from "./github.ts";
 
 /** The `gh api graphql` envelope, with whatever references the test needs. */
 function reply(nodes: unknown[] | null): string {
@@ -111,6 +111,127 @@ test("MERGED, CLOSED and OPEN are the only answers; anything else is 'could not 
   expect(prStateFrom("DRAFT")).toBeUndefined();
 });
 
+
+const HEAD_SHA = "a".repeat(40);
+
+function verificationReply(
+  checks: unknown[],
+  over: Record<string, unknown> = {},
+): string {
+  return JSON.stringify({
+    state: "OPEN",
+    isDraft: false,
+    headRefOid: HEAD_SHA,
+    statusCheckRollup: checks,
+    ...over,
+  });
+}
+
+test("an open PR at the observed head with terminal successful checks is green", () => {
+  expect(
+    prVerificationFrom(
+      verificationReply([
+        { __typename: "CheckRun", name: "test", status: "COMPLETED", conclusion: "SUCCESS" },
+        { __typename: "CheckRun", name: "docs", status: "COMPLETED", conclusion: "SKIPPED" },
+      ]),
+      HEAD_SHA,
+    ),
+  ).toEqual({ status: "green", reason: "2 checks succeeded or were skipped" });
+});
+
+test("missing or nonterminal checks are pending, never green", () => {
+  expect(prVerificationFrom(verificationReply([]), HEAD_SHA).status).toBe("pending");
+  expect(
+    prVerificationFrom(
+      verificationReply([
+        { __typename: "CheckRun", name: "test", status: "IN_PROGRESS", conclusion: "" },
+      ]),
+      HEAD_SHA,
+    ),
+  ).toEqual({ status: "pending", reason: "Checks pending: test" });
+});
+
+test("a late PR head change invalidates the worker's green observation", () => {
+  const actual = "b".repeat(40);
+  expect(
+    prVerificationFrom(
+      verificationReply(
+        [{ __typename: "CheckRun", name: "test", status: "COMPLETED", conclusion: "SUCCESS" }],
+        { headRefOid: actual },
+      ),
+      HEAD_SHA,
+    ),
+  ).toEqual({
+    status: "failed",
+    reason: `PR head changed: expected ${HEAD_SHA}, found ${actual}`,
+  });
+});
+
+test("cancelled and red checks return a concise job digest", () => {
+  expect(
+    prVerificationFrom(
+      verificationReply([
+        { __typename: "CheckRun", name: "test", status: "COMPLETED", conclusion: "FAILURE" },
+        { __typename: "CheckRun", name: "lint", status: "COMPLETED", conclusion: "CANCELLED" },
+      ]),
+      HEAD_SHA,
+    ),
+  ).toEqual({
+    status: "failed",
+    reason: "Checks failed: test (FAILURE), lint (CANCELLED)",
+  });
+});
+
+test("the tracker appends bounded failed-step logs to a failed check digest", async () => {
+  const calls: string[][] = [];
+  const tracker = makeTracker(
+    {
+      name: "demo",
+      tracker: { kind: "github", repo: "acme/planning" },
+      queueLabel: "ready-for-agent",
+      stateLabels: {
+        inProgress: "agent:in-progress",
+        blocked: "agent:blocked",
+        failed: "agent:failed",
+      },
+      routing: { labelPrefix: "repo:", repos: {} },
+      caps: {},
+      escalation: { fallbackToIssueComment: true, orchestrator: "embedded" },
+      authority: { ...DEFAULT_AUTHORITY },
+      workspaceRoot: "/tmp/conductor/work",
+      mirrorRoot: "/tmp/conductor/mirrors",
+    },
+    async (argv) => {
+      calls.push(argv);
+      if (argv[0] === "pr") {
+        return verificationReply([
+          {
+            __typename: "CheckRun",
+            name: "test",
+            status: "COMPLETED",
+            conclusion: "FAILURE",
+            detailsUrl: "https://github.com/acme/api/actions/runs/123/job/456",
+          },
+        ]);
+      }
+      return "test\tFAIL\tAssertionError: expected 2, received 3\n";
+    },
+  );
+
+  const result = await tracker.verifyPr("https://github.com/acme/api/pull/7", HEAD_SHA);
+  expect(result?.reason).toContain("test (FAILURE)");
+  expect(result?.reason).toContain("AssertionError: expected 2, received 3");
+  expect(calls[1]).toEqual([
+    "run",
+    "view",
+    "123",
+    "--repo",
+    "acme/api",
+    "--job",
+    "456",
+    "--log-failed",
+  ]);
+});
 test("a prUrl that is not a pull request URL is never handed to gh", async () => {
   // `gh pr view` also accepts a bare number or a *branch name*, and resolves
   // those against whatever repository the current directory belongs to. The

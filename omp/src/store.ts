@@ -26,13 +26,12 @@ import type { RunRecord, RunState, Store } from "./types.ts";
 export const LIVE_STATES: readonly RunState[] = ["claimed", "running"];
 
 /**
- * States that keep an *issue* occupied. `pushed-green` belongs here but not in
- * {@link LIVE_STATES}: its worker is finished and its worktree already removed,
- * so it must not consume a slot — two green PRs awaiting a human merge would
- * otherwise stop the whole fleet — but its issue has a live PR that a second
- * attempt must not land on.
+ * States that keep an *issue* occupied. Pending and green pushes belong here
+ * but not in {@link LIVE_STATES}: their workers are finished and their
+ * worktrees removed, so they must not consume slots, while their live PRs must
+ * still block duplicate attempts.
  */
-const ACTIVE_STATES: readonly RunState[] = [...LIVE_STATES, "pushed-green"];
+const ACTIVE_STATES: readonly RunState[] = [...LIVE_STATES, "pushed-pending", "pushed-green"];
 
 const LIVE_PLACEHOLDERS = LIVE_STATES.map(() => "?").join(", ");
 const ACTIVE_PLACEHOLDERS = ACTIVE_STATES.map(() => "?").join(", ");
@@ -55,6 +54,7 @@ const UPDATABLE_COLUMNS: Record<string, true> = {
   spendUsd: true,
   sessionFile: true,
   prUrl: true,
+  headSha: true,
   startedAt: true,
   endedAt: true,
   lastError: true,
@@ -77,6 +77,7 @@ interface RunRow {
   spendUsd: number;
   sessionFile: string | null;
   prUrl: string | null;
+  headSha: string | null;
   startedAt: number;
   endedAt: number | null;
   lastError: string | null;
@@ -96,6 +97,7 @@ CREATE TABLE IF NOT EXISTS runs (
   spendUsd    REAL    NOT NULL,
   sessionFile TEXT,
   prUrl       TEXT,
+  headSha     TEXT,
   startedAt   INTEGER NOT NULL,
   endedAt     INTEGER,
   lastError   TEXT
@@ -139,6 +141,7 @@ function toRecord(row: RunRow): RunRecord {
   };
   if (row.sessionFile !== null) record.sessionFile = row.sessionFile;
   if (row.prUrl !== null) record.prUrl = row.prUrl;
+  if (row.headSha !== null) record.headSha = row.headSha;
   if (row.endedAt !== null) record.endedAt = row.endedAt;
   if (row.lastError !== null) record.lastError = row.lastError;
   return record;
@@ -161,16 +164,19 @@ export function openStore(dbPath: string): Store {
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec("PRAGMA foreign_keys = ON;");
   db.exec("PRAGMA busy_timeout = 5000;");
-  // ponytail: the schema is created if absent and never migrated — a column
-  // change means hand-editing or deleting the file. Upgrade path for the first
-  // shape change: PRAGMA user_version plus an ordered migration list here.
   db.exec(SCHEMA);
+  // v0.3.18 and earlier created `runs` without the worker-observed PR head.
+  // This additive migration is idempotent and preserves every existing row.
+  const columns = db.query<{ name: string }, []>("PRAGMA table_info(runs)").all();
+  if (!columns.some((column) => column.name === "headSha")) {
+    db.exec("ALTER TABLE runs ADD COLUMN headSha TEXT");
+  }
 
   const insertRun = db.query<unknown, SqlValue[]>(
     `INSERT INTO runs (
        id, project, issue, repo, branch, worktree, state, attempt, turns,
-       spendUsd, sessionFile, prUrl, startedAt, endedAt, lastError
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       spendUsd, sessionFile, prUrl, headSha, startedAt, endedAt, lastError
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const selectRun = db.query<RunRow, [string]>(`SELECT * FROM runs WHERE id = ?`);
   const selectActive = db.query<RunRow, SqlValue[]>(
@@ -228,6 +234,7 @@ export function openStore(dbPath: string): Store {
         record.spendUsd,
         toSql(record.sessionFile),
         toSql(record.prUrl),
+        toSql(record.headSha),
         record.startedAt,
         toSql(record.endedAt),
         toSql(record.lastError),

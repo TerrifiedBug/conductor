@@ -29,10 +29,11 @@ import type {
   ReadyIssue,
   RepoTarget,
   RunRecord,
+  RunState,
   Store,
   Tracker,
 } from "./types.ts";
-import { type KilledBy, renderBrief, runWorker } from "./worker.ts";
+import { type KilledBy, type WorkerResult, renderBrief, runWorker } from "./worker.ts";
 import {
   addWorktree,
   mirrorPathFor,
@@ -501,6 +502,27 @@ export async function buildBrief(
 
 // ------------------------------------------------------------------- one issue
 
+export async function verifyPushedGreenClaim(
+  tracker: Pick<Tracker, "verifyPr">,
+  claim: Pick<WorkerResult, "prUrl" | "headSha">,
+): Promise<{
+  state: "pushed-green" | "pushed-pending" | "failed";
+  reason?: string;
+}> {
+  if (claim.prUrl === undefined || claim.headSha === undefined) {
+    return { state: "failed", reason: "Worker did not report a PR URL and observed head SHA" };
+  }
+  const verification = await tracker.verifyPr(claim.prUrl, claim.headSha);
+  if (verification === undefined) {
+    return { state: "pushed-pending", reason: "GitHub PR verification unavailable; retrying" };
+  }
+  if (verification.status === "green") return { state: "pushed-green" };
+  return {
+    state: verification.status === "pending" ? "pushed-pending" : "failed",
+    reason: verification.reason,
+  };
+}
+
 /**
  * One attempt at one issue, from claim to terminal state. Everything is inside
  * a single try/catch so that a bad issue costs its own run and nothing else.
@@ -594,16 +616,26 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
       log(`#${issue} model fallback: ${result.modelFallbackMessage}`);
     }
 
+    const verified: { state: RunState; reason?: string } =
+      result.state === "pushed-green"
+        ? await verifyPushedGreenClaim(tracker, result)
+        : { state: result.state };
+    const state = verified.state;
+    const finalReport =
+      verified.reason === undefined ? result.report : `${verified.reason}\n\n${result.report}`;
+
     store.updateRun(runId, {
-      state: result.state,
+      state,
       endedAt: Date.now(),
       turns: result.turns,
       spendUsd: result.spendUsd,
       prUrl: result.prUrl,
+      headSha: result.headSha,
       sessionFile: result.sessionFile,
+      ...(verified.reason === undefined ? {} : { lastError: verified.reason }),
     });
 
-    if (result.state === "blocked") {
+    if (state === "blocked") {
       await swapLabel(tracker, issue, inProgress, project.stateLabels.blocked);
       await safeEscalate(d, {
         tier: 1,
@@ -613,7 +645,7 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
         summary: `#${issue} is blocked on attempt ${attempt} and needs a decision`,
         detail: [`${r.issue.title}`, r.issue.url, "", result.report].join("\n"),
       });
-    } else if (result.state === "failed" || result.state === "killed") {
+    } else if (state === "failed" || state === "killed") {
       // Turns-cap with attempts left: salvage, put the issue back on the queue,
       // and skip the failed label so the next tick reclaims as a continuation
       // instead of burning a human triage cycle (#50 / #21).
@@ -665,21 +697,20 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
             ...salvaged,
             `Session: ${result.sessionFile ?? "(no transcript)"}`,
             "",
-            result.report,
+            finalReport,
           ].join("\n"),
         });
       }
     } else {
-      // pushed-green: the PR belongs to a human now. The in-progress label
-      // stays on until the merge closes the issue, which is also what keeps
-      // the next tick from re-claiming it.
-      log(`#${issue} ${result.state}${result.prUrl ? ` ${result.prUrl}` : ""}`);
+      // A verified or still-pending PR keeps the in-progress label until its
+      // checks or merge settle, preventing another worker from duplicating it.
+      log(`#${issue} ${state}${result.prUrl ? ` ${result.prUrl}` : ""}`);
     }
 
     // A failed or killed tree is evidence — keep it. Anything else is just
     // disk, and the mirror means re-provisioning is cheap. (The kept tree is
     // wiped by the next attempt, not left to accumulate forever.)
-    if (result.state !== "failed" && result.state !== "killed") {
+    if (state !== "failed" && state !== "killed") {
       await removeWorktree(mirrorPath, worktreePath);
     }
   } catch (err) {
@@ -783,12 +814,13 @@ export async function settlePushedGreen(
   // is live workers plus these, so the list is bounded by the worker cap plus
   // the number of PRs awaiting a merge — a handful, by construction. A fleet
   // where that is not a handful has a merge problem, not a dispatch one.
-  const pending = store.activeRuns(project.name).filter((r) => r.state === "pushed-green");
+  const pending = store
+    .activeRuns(project.name)
+    .filter((r) => r.state === "pushed-green" || r.state === "pushed-pending");
 
   for (const run of pending) {
-    // Nothing to ask about. A green push means a PR, so this row should not
-    // exist; if one ever does, it must not buy a `gh` call every five minutes
-    // forever to be told nothing.
+    // Nothing to ask about. A pushed result requires a PR, so a malformed row
+    // must not buy a `gh` call every five minutes forever.
     if (run.prUrl === undefined) continue;
 
     let pr: PrState | undefined;
@@ -804,12 +836,32 @@ export async function settlePushedGreen(
     }
 
     const settlement = settlementFor(pr, run.prUrl);
-    if (settlement === undefined) continue;
+    if (settlement !== undefined) {
+      const patch: Partial<RunRecord> = { state: settlement.state, endedAt: Date.now() };
+      if (settlement.state === "failed") patch.lastError = settlement.reason;
+      store.updateRun(run.id, patch);
+      log(`#${run.issue} settled: ${settlement.reason}`);
+      continue;
+    }
 
-    const patch: Partial<RunRecord> = { state: settlement.state, endedAt: Date.now() };
-    if (settlement.state === "failed") patch.lastError = settlement.reason;
-    store.updateRun(run.id, patch);
-    log(`#${run.issue} settled: ${settlement.reason}`);
+    if (run.state !== "pushed-pending" || pr !== "open" || run.headSha === undefined) continue;
+    let verification;
+    try {
+      verification = await tracker.verifyPr(run.prUrl, run.headSha);
+    } catch (err) {
+      log(`#${run.issue} checks not settled (${errText(err)}) — retrying next tick`);
+      continue;
+    }
+    if (verification === undefined) continue;
+    if (verification.status === "green") {
+      store.updateRun(run.id, { state: "pushed-green", lastError: undefined });
+      log(`#${run.issue} checks settled: ${verification.reason}`);
+    } else if (verification.status === "failed") {
+      store.updateRun(run.id, { state: "failed", lastError: verification.reason });
+      log(`#${run.issue} checks failed: ${verification.reason}`);
+    } else {
+      store.updateRun(run.id, { lastError: verification.reason });
+    }
   }
 }
 

@@ -13,7 +13,7 @@
  * `gh auth token`; the nine Tracker methods above it stay untouched.
  */
 
-import type { PrState, ProjectConfig, ReadyIssue, Tracker } from "../types.ts";
+import type { PrState, PrVerification, ProjectConfig, ReadyIssue, Tracker } from "../types.ts";
 
 /** The subset of `gh issue list --json` output this adapter reads. Fields the
  *  API can return as null are typed as such so the mapping has to handle it. */
@@ -71,6 +71,23 @@ interface ClosersResponse {
       } | null;
     } | null;
   } | null;
+}
+
+interface GhCheck {
+  __typename?: string;
+  name?: string;
+  context?: string;
+  status?: string;
+  conclusion?: string;
+  state?: string;
+  detailsUrl?: string;
+}
+
+interface GhPrVerification {
+  state?: string;
+  isDraft?: boolean;
+  headRefOid?: string;
+  statusCheckRollup?: GhCheck[] | null;
 }
 
 /** Carries the captured stderr so callers can classify a failure without
@@ -169,7 +186,98 @@ export function firstOpenCloser(raw: string): string | undefined {
  * be answered, confidently, about some other repository's pull request. A
  * settle sweep that acted on that answer would mark the wrong run merged.
  */
-const PR_URL = /^https?:\/\/[^\s/]+\/[^\s/]+\/[^\s/]+\/pull\/\d+/;
+const PR_URL = /^https?:\/\/[^\s/]+\/[^\s/]+\/[^\s/]+\/pull\/\d+\/?$/;
+
+type CheckVerdict = PrVerification["status"];
+
+function checkName(check: GhCheck): string {
+  return check.name ?? check.context ?? "(unnamed check)";
+}
+
+function checkVerdict(check: GhCheck): CheckVerdict {
+  if (check.__typename === "StatusContext" || check.state !== undefined) {
+    if (check.state === "SUCCESS") return "green";
+    if (check.state === "PENDING" || check.state === "EXPECTED") return "pending";
+    return "failed";
+  }
+  if (check.status !== "COMPLETED") return "pending";
+  if (check.conclusion === "SUCCESS" || check.conclusion === "SKIPPED") return "green";
+  return "failed";
+}
+
+/**
+ * Verify one `gh pr view --json state,isDraft,headRefOid,statusCheckRollup`
+ * payload against the worker-observed head. A missing rollup is pending rather
+ * than green because GitHub may not have created the checks yet.
+ */
+export function prVerificationFrom(raw: string, expectedHead: string): PrVerification {
+  const pr = JSON.parse(raw) as GhPrVerification;
+  if (pr.state !== "OPEN") {
+    return { status: "failed", reason: `PR is ${pr.state ?? "unknown"}, expected OPEN` };
+  }
+  if (pr.isDraft !== false) {
+    return { status: "failed", reason: "PR is draft or draft state is unknown" };
+  }
+  if (pr.headRefOid?.toLowerCase() !== expectedHead.toLowerCase()) {
+    return {
+      status: "failed",
+      reason: `PR head changed: expected ${expectedHead}, found ${pr.headRefOid ?? "unknown"}`,
+    };
+  }
+
+  const checks = pr.statusCheckRollup ?? [];
+  if (checks.length === 0) {
+    return { status: "pending", reason: "GitHub has not reported any checks yet" };
+  }
+  const failed = checks.filter((check) => checkVerdict(check) === "failed");
+  if (failed.length > 0) {
+    return {
+      status: "failed",
+      reason: `Checks failed: ${failed.map((check) => `${checkName(check)} (${check.conclusion ?? check.state ?? "unknown"})`).join(", ")}`,
+    };
+  }
+  const pending = checks.filter((check) => checkVerdict(check) === "pending");
+  if (pending.length > 0) {
+    return {
+      status: "pending",
+      reason: `Checks pending: ${pending.map(checkName).join(", ")}`,
+    };
+  }
+  return { status: "green", reason: `${checks.length} checks succeeded or were skipped` };
+}
+
+function failedCheck(raw: string): GhCheck | undefined {
+  const checks = (JSON.parse(raw) as GhPrVerification).statusCheckRollup ?? [];
+  return checks.find((check) => checkVerdict(check) === "failed");
+}
+
+function runLogArgs(detailsUrl: string): string[] | undefined {
+  const match =
+    /^https:\/\/github\.com\/([^/]+\/[^/]+)\/actions\/runs\/(\d+)(?:\/job\/(\d+))?/.exec(
+      detailsUrl,
+    );
+  if (match?.[1] === undefined || match[2] === undefined) return undefined;
+  return [
+    "run",
+    "view",
+    match[2],
+    "--repo",
+    match[1],
+    ...(match[3] === undefined ? [] : ["--job", match[3]]),
+    "--log-failed",
+  ];
+}
+
+function conciseLog(raw: string): string | undefined {
+  const lines = raw
+    .replaceAll(/\u001b\[[0-9;]*m/g, "")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim() !== "")
+    .slice(-8)
+    .map((line) => line.slice(0, 240));
+  return lines.length === 0 ? undefined : lines.join("\n");
+}
 
 /**
  * GitHub's PR state spelling mapped onto {@link PrState}.
@@ -344,6 +452,37 @@ export function makeTracker(p: ProjectConfig, runGh: typeof gh = gh): Tracker {
         // job is to leave the row alone on that — so classifying them here would
         // buy nothing but a way to get the classification wrong. The next tick
         // asks again for free.
+        return undefined;
+      }
+    },
+
+    async verifyPr(url: string, expectedHead: string): Promise<PrVerification | undefined> {
+      if (!PR_URL.test(url)) return undefined;
+      try {
+        const raw = await runGh([
+          "pr",
+          "view",
+          url,
+          "--json",
+          "state,isDraft,headRefOid,statusCheckRollup",
+        ]);
+        const verification = prVerificationFrom(raw, expectedHead);
+        if (verification.status !== "failed") return verification;
+
+        const detailsUrl = failedCheck(raw)?.detailsUrl;
+        const args = detailsUrl === undefined ? undefined : runLogArgs(detailsUrl);
+        if (args === undefined) return verification;
+        try {
+          const digest = conciseLog(await runGh(args));
+          return digest === undefined
+            ? verification
+            : { ...verification, reason: `${verification.reason}\n${digest}` };
+        } catch {
+          return verification;
+        }
+      } catch {
+        // Lookup or payload failure is not permission to accept success. The
+        // daemon records a pending row and asks again on a later tick.
         return undefined;
       }
     },

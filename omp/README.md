@@ -438,13 +438,13 @@ Per tick, for the daemon's project:
 1. **Paused?** If the pause sentinel exists, the tick claims nothing and returns.
    Pause is checked first, so `omp-conductor pause` takes effect on the next tick
    without signalling the process.
-2. **Settle the green PRs.** For every run in `pushed-green`, ask the tracker
-   what became of its PR. Merged → the row becomes `merged`; closed without
-   merging → `failed`, with the PR named in the row's `lastError`. Still open, or
-   an answer that could not be obtained at all → the row is left exactly as it
-   is. Bounded by the number of green PRs awaiting a merge, which is a handful by
-   construction. This runs above admission so a row settled here frees its issue
-   in the same tick. See [what settles a green PR](#what-settles-a-green-pr).
+2. **Verify and settle pushed PRs.** For every run in `pushed-pending`, repeat
+   the independent head/check verification; green → `pushed-green`, red →
+   `failed`, and still pending stays occupied. For every verified
+   `pushed-green` run, ask what became of its PR. Merged → `merged`; closed
+   without merging → `failed`. Unknown answers leave the row unchanged. This
+   runs above admission so a row settled here frees its issue in the same tick.
+   See [what settles a green PR](#what-settles-a-green-pr).
 3. **List the queue.** Open issues in `tracker.repo` labelled `queueLabel`.
 4. **Filter and route.** An issue is eligible only if it carries the queue label
    and none of the three state labels (`inProgress`, `blocked`, `failed`). Eligible
@@ -454,12 +454,12 @@ Per tick, for the daemon's project:
 6. **Check spend.** If spend since local midnight has reached `dailySpendUsd`, the
    daemon **pauses itself**, pages at Tier 2, and returns.
 7. **Check capacity.** `maxConcurrentWorkers` minus *live* workers (runs in
-   `claimed` or `running`) gives the free slots. A green PR awaiting a human
-   merge occupies its issue but not a slot: its worker is finished, and counting
-   it would let two green PRs stop the fleet. If no slot is free, the tick logs
-   and returns.
+   `claimed` or `running`) gives the free slots. A pending or green PR occupies
+   its issue but not a slot: its worker is finished, and counting pushed PRs
+   would let two completed workers stop the fleet.
+   If no slot is free, the tick logs and returns.
 8. **Admit issues** up to the free slots, skipping any issue that already has
-   an active run — including a green PR, so a second attempt can never land on a
+   an active run — including a pending or green PR, so a second attempt can never land on a
    live PR. An issue that has used `maxAttemptsPerIssue` escalates at Tier 1
    instead of being admitted.
 9. **Ask the tracker whether the work already exists.** For each candidate that
@@ -496,13 +496,15 @@ Then, per admitted issue:
 
    | Outcome | Labels | Worktree | Escalation |
    | --- | --- | --- | --- |
+   | `pushed-pending` | `agent:in-progress` stays while the daemon rechecks GitHub | removed | none |
    | `pushed-green` | `agent:in-progress` stays until the merge closes the issue | removed | none |
    | `blocked` | swapped to `agent:blocked` | removed | Tier 1 |
    | `failed` / `killed` | swapped to `agent:failed` | dirty tree committed to the branch, then **kept** as evidence | Tier 1 |
    | unexpected error | swapped to `agent:failed` | same | Tier 1 |
 
-   `pushed-green` is not the end of the row: a later tick settles it once the PR
-   resolves. See [what settles a green PR](#what-settles-a-green-pr).
+   `pushed-pending` and `pushed-green` are not the end of the row: later ticks
+   verify outstanding checks and settle the PR once it resolves. See
+   [what settles a green PR](#what-settles-a-green-pr).
 
    Label swaps add the new label before removing the old one: the reverse order
    leaves a window in which the issue carries no state label at all, which is
@@ -572,10 +574,17 @@ the new process records a fresh baseline.
 
 ### What settles a green PR
 
-`pushed-green` means the worker finished, pushed, and watched the checks go green.
-What happens next is a human's decision, taken minutes to days later and never
-announced to the daemon — so every tick asks the tracker about every green PR it
-is still holding, and settles the ones that resolved:
+The worker watches CI, then reports the PR URL and the exact remote head SHA it
+observed. The daemon independently reads the PR again and requires it to be open,
+non-draft, still at that head, and backed by a non-empty check rollup in which
+every check succeeded or was skipped. Missing or nonterminal checks become
+`pushed-pending` and are rechecked on later ticks; red or cancelled checks become
+`failed` with a bounded job/log digest. Only verified evidence becomes
+`pushed-green`.
+
+What happens after verification is a human's decision, taken minutes to days
+later and never announced to the daemon — so every tick asks the tracker about
+every pushed PR it is still holding:
 
 | PR | Row becomes | Why |
 | --- | --- | --- |
@@ -1289,9 +1298,9 @@ dispatcher. The brief is explicit about the boundary:
 | Open a PR that links the issue, and watch CI to a verdict with `gh pr checks --watch`. | Run `gh pr merge`. **A worker never merges** — that one is absolute, whoever else holds the authority — so PRs land one at a time with a freshness re-check; two workers merging concurrently is how agent PRs clobber each other. Who *may* merge is the [`authority`](#configuration) answer, and it is never the worker. |
 | Escalate: ambiguity, a cross-repo contract, a needed credential, a product or data-migration decision, a blocking existing test, CI red twice, or most of the wall-clock budget burned. | **Cut a release**, push a tag, publish to npm, edit a deployment pin, deploy, or touch infrastructure or secrets — permanently out of scope. Releases are batched and decided outside this loop, so "this needs releasing" is a thing to report, never a task to take on. |
 
-The worker ends with a six-line evidence report (issue, pr, state, gates, changed,
-next). `pushed-green` means it watched the checks go green rather than expecting
-them to.
+The worker ends with a seven-line evidence report (issue, PR, observed head SHA,
+state, gates, changed, next). A textual `pushed-green` claim is not success: the
+daemon repeats the PR/head/check verification before it records that state.
 
 ### Worker confinement and the integrity tripwire
 

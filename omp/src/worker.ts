@@ -13,8 +13,11 @@
 import { createSession, disposeSession } from "./omp.ts";
 import type { Caps, RunState } from "./types.ts";
 
-/** A PR link the worker pushed, recognised anywhere in its report. */
-const PR_URL_PATTERN = /https:\/\/github\.com\/\S+\/pull\/\d+/;
+/** Structured evidence fields from the worker's final report. */
+const PR_URL_PATTERN = /^pr:\s*(https:\/\/github\.com\/\S+\/pull\/\d+)\s*$/im;
+const HEAD_SHA_PATTERN = /^head:\s*([0-9a-f]{40})\s*$/im;
+const PUSHED_GREEN_PATTERN = /^state:\s*pushed-green\s*$/im;
+const BLOCKED_PATTERN = /^state:\s*blocked\s*$/im;
 
 /** `{{KEY}}` placeholders in a brief template. */
 const PLACEHOLDER_PATTERN = /\{\{([A-Za-z0-9_]+)\}\}/g;
@@ -68,6 +71,7 @@ export interface RunWorkerDeps {
 export interface WorkerResult {
   state: RunState;
   prUrl?: string;
+  headSha?: string;
   turns: number;
   spendUsd: number;
   report: string;
@@ -103,23 +107,30 @@ export function renderBrief(template: string, vars: Record<string, string>): str
 }
 
 /**
- * Read the run's outcome out of the worker's final report.
+ * Read the run's structured outcome evidence from its final report.
  *
- * Success has to be claimed explicitly (`pushed-green`); everything else,
- * including an empty or unparseable report, is a failure. Defaulting the other
- * way would let a session that died mid-thought be reported as merge-ready.
+ * A textual `pushed-green` claim is not success by itself. The exact state line
+ * must carry both a PR URL and the head SHA observed after CI; the daemon then
+ * asks the tracker to verify those facts independently. Missing or malformed
+ * evidence fails closed.
  */
-export function deriveResult(report: string): { state: RunState; prUrl?: string } {
-  const haystack = report.toLowerCase();
-  const state: RunState = haystack.includes("pushed-green")
-    ? "pushed-green"
-    : haystack.includes("ci-red")
-      ? "failed"
-      : haystack.includes("blocked")
-        ? "blocked"
-        : "failed";
-  const prUrl = PR_URL_PATTERN.exec(report)?.[0];
-  return prUrl === undefined ? { state } : { state, prUrl };
+export function deriveResult(report: string): {
+  state: RunState;
+  prUrl?: string;
+  headSha?: string;
+} {
+  const prUrl = PR_URL_PATTERN.exec(report)?.[1];
+  const headSha = HEAD_SHA_PATTERN.exec(report)?.[1]?.toLowerCase();
+  if (PUSHED_GREEN_PATTERN.test(report) && prUrl !== undefined && headSha !== undefined) {
+    return { state: "pushed-green", prUrl, headSha };
+  }
+
+  const state: RunState = BLOCKED_PATTERN.test(report) ? "blocked" : "failed";
+  return {
+    state,
+    ...(prUrl === undefined ? {} : { prUrl }),
+    ...(headSha === undefined ? {} : { headSha }),
+  };
 }
 
 /**
@@ -294,12 +305,12 @@ export async function runWorker(
     return withSessionFacts({ state: "killed", turns, spendUsd, report, killedBy });
   }
 
-  const { state, prUrl } = deriveResult(report);
-  return withSessionFacts(
-    prUrl === undefined
-      ? { state, turns, spendUsd, report }
-      : { state, prUrl, turns, spendUsd, report },
-  );
+  return withSessionFacts({
+    ...deriveResult(report),
+    turns,
+    spendUsd,
+    report,
+  });
 }
 
 /**
