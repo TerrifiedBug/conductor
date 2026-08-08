@@ -235,6 +235,13 @@ export function openStore(dbPath: string): Store {
       WHERE project = ? AND state IN (${LIVE_PLACEHOLDERS})
       ORDER BY startedAt ASC`,
   );
+  const selectRetained = db.query<RunRow, [string]>(
+    `SELECT * FROM runs
+      WHERE project = ?
+        AND state IN ('failed', 'killed', 'orphaned')
+        AND worktree <> ''
+      ORDER BY endedAt ASC, startedAt ASC`,
+  );
   const countAttempts = db.query<{ n: number }, [string, number]>(
     `SELECT COUNT(*) AS n FROM runs WHERE project = ? AND issue = ?`,
   );
@@ -332,6 +339,10 @@ export function openStore(dbPath: string): Store {
 
     liveRuns(project: string): RunRecord[] {
       return selectLive.all(project, ...LIVE_STATES).map(toRecord);
+    },
+
+    retainedRuns(project: string): RunRecord[] {
+      return selectRetained.all(project).map(toRecord);
     },
 
     attemptsFor(project: string, issue: number): number {

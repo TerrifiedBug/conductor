@@ -508,7 +508,7 @@ Then, per admitted issue:
    | `pushed-pending` | `agent:in-progress` stays while the daemon rechecks GitHub | removed | none |
    | `pushed-green` | `agent:in-progress` stays until the merge closes the issue | removed | none |
    | `blocked` | swapped to `agent:blocked` | removed | Tier 1 |
-   | `failed` / `killed` | swapped to `agent:failed` | dirty tree committed to the branch, then **kept** as evidence | Tier 1 |
+   | `failed` / `killed` | swapped to `agent:failed` | dirty tree committed to the branch, then retained until the PR or issue is terminal | Tier 1 |
    | unexpected error | swapped to `agent:failed` | same | Tier 1 |
 
    `pushed-pending` and `pushed-green` are not the end of the row: later ticks
@@ -531,6 +531,13 @@ Then, per admitted issue:
    says that, loudly, naming the tree that now holds the only copy. A `blocked`
    run is deliberately *not* salvaged — it stopped on purpose, with turns still
    in hand to commit for itself.
+
+   Later ticks reap retained failure trees in bounded batches after the tracker
+   proves their PR merged/closed or their issue closed, provided no live run or
+   queued continuation owns the issue. Cleanup fetches remote refs first and
+   keeps any dirty tree or branch with uniquely local commits. Only then does it
+   remove the physical tree, prune registrations, and delete the obsolete local
+   mirror branch. Unknown tracker, network, repo, or git state is a no-op.
 
 ### What a restart does to runs that were in flight
 
@@ -1425,8 +1432,10 @@ Known and deliberate in this version:
 - **No cross-process lock on the mirrors.** Two dispatch loops fetching the same
   repo at the same instant can collide on git's ref locks; the run fails and is
   retried rather than corrupted.
-- **Mirrors grow one branch ref per run.** Unpushed work is never discarded, so
-  refs accumulate until you reap them.
+- **Uniquely local mirror branches are retained.** Terminal runs are reaped
+  automatically only after every commit exists on a remote ref. A failed salvage
+  push deliberately leaves its branch and tree for an operator rather than
+  trading disk hygiene for data loss.
 - **`stop` is a bounded best-effort drain.** A signal stops new ticks and the
   daemon waits for its active worker pool before closing the store. The CLI
   escalates to `SIGKILL` after 10 seconds, so a worker that needs longer is

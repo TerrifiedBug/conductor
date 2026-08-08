@@ -608,3 +608,69 @@ export async function removeWorktree(
 
   await git(["worktree", "prune"], mirrorPath);
 }
+
+export type RetainedWorktreeCleanup =
+  | { kind: "removed" }
+  | { kind: "retained"; reason: "dirty" | "unpushed" | "unknown"; detail: string };
+
+/**
+ * Reap a terminal run's tree and local mirror branch without deleting the only
+ * copy of work. Tracker state is proved by the caller; this function proves the
+ * local half after refreshing remote refs. Any ambiguity retains everything.
+ */
+export async function cleanupRetainedWorktree(
+  mirrorPath: string,
+  worktreePath: string,
+  branch: string,
+): Promise<RetainedWorktreeCleanup> {
+  if (!existsSync(mirrorPath)) {
+    return existsSync(worktreePath)
+      ? { kind: "retained", reason: "unknown", detail: "mirror is missing" }
+      : { kind: "removed" };
+  }
+
+  try {
+    if (existsSync(worktreePath)) {
+      const dirty = await git(["status", "--porcelain"], worktreePath);
+      if (dirty !== "") {
+        return { kind: "retained", reason: "dirty", detail: "worktree has uncommitted changes" };
+      }
+      const actual = await git(["rev-parse", "--abbrev-ref", "HEAD"], worktreePath);
+      if (actual !== branch) {
+        return {
+          kind: "retained",
+          reason: "unknown",
+          detail: `worktree is on ${actual}, expected ${branch}`,
+        };
+      }
+    }
+
+    // A deleted remote branch can make a pushed commit look local-only until
+    // the default branch is fetched. Failure is ambiguity, never permission.
+    await git(["fetch", "--prune", "origin"], mirrorPath);
+
+    const ref = `refs/heads/${branch}`;
+    if (await gitSucceeds(["show-ref", "--verify", "--quiet", ref], mirrorPath)) {
+      const unique = await git(["rev-list", ref, "--not", "--remotes"], mirrorPath);
+      if (unique !== "") {
+        return {
+          kind: "retained",
+          reason: "unpushed",
+          detail: `${branch} has commits absent from every remote ref`,
+        };
+      }
+    }
+
+    await removeWorktree(mirrorPath, worktreePath);
+    if (await gitSucceeds(["show-ref", "--verify", "--quiet", ref], mirrorPath)) {
+      await git(["branch", "-D", branch], mirrorPath);
+    }
+    return { kind: "removed" };
+  } catch (err) {
+    return {
+      kind: "retained",
+      reason: "unknown",
+      detail: err instanceof Error ? err.message : String(err),
+    };
+  }
+}

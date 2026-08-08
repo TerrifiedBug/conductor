@@ -39,9 +39,11 @@ import type {
 import { type KilledBy, type WorkerResult, renderBrief, runWorker } from "./worker.ts";
 import {
   addWorktree,
+  cleanupRetainedWorktree,
   mirrorPathFor,
   removeWorktree,
   salvageWip,
+  type RetainedWorktreeCleanup,
   type SalvageOutcome,
   worktreePathFor,
 } from "./worktree.ts";
@@ -79,6 +81,7 @@ interface Deps {
   turnLimits: TurnLimitRegistry;
   integrity: IntegrityGate;
   stall: StallGate;
+  cleanup?: RetainedCleanupCursor;
 }
 
 // ---------------------------------------------------------------- paths & pause
@@ -953,6 +956,97 @@ export async function settlePushedGreen(
   }
 }
 
+const RETAINED_CLEANUP_BATCH = 10;
+
+export interface RetainedCleanupCursor {
+  next: number;
+}
+
+type CleanupRetainedWorktree = (
+  mirrorPath: string,
+  worktreePath: string,
+  branch: string,
+) => Promise<RetainedWorktreeCleanup>;
+
+/**
+ * Bounded, rotating cleanup for failure-path trees. Tracker state proves the
+ * run is terminal; local git state independently proves deletion cannot erase
+ * dirty or uniquely unpushed work.
+ */
+export async function cleanupRetainedRuns(
+  d: Pick<Deps, "project" | "tracker" | "store">,
+  queuedIssues: ReadonlySet<number>,
+  cursor: RetainedCleanupCursor,
+  cleanup: CleanupRetainedWorktree = cleanupRetainedWorktree,
+): Promise<void> {
+  const { project, tracker, store } = d;
+  const candidates = store.retainedRuns(project.name);
+  if (candidates.length === 0) {
+    cursor.next = 0;
+    return;
+  }
+
+  const occupied = new Set(store.activeRuns(project.name).map((run) => run.issue));
+  const liveRepos = new Set(store.liveRuns(project.name).map((run) => run.repo));
+  const start = cursor.next % candidates.length;
+  const count = Math.min(RETAINED_CLEANUP_BATCH, candidates.length);
+  const batch = Array.from({ length: count }, (_, offset) => candidates[(start + offset) % candidates.length]!);
+  cursor.next = (start + count) % candidates.length;
+
+  for (const run of batch) {
+    if (occupied.has(run.issue) || queuedIssues.has(run.issue) || liveRepos.has(run.repo)) continue;
+    // Attempts reuse one physical path and deterministic branch. An older row
+    // cannot authorize deleting the newest failed attempt's evidence merely
+    // because its own PR resolved first.
+    const latest = store.latestRun(project.name, run.issue);
+    if (
+      latest !== undefined &&
+      latest.id !== run.id &&
+      latest.state !== "merged" &&
+      latest.worktree !== ""
+    ) {
+      continue;
+    }
+
+    let terminal = false;
+    try {
+      if (run.prUrl !== undefined) {
+        const pr = await tracker.prState(run.prUrl);
+        if (pr === undefined) continue;
+        if (pr === "merged" || pr === "closed") {
+          terminal = true;
+        } else {
+          const issue = await tracker.issueState(run.issue);
+          if (issue === undefined) continue;
+          terminal = issue === "closed";
+        }
+      } else {
+        const issue = await tracker.issueState(run.issue);
+        if (issue === undefined) continue;
+        terminal = issue === "closed";
+      }
+    } catch (err) {
+      log(`#${run.issue} retained cleanup deferred: tracker state failed (${errText(err)})`);
+      continue;
+    }
+    if (!terminal) continue;
+
+    const repo = Object.values(project.routing.repos).find((candidate) => candidate.name === run.repo);
+    if (repo === undefined) {
+      log(`#${run.issue} retained cleanup deferred: repo ${run.repo} is no longer configured`);
+      continue;
+    }
+
+    const outcome = await cleanup(mirrorPathFor(repo, project.mirrorRoot), run.worktree, run.branch);
+    if (outcome.kind === "removed") {
+      store.updateRun(run.id, { worktree: "" });
+      log(`#${run.issue} retained worktree reaped: ${run.worktree} (${run.branch})`);
+    } else {
+      log(`#${run.issue} retained worktree kept (${outcome.reason}): ${outcome.detail}`);
+    }
+  }
+}
+
 // -------------------------------------------------------------------- admission
 
 /** A candidate cleared for dispatch, with the attempt number it will run as. */
@@ -1274,6 +1368,11 @@ export async function tick(d: Deps, workers?: WorkerPool): Promise<void> {
   // route() filters the queue through isEligible() itself, so anything already
   // carrying a state label is gone before it gets here.
   const ready = await d.tracker.listReady();
+  await cleanupRetainedRuns(
+    d,
+    new Set(ready.map((issue) => issue.number)),
+    d.cleanup ?? { next: 0 },
+  );
   const { routed, unroutable } = route(ready, project);
   const routingHolds: AdmissionHold[] = unroutable.map((u) => ({
     issue: u.issue.number,
@@ -1763,6 +1862,7 @@ export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
     // Fresh per daemon run, like the integrity gate: a restart is entitled to
     // page again about a stall that is still on disk.
     stall: { paged: false },
+    cleanup: { next: 0 },
   };
 
   if (o.once) {

@@ -12,7 +12,14 @@
 
 import { expect, test } from "bun:test";
 import { DEFAULT_AUTHORITY } from "../types.ts";
-import { firstOpenCloser, makeTracker, parentNumberFrom, prStateFrom, prVerificationFrom } from "./github.ts";
+import {
+  firstOpenCloser,
+  issueStateFrom,
+  makeTracker,
+  parentNumberFrom,
+  prStateFrom,
+  prVerificationFrom,
+} from "./github.ts";
 
 /** The `gh api graphql` envelope, with whatever references the test needs. */
 function reply(nodes: unknown[] | null): string {
@@ -109,6 +116,13 @@ test("MERGED, CLOSED and OPEN are the only answers; anything else is 'could not 
   expect(prStateFrom("")).toBeUndefined();
   expect(prStateFrom("merged")).toBeUndefined();
   expect(prStateFrom("DRAFT")).toBeUndefined();
+});
+
+test("issue state is closed only on GitHub's exact terminal spelling", () => {
+  expect(issueStateFrom("OPEN\n")).toBe("open");
+  expect(issueStateFrom("CLOSED\n")).toBe("closed");
+  expect(issueStateFrom("")).toBeUndefined();
+  expect(issueStateFrom("closed")).toBeUndefined();
 });
 
 

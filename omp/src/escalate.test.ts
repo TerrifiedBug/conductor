@@ -86,6 +86,7 @@ function makeTracker(opts: { commentThrows?: boolean } = {}) {
     linkParent: async () => {},
     parentOf: async () => undefined,
     openCloserFor: async () => undefined,
+    issueState: async () => undefined,
     prState: async () => undefined,
     verifyPr: async () => undefined,
   };
@@ -105,6 +106,7 @@ function makeStore() {
     getRun: () => undefined,
     activeRuns: () => [],
     liveRuns: () => [],
+    retainedRuns: () => [],
     attemptsFor: () => 0,
     failuresFor: () => 0,
     continuationsFor: () => 0,

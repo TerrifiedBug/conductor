@@ -37,6 +37,7 @@ function makeTracker(): { tracker: Tracker; removed: { issue: number; label: str
     linkParent: refuse("linkParent"),
     parentOf: refuse("parentOf"),
     openCloserFor: refuse("openCloserFor"),
+    issueState: refuse("issueState"),
     prState: refuse("prState"),
     verifyPr: refuse("verifyPr"),
   };

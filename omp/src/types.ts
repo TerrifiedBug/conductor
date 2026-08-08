@@ -244,6 +244,9 @@ export interface PrVerification {
   reason: string;
 }
 
+/** Tracker lifecycle state for an issue. Undefined means the adapter could not tell. */
+export type IssueState = "open" | "closed";
+
 /**
  * Deliberately narrow so a Gitea or local-file tracker can drop in later.
  * Nothing here is GitHub-shaped; the GitHub adapter owns `gh` entirely.
@@ -279,6 +282,11 @@ export interface Tracker {
    * only party that remembers across all of those.
    */
   openCloserFor(issue: number): Promise<string | undefined>;
+  /**
+   * Whether an issue is still open, or undefined when tracker/network state is
+   * ambiguous. Cleanup must never interpret undefined as permission to delete.
+   */
+  issueState(issue: number): Promise<IssueState | undefined>;
   /**
    * The state of one specific pull request, or undefined when this adapter
    * could not tell — a network failure, a deleted PR, a URL it cannot parse.
@@ -396,6 +404,8 @@ export interface Store {
   activeRuns(project: string): RunRecord[];
   /** Runs backed by a worker process — what capacity counts. Subset of {@link Store.activeRuns}. */
   liveRuns(project: string): RunRecord[];
+  /** Failed/killed/orphaned rows whose retained tree has not been reaped. */
+  retainedRuns(project: string): RunRecord[];
   /** Total run segments, used only for the monotonically increasing run number. */
   attemptsFor(project: string, issue: number): number;
   /** Terminal implementation failures that consume `maxAttemptsPerIssue`. */
