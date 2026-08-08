@@ -525,12 +525,12 @@ Per tick, for the daemon's project:
    the independent `maxContinuationsPerIssue`. Exhausting either escalates.
 9. **Ask the tracker whether the work already exists.** For each candidate that
    survived step 8 — so at most one API call per free slot, never one per queued
-   issue — the daemon asks whether an **open** PR already closes the issue. If one
-   does, the issue is skipped with its PR named in the log. Drafts count: a draft
-   PR's branch still holds the only copy of the work. This is the guard the store
-   cannot provide, because a store younger than the PRs (a migration, a wiped or
-   relocated state directory, a restore onto a new host) has no row to object
-   with. If the check itself fails, the candidate is **held**, not admitted, and
+   issue — the daemon asks whether an **open** PR already closes it. An open PR
+   normally holds the issue. One narrow exception permits a routed continuation:
+   the PR URL must match the latest terminal run's retained PR exactly. Drafts
+   count because their branch can hold the only copy of the work.
+   The tracker also finds work missing from a new, moved, restored, or cleared
+   store. If the check fails, the candidate is **held**, not admitted, and
    retried next tick: the cost of holding is five minutes, the cost of admitting
    on an unknown is a burned attempt and a duplicate PR. Only that candidate is
    held, so a flaky API cannot stall the rest of the queue.
