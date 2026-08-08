@@ -55,7 +55,8 @@ import {
   releaseDriftDigestLine,
   type ReleaseDecision,
 } from "./release-policy.ts";
-import { DEFAULT_RELEASE_POLICY, DEFAULT_REPORT_SCOPE, type ReportScope } from "./types.ts";
+import { DEFAULT_RELEASE_POLICY, DEFAULT_REPORT_SCOPE, type FrictionSignal, type ReportScope, type Store } from "./types.ts";
+import { dbPath, openStore } from "./store.ts";
 
 /** The activation file. Absent means "this is not an orchestrator session". */
 export const TICK_CONFIG_FILE = ".conductor-tick.json";
@@ -69,6 +70,11 @@ export const TICK_CUSTOM_TYPE = "omp-conductor.tick";
  * misconfiguration worth refusing rather than obeying.
  */
 export const MIN_INTERVAL_SECONDS = 60;
+/** Repetition threshold and windows for Learning-loop friction signals. */
+export const FRICTION_MIN_OBSERVATIONS = 3;
+export const FRICTION_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1_000;
+export const FRICTION_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1_000;
+const FRICTION_DIGEST_LIMIT = 3;
 
 /**
  * How often to re-ask who owns the fleet tick after herdr failed to answer.
@@ -329,6 +335,35 @@ export const TICK_SCOPE_CONSTRAINTS: { readonly [K in ReportScope]: string } = {
  */
 export const TICK_DELIVERY_RULE =
   "This tick was injected locally, not sent from Telegram, so your end-of-turn text does NOT reach your operator. Deliver anything reportable this turn by calling the telegram_send tool and confirming success; never claim a report was sent otherwise.";
+
+function frictionLabel(kind: FrictionSignal["kind"]): string {
+  if (kind.startsWith("admission:")) return `admission hold ${kind.slice("admission:".length)}`;
+  if (kind === "feedback:escalation-should-digest") return "escalations classified as digest material";
+  if (kind === "feedback:report-noise") return "tick reports classified as noise";
+  return "tick reports classified as surprising";
+}
+
+/** Bounded evidence for the existing approval protocol — never an automatic edit. */
+export function formatFrictionDigest(signals: readonly FrictionSignal[]): string {
+  const shown = signals.slice(0, FRICTION_DIGEST_LIMIT);
+  const lines = [
+    "Repeated friction observed over the last 7 days (evidence only; not permission to edit policy):",
+    ...shown.map((signal) => {
+      const issues =
+        signal.issues.length === 0 ? "" : `; issues ${signal.issues.map((issue) => `#${issue}`).join(", ")}`;
+      const samples = signal.samples.length === 0 ? "" : `; examples: ${signal.samples.join(" | ")}`;
+      return (
+        `- ${frictionLabel(signal.kind)} — ${signal.observations} observations, ` +
+        `${signal.occurrences} affected${issues}${samples}`
+      );
+    }),
+  ];
+  if (signals.length > shown.length) lines.push(`- ${signals.length - shown.length} more signal(s) deferred`);
+  lines.push(
+    "After the tick duties, investigate at most one signal. Use the existing Learning loop only if the recurring cause has a safe POLICY.md remedy; otherwise leave policy unchanged and report or file the underlying product/infra issue through the existing rules.",
+  );
+  return lines.join("\n");
+}
 
 /**
  * The scope this tick carries, where the brief actually lives, and — when the
@@ -989,10 +1024,10 @@ function tick(pi: TickApi, ctx: TickContext, config: TickConfig, session: TickSe
   refreshComposedBriefBestEffort();
 
   const scope = resolveTickScope();
-  // A configured message owns the ordinary reporting and delivery clauses. The
-  // mechanical release-policy drift line is different: it is the evidence that
-  // configured intent and observed tool use diverged, so no custom heartbeat may
-  // silently suppress it.
+  // A configured message owns the ordinary reporting and delivery clauses.
+  // Mechanical evidence is different: release-policy drift and repeated
+  // operational friction must not disappear because an operator customized the
+  // ordinary heartbeat wording.
   let content = currentMessage(ctx.cwd, config);
   if (content === undefined) {
     if (scope.fallback !== undefined && !session.scopeFallbackLogged) {
@@ -1001,15 +1036,53 @@ function tick(pi: TickApi, ctx: TickContext, config: TickConfig, session: TickSe
     }
     content = `${defaultTickMessage(new Date(), scope.briefPath, scope.policyPath)}\n${TICK_SCOPE_CONSTRAINTS[scope.scope]}\n${TICK_DELIVERY_RULE}`;
   }
+  let frictionStore: Store | undefined;
+  let frictionSignals: FrictionSignal[] = [];
+  const now = Date.now();
   if (scope.projectName !== undefined) {
     const drift = releaseDriftDigestLine(scope.projectName);
     if (drift !== undefined) content = `${content}\n${drift}`;
+    if (existsSync(dbPath())) {
+      try {
+        frictionStore = openStore(dbPath());
+        frictionSignals = frictionStore.pendingFriction(
+          scope.projectName,
+          now - FRICTION_LOOKBACK_MS,
+          FRICTION_MIN_OBSERVATIONS,
+          now - FRICTION_COOLDOWN_MS,
+        );
+        if (frictionSignals.length > 0) content = `${content}\n${formatFrictionDigest(frictionSignals)}`;
+      } catch (err) {
+        frictionStore?.close();
+        frictionStore = undefined;
+        pi.logger.error(
+          `[omp-conductor] friction digest unavailable: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
   }
 
-  pi.sendMessage(
-    { customType: TICK_CUSTOM_TYPE, content, display: true, attribution: "user" },
-    { triggerTurn: true, deliverAs: "followUp" },
-  );
+  try {
+    pi.sendMessage(
+      { customType: TICK_CUSTOM_TYPE, content, display: true, attribution: "user" },
+      { triggerTurn: true, deliverAs: "followUp" },
+    );
+    if (scope.projectName !== undefined && frictionSignals.length > 0) {
+      try {
+        frictionStore?.markFrictionSurfaced(
+          scope.projectName,
+          frictionSignals.map((signal) => signal.kind),
+          now,
+        );
+      } catch (err) {
+        pi.logger.error(
+          `[omp-conductor] friction digest cooldown could not be recorded: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  } finally {
+    frictionStore?.close();
+  }
   pi.logger.info(`[omp-conductor] tick sent: ${decision.reason}`, { reason: decision.reason });
   // An empty queue at send time is the proof the previous tick was consumed, so
   // this is the only place either the counter or the marker is cleared.

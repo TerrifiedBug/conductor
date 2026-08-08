@@ -13,6 +13,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { configPath, stateDir } from "./config.ts";
+import { dbPath, openStore } from "./store.ts";
 import { setPaused } from "./daemon.ts";
 import orchestratorTickExtension, {
   DEFAULT_FLEET_AGENT_NAME,
@@ -22,6 +23,7 @@ import orchestratorTickExtension, {
   STALL_MARKER_FILE,
   STALL_TICKS,
   TICK_CONFIG_FILE,
+  FRICTION_MIN_OBSERVATIONS,
   TICK_REQUESTED_FILE,
   TICK_STATUS_FILE,
   TICK_CUSTOM_TYPE,
@@ -30,12 +32,13 @@ import orchestratorTickExtension, {
   TICK_SCOPE_CONSTRAINTS,
   claimTickOwner,
   defaultTickMessage,
+  formatFrictionDigest,
   paneOwnership,
   parseHerdrAgents,
   resolveTickOwnership,
   tickDecision,
 } from "./orchestrator-tick.ts";
-import type { ReportScope } from "./types.ts";
+import type { FrictionSignal, ReportScope } from "./types.ts";
 
 const HOME_KEY = "OMP_CONDUCTOR_HOME";
 /**
@@ -954,6 +957,52 @@ test("the default tick is three lines: the prompt, the scope contract, the deliv
   expect(lines[0]).toContain("ORCHESTRATOR.md");
   expect(lines[1]).toBe(TICK_SCOPE_CONSTRAINTS.material);
   expect(lines[2]).toBe(TICK_DELIVERY_RULE);
+});
+
+test("a repeated friction signal feeds one bounded Learning-loop prompt, then cools down", () => {
+  writeConductorConfig({ name: "fleet", scope: "material" });
+  const store = openStore(dbPath());
+  const at = Date.now() - 1_000;
+  for (let index = 0; index < FRICTION_MIN_OBSERVATIONS; index += 1) {
+    store.recordFriction("fleet", {
+      kind: "feedback:report-noise",
+      occurrences: 1,
+      sample: "routine green status was sent as a material report",
+      at: at + index,
+    });
+  }
+  store.close();
+  const pi = scopeHost();
+
+  pi.fire();
+  expect(pi.sent[0]?.message.content).toContain("Repeated friction observed over the last 7 days");
+  expect(pi.sent[0]?.message.content).toContain("tick reports classified as noise");
+  expect(pi.sent[0]?.message.content).toContain("not permission to edit policy");
+
+  pi.fire();
+  expect(pi.sent[1]?.message.content).not.toContain("Repeated friction observed");
+});
+
+test("the friction digest is bounded and directs evidence through the existing protocol", () => {
+  const signal = (kind: FrictionSignal["kind"]): FrictionSignal => ({
+    kind,
+    observations: 3,
+    occurrences: 4,
+    issues: [12],
+    samples: ["same hold recurred"],
+    latestAt: 1,
+  });
+  const text = formatFrictionDigest([
+    signal("admission:parent-lookup-error"),
+    signal("feedback:escalation-should-digest"),
+    signal("feedback:report-noise"),
+    signal("feedback:report-surprise"),
+  ]);
+
+  expect(text).toContain("admission hold parent-lookup-error");
+  expect(text).toContain("1 more signal(s) deferred");
+  expect(text).toContain("Use the existing Learning loop only if");
+  expect(text).not.toContain("tick reports classified as surprising");
 });
 
 // ---------------------------------------------------------------- tick owner

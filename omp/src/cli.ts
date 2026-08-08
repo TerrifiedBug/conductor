@@ -22,7 +22,7 @@ import {
   writeMergedBrief,
 } from "./brief-upgrade.ts";
 import { findProject, loadConfig, resolveCaps, stateDir } from "./config.ts";
-import { dbPath, runDaemon, setPaused } from "./daemon.ts";
+import { runDaemon, setPaused } from "./daemon.ts";
 import {
   armTicks,
   clearPaneHalt,
@@ -52,11 +52,19 @@ import {
   renderFloorForProject,
   shippedBriefTemplate,
 } from "./setup.ts";
-import { LIVE_STATES, openStore } from "./store.ts";
+import { dbPath, LIVE_STATES, openStore } from "./store.ts";
 import { formatTranscriptLine } from "./transcript.ts";
 import { makeTracker } from "./tracker/github.ts";
 import type { ProjectConfig } from "./types.ts";
 import { formatUnblock, unblockIssue } from "./unblock.ts";
+
+const FRICTION_FEEDBACK_KINDS = {
+  "escalation-digest": "feedback:escalation-should-digest",
+  "report-noise": "feedback:report-noise",
+  "report-surprise": "feedback:report-surprise",
+} as const;
+
+type FrictionFeedbackName = keyof typeof FRICTION_FEEDBACK_KINDS;
 
 function packageVersion(): string {
   const parsed = JSON.parse(readFileSync(join(import.meta.dir, "..", "package.json"), "utf8")) as {
@@ -90,6 +98,7 @@ usage:
   omp-conductor resume
   omp-conductor graph-setup [--project NAME] [--write]
   omp-conductor brief-upgrade [--migrate|--retrofit] [--apply] [--file PATH] [--project NAME]
+  omp-conductor friction <escalation-digest|report-noise|report-surprise> --detail TEXT [--issue N] [--project NAME]
   omp-conductor help
 
   start    start the installed herdr-fleet.service when present, then run the
@@ -135,6 +144,10 @@ usage:
            and why the brief's "never hand-edit a state label" rule can stay
            absolute. Run history is kept; answered blocks consume the separate
            operational-continuation budget, not failed implementation attempts.
+  friction record a bounded observation the daemon cannot classify itself:
+           an escalation that belonged in a digest, or a tick report that was
+           noise/surprising. Repeated observations feed the existing Learning
+           loop; recording one never edits policy by itself.
   daemon   run the dispatch loop in the foreground; --once runs a single tick
            and exits. This is what \`start\` launches.
   pause    stop claiming new work only (ticks keep firing if armed). Prefer hold.
@@ -607,6 +620,44 @@ try {
       } finally {
         store.close();
       }
+      break;
+    }
+
+    case "friction": {
+      const name = argv[1] as FrictionFeedbackName | undefined;
+      if (name === undefined || !Object.hasOwn(FRICTION_FEEDBACK_KINDS, name)) {
+        process.stderr.write(
+          "omp-conductor: friction needs one of: escalation-digest, report-noise, report-surprise\n",
+        );
+        process.exit(2);
+      }
+      const rawDetail = flag(argv, "detail");
+      const detail = rawDetail?.replace(/\s+/g, " ").trim();
+      if (
+        detail === undefined ||
+        detail.length === 0 ||
+        detail.length > 160 ||
+        rawDetail?.startsWith("--") === true
+      ) {
+        process.stderr.write("omp-conductor: friction needs --detail with 1-160 characters\n");
+        process.exit(2);
+      }
+      const issueText = flag(argv, "issue");
+      const issue = issueText === undefined ? undefined : issueArg("friction --issue", issueText);
+      const project = findProject(loadConfig(), flag(argv, "project"));
+      const store = openStore(dbPath());
+      try {
+        store.recordFriction(project.name, {
+          kind: FRICTION_FEEDBACK_KINDS[name],
+          occurrences: 1,
+          ...(issue === undefined ? {} : { issue }),
+          sample: detail,
+          at: Date.now(),
+        });
+      } finally {
+        store.close();
+      }
+      process.stdout.write(`friction recorded for ${project.name}: ${name} — ${detail}\n`);
       break;
     }
 

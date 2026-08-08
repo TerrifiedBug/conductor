@@ -329,7 +329,22 @@ omp-conductor brief-upgrade --retrofit --apply
 
 `--file PATH` checks a brief that is not where the wizard would have put it.
 
-The **Learning loop** proposes diffs against `POLICY.md` for you to approve over Telegram.
+The **Learning loop** proposes diffs against `POLICY.md` for you to approve over
+Telegram. It also learns from repeated operational friction. The daemon
+automatically rolls up repairable admission holds; the orchestrator records
+judgments code cannot make with:
+
+```bash
+omp-conductor friction escalation-digest --detail "routine retry belonged in the digest" [--issue N]
+omp-conductor friction report-noise --detail "green status repeated with no operator action"
+omp-conductor friction report-surprise --detail "a material failure was missing from the report"
+```
+
+Three observations within seven days make a bounded signal eligible for one
+tick. After it is surfaced, that signal cools down for seven days. A signal is
+evidence to investigate, never an automatic policy edit: the existing one-at-a-
+time Telegram approval, `POLICY.md`-only edit, Hard-boundary prohibition, and
+**Amendments** log still apply.
 
 ## Quick start
 
@@ -1287,6 +1302,7 @@ omp-conductor release-pane [--project NAME]
 omp-conductor tail <issue> [--project NAME]
 omp-conductor extend <issue> --turns N [--project NAME]
 omp-conductor unblock <issue> [--project NAME]
+omp-conductor friction <escalation-digest|report-noise|report-surprise> --detail TEXT [--issue N] [--project NAME]
 omp-conductor daemon [--once] [--port N] [--project NAME]
 omp-conductor pause
 omp-conductor resume
@@ -1310,6 +1326,7 @@ omp-conductor help
 | `tail <issue>` | Follow the newest run for that issue: the worker's assistant text as `assistant: …` and each tool it calls as `tool: <name>`, printed as they land. Workers are omp sessions inside the daemon rather than terminals, so this is the only way to watch one live — a herdr pane running it becomes an observation window. Starts from the top of the transcript, not the end, so attaching to a run that is already ten turns in shows those ten turns. Exits `1` with `no run recorded for #N` when the issue has never been dispatched, or `no transcript yet (state: …)` when the attempt has not opened one. Otherwise it runs until `Ctrl-C`, or until the run has finished and its transcript has been silent for five seconds, and prints `run ended: <state>`. |
 | `extend <issue> --turns N [--project NAME]` | Monotonically raise that live worker's effective turn ceiling through its owning daemon. The current omp session keeps running; no restart or continuation is created. The daemon persists the new ceiling for `status` and rejects missing, settled, cap-killed, equal, or lower requests instead of implying that an immutable session changed. |
 | `unblock <issue>` | Remove that issue's `blocked` and `failed` labels so an answered escalation can be claimed again. `agent:in-progress` is never touched. Run history remains intact: blocks consume the independent continuation budget, not failed implementation attempts. The output reports both budgets and warns when either will make the next tick escalate instead of dispatch. Exits `2` when the issue number is missing or malformed. |
+| `friction <kind> --detail TEXT [--issue N]` | Record one bounded judgment the daemon cannot infer: an escalation belonged in a digest, or a tick report was noise/surprising. The detail is limited to 160 characters. One event never changes policy; three observations inside seven days make the aggregate eligible for one Learning-loop prompt, followed by a seven-day cooldown. |
 | `daemon` | Run the loop in the **foreground**, ticking every 5 minutes and serving `/healthz`. Admitted workers run in a tracked background pool, so settlement and capacity checks remain periodic while they work; shutdown drains the pool before closing the store. This is what `start` launches and what a systemd unit should call. |
 | `daemon --once` | Run a single tick, wait for workers admitted by that tick, and exit. No HTTP server or pidfile — a drill must not register itself as the daemon, or the next reader believes it and the real daemon's in-flight runs get reconciled as orphans. |
 | `--port N` | Accepted by `start`, `restart` and `daemon`. Both `--port 9000` and `--port=9000` work; missing or out of range exits `2` rather than falling back to the default, because probing the wrong endpoint is worse than a hard failure. |

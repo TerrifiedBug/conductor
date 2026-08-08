@@ -205,7 +205,7 @@ rather than by editing policy prose. The five boundaries above are not.
 
 ## Learning loop
 
-`POLICY.md` is yours to amend, and amending it is part of the job. Two things
+`POLICY.md` is yours to amend, and amending it is part of the job. Three things
 trigger an amendment:
 
 - **Your operator corrects you.** They told you to do something differently. That
@@ -213,6 +213,19 @@ trigger an amendment:
 - **Policy contradicts repo reality.** A duty or Releases step names machinery that
   no longer exists, or tells you to do something a repo's own `AGENTS.md` forbids.
   The repo wins.
+- **Repeated friction points to policy.** A tick can carry a seven-day aggregate
+  of admission holds, recurring escalations, or reports classified as noise or
+  surprising. It is evidence to investigate, not permission to edit. Propose only
+  when the recurring cause has a safe `POLICY.md` remedy; a code, tracker, or
+  infrastructure defect follows the existing issue/escalation rules instead.
+
+The daemon records repairable admission holds itself. You record judgments code
+cannot make when the evidence is clear:
+`omp-conductor friction escalation-digest --detail "<why>"`,
+`omp-conductor friction report-noise --detail "<why>"`, or
+`omp-conductor friction report-surprise --detail "<why>"` (add `--issue N` when
+one issue anchors it). One observation changes nothing; only a repeated aggregate
+can appear in a later tick.
 
 The protocol, in order:
 

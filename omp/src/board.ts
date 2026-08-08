@@ -2,7 +2,7 @@ import { closeSync, openSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { emitKeypressEvents } from "node:readline";
 import { findProject, loadConfig, resolveCaps } from "./config.ts";
-import { dbPath, statusSnapshotFromStore, type StatusSnapshot } from "./daemon.ts";
+import { statusSnapshotFromStore, type StatusSnapshot } from "./daemon.ts";
 import {
   codeGraphFromHealthz,
   fleetLayers,
@@ -12,7 +12,7 @@ import {
 } from "./fleet.ts";
 import { probeCodeGraph, type CodeGraphHealth } from "./graph-health.ts";
 import { healthCheck, livingDaemon } from "./lifecycle.ts";
-import { openStore } from "./store.ts";
+import { dbPath, openStore } from "./store.ts";
 import { formatTranscriptLine } from "./transcript.ts";
 import type { AdmissionHoldReason, ProjectConfig, RunRecord, RunState, Store } from "./types.ts";
 
