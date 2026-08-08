@@ -64,18 +64,22 @@ Per-half configuration and limitations live in each half's own README:
 
 ## The fleet host
 
-Both halves are pointed at the same 24/7 session — on your always-on host, an omp
-session with `/root/fleet` as its cwd, `ORCHESTRATOR.md` as its standing brief
-(symlinked as `AGENTS.md`), and `state/armed` as the marker that decides whether a
-heartbeat does anything. Pause only stops the dispatch loop from claiming new work;
-an armed heartbeat still fires. Soft-stop both brains with `omp-conductor hold`
-(pause + disarm). Harder stops are `halt` / `halt --pane` — see
+Both halves point at the same 24/7 omp session on your always-on host. The
+session's working directory is configured as `FLEET_CWD`; it contains
+`.conductor-tick.json`, whose relative `armedFile` also resolves from that
+directory. Conductor state defaults to `~/.omp/conductor`, while `workspaceRoot`
+defaults to its `worktrees/` directory. Setup composes the package floor and the
+fleet-owned `POLICY.md` into `ORCHESTRATOR.md` there. No `/root` layout is built
+into a new deployment.
+
+Pause only stops the dispatch loop from claiming new work; an armed heartbeat
+still fires. Soft-stop both brains with `omp-conductor hold` (pause + disarm).
+Harder stops are `halt` / `halt --pane` — see
 [`omp/README.md`](omp/README.md#stop-the-conductor-hold--halt).
 
-The Herdr half never edits that session's state. It only answers one question —
-is the fleet session running in its pane? — and either resumes it by exact
-session identity or says, in Telegram and in a Herdr notification, that the fleet
-is down.
+The Herdr half owns recovery, not dispatch or policy. It restores the exact
+session identity, requests an immediate heartbeat, or reports through Telegram
+and a Herdr notification that the fleet is down.
 
 ## Development
 
