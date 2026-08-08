@@ -478,11 +478,11 @@ describe("dispatchAdmissions", () => {
 });
 
 describe("live turn-limit control", () => {
-  const request = (issue: number, maxTurns: number): Request =>
+  const request = (issue: number, maxTurns: number, project = PROJECT): Request =>
     new Request(`http://127.0.0.1/runs/${issue}/turn-limit`, {
       method: "PUT",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ maxTurns }),
+      body: JSON.stringify({ project, maxTurns }),
     });
 
   it("raises the controller and persisted effective ceiling together", async () => {
@@ -554,6 +554,30 @@ describe("live turn-limit control", () => {
     expect(await response?.json()).toEqual({ error: "no run recorded for #404" });
     store.close();
   });
+
+  it("refuses a project mismatch before looking up the same-number run", async () => {
+    const store = openStore(":memory:");
+    const run = store.createRun(draft({ maxTurns: 120 }));
+    const registry = createTurnLimitRegistry((runId, maxTurns) => {
+      store.updateRun(runId, { maxTurns });
+    });
+    registry.open(PROJECT, run.issue, run.id, 120);
+
+    const response = await turnLimitResponse(
+      request(run.issue, 180, "other-project"),
+      PROJECT,
+      store,
+      registry,
+    );
+
+    expect(response?.status).toBe(409);
+    expect(await response?.json()).toEqual({
+      error: `daemon serves project "${PROJECT}", not requested project "other-project"`,
+    });
+    expect(store.getRun(run.id)?.maxTurns).toBe(120);
+    store.close();
+  });
+
 });
 
 describe("summarizeDispatch", () => {

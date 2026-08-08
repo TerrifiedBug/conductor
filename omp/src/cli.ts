@@ -613,7 +613,7 @@ try {
         {
           method: "PUT",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ maxTurns }),
+          body: JSON.stringify({ project: project.name, maxTurns }),
         },
       );
       const payload = (await response.json()) as {

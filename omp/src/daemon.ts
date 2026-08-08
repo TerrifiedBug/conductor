@@ -1401,8 +1401,20 @@ export async function turnLimitResponse(
   } catch {
     return Response.json({ error: "request body must be valid JSON" }, { status: 400 });
   }
-  const maxTurns =
-    body !== null && typeof body === "object" ? Reflect.get(body, "maxTurns") : undefined;
+  if (body === null || typeof body !== "object") {
+    return Response.json({ error: "request body must be a JSON object" }, { status: 400 });
+  }
+  const requestedProject = Reflect.get(body, "project");
+  if (typeof requestedProject !== "string" || requestedProject.length === 0) {
+    return Response.json({ error: "project must be a non-empty string" }, { status: 400 });
+  }
+  if (requestedProject !== project) {
+    return Response.json(
+      { error: `daemon serves project "${project}", not requested project "${requestedProject}"` },
+      { status: 409 },
+    );
+  }
+  const maxTurns = Reflect.get(body, "maxTurns");
   if (!Number.isSafeInteger(maxTurns) || (maxTurns as number) < 1) {
     return Response.json({ error: "maxTurns must be a positive integer" }, { status: 400 });
   }
