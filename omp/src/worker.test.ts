@@ -9,6 +9,7 @@
 
 import { describe, expect, test } from "bun:test";
 import type { AgentSessionLike } from "./omp.ts";
+import { openStore } from "./store.ts";
 import { costUsdFromMessage, deriveResult, renderBrief, runWorker, shouldComplete, type WorkerOpts } from "./worker.ts";
 import { DEFAULT_CAPS } from "./types.ts";
 
@@ -307,5 +308,66 @@ describe("runWorker spend metering", () => {
     });
     expect(result.spendUsd).toBeCloseTo(0.2);
     expect(result.state).toBe("pushed-green");
+  });
+
+  test("persists cumulative spend before the worker settles", async () => {
+    const handlers = new Map<string, ((e: unknown) => void)[]>();
+    const messageHandled = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const store = openStore(":memory:");
+    const record = store.createRun({
+      project: "demo",
+      issue: 42,
+      repo: "api",
+      branch: "fix/live-spend",
+      worktree: "/tmp/demo-42",
+      state: "running",
+      attempt: 1,
+      turns: 0,
+      spendUsd: 0,
+      startedAt: 1_000,
+    });
+    const session = {
+      prompt: async () => {
+        for (const cb of handlers.get("message_end") ?? []) {
+          cb({
+            message: {
+              role: "assistant",
+              content: "still working",
+              usage: { cost: { total: 0.12 } },
+            },
+          });
+        }
+        messageHandled.resolve();
+        await release.promise;
+        for (const cb of handlers.get("agent_end") ?? []) cb({ isTerminal: true });
+      },
+      on: (event: string, cb: (e: unknown) => void) => {
+        const list = handlers.get(event) ?? [];
+        list.push(cb);
+        handlers.set(event, list);
+      },
+      abort: () => {},
+    };
+    let settled = false;
+    const run = runWorker(
+      workerOpts({
+        onSpend: (spendUsd) => store.updateRun(record.id, { spendUsd }),
+      }),
+      { createSession: async () => session as never },
+    ).finally(() => {
+      settled = true;
+    });
+
+    await messageHandled.promise;
+    expect(settled).toBe(false);
+    expect(store.getRun(record.id)?.spendUsd).toBeCloseTo(0.12);
+    expect(store.spendSince("demo", 0)).toBeCloseTo(0.12);
+
+    release.resolve();
+    const result = await run;
+    store.updateRun(record.id, { spendUsd: result.spendUsd });
+    expect(store.spendSince("demo", 0)).toBeCloseTo(0.12);
+    store.close();
   });
 });

@@ -579,6 +579,7 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
       sessionDir,
       ...(project.workerModel === undefined ? {} : { model: project.workerModel }),
       onTurn: (n) => store.updateRun(runId, { turns: n }),
+      onSpend: (usd) => store.updateRun(runId, { spendUsd: usd }),
       // Recorded the moment the session opens its transcript, not when the run
       // ends: `omp-conductor tail` resolves an issue to a file through this row,
       // and a path written at completion is a path nobody can follow live. The
