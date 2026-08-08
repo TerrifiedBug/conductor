@@ -376,12 +376,13 @@ The **Learning loop** proposes diffs against `POLICY.md` for you to approve over
    omp-conductor daemon --once
    ```
 
-The loop ticks every 5 minutes. `omp-conductor stop` shuts the loop down after
-the current tick rather than mid-run. When the live process is the MainPID of
-`omp-conductor.service`, stop goes through `systemctl stop` so a unit with
-`Restart=on-failure` cannot bring it straight back; otherwise it is a raw
-`SIGTERM` (then `SIGKILL` after 10 seconds). An example unit (with
-`SuccessExitStatus=0 143` and `MemoryMax=5G`) ships as
+The loop ticks every 5 minutes even while workers remain active; merge
+settlement and capacity checks no longer wait for the longest worker from the
+previous tick. `omp-conductor stop` stops scheduling and waits for active
+workers rather than abandoning them. When systemd owns the process, stop goes
+through `systemctl stop`; otherwise it sends `SIGTERM`, then `SIGKILL` after 10
+seconds. An example unit (with `SuccessExitStatus=0 143` and `MemoryMax=5G`)
+ships as
 [`systemd/omp-conductor.service.example`](systemd/omp-conductor.service.example).
 
 
@@ -1241,8 +1242,8 @@ omp-conductor help
 | `release-pane [--project NAME]` | Clear the `halt --pane` recovery pin so herdr-conductor may resume the fleet agent again. |
 | `tail <issue>` | Follow the newest run for that issue: the worker's assistant text as `assistant: …` and each tool it calls as `tool: <name>`, printed as they land. Workers are omp sessions inside the daemon rather than terminals, so this is the only way to watch one live — a herdr pane running it becomes an observation window. Starts from the top of the transcript, not the end, so attaching to a run that is already ten turns in shows those ten turns. Exits `1` with `no run recorded for #N` when the issue has never been dispatched, or `no transcript yet (state: …)` when the attempt has not opened one. Otherwise it runs until `Ctrl-C`, or until the run has finished and its transcript has been silent for five seconds, and prints `run ended: <state>`. |
 | `unblock <issue>` | Remove that issue's `blocked` and `failed` labels so an answered escalation can be claimed again. `agent:in-progress` is never touched. Run history remains intact: blocks consume the independent continuation budget, not failed implementation attempts. The output reports both budgets and warns when either will make the next tick escalate instead of dispatch. Exits `2` when the issue number is missing or malformed. |
-| `daemon` | Run the loop in the **foreground**, ticking every 5 minutes and serving `/healthz`. This is what `start` launches, and what a systemd unit should call. Writes the pidfile itself, and refuses with `another daemon is alive (pid N); stop it first` rather than becoming a second dispatcher. |
-| `daemon --once` | Run a single tick and exit. No HTTP server, and no pidfile — a drill must not register itself as the daemon, or the next reader believes it and the real daemon's in-flight runs get reconciled as orphans. |
+| `daemon` | Run the loop in the **foreground**, ticking every 5 minutes and serving `/healthz`. Admitted workers run in a tracked background pool, so settlement and capacity checks remain periodic while they work; shutdown drains the pool before closing the store. This is what `start` launches and what a systemd unit should call. |
+| `daemon --once` | Run a single tick, wait for workers admitted by that tick, and exit. No HTTP server or pidfile — a drill must not register itself as the daemon, or the next reader believes it and the real daemon's in-flight runs get reconciled as orphans. |
 | `--port N` | Accepted by `start`, `restart` and `daemon`. Both `--port 9000` and `--port=9000` work; missing or out of range exits `2` rather than falling back to the default, because probing the wrong endpoint is worse than a hard failure. |
 | `--project NAME` | Pick the project to service. One daemon process serves exactly one project; with several configured projects the name is required. |
 | `pause` | Stop claiming new work only. The running daemon notices on its next tick; runs already in flight finish. The orchestrator heartbeat keeps ticking if armed — its gate is the arm marker, not this flag. Prefer `hold` to silence both. |
@@ -1393,23 +1394,23 @@ Known and deliberate in this version:
   retried rather than corrupted.
 - **Mirrors grow one branch ref per run.** Unpushed work is never discarded, so
   refs accumulate until you reap them.
-- **`stop` is a deadline, not a clean drain.** Whether it goes through
-  `systemctl` or a raw signal, the loop is asked to finish the tick it is on, and
-  a tick with a worker in flight can run for that worker's whole wall clock; the
-  signal path escalates to `SIGKILL` after 10 seconds. There is no "stop once the
-  current worker lands". A unit that supervises the daemon should set
-  `SuccessExitStatus=0 143` (belt-and-braces for a handled `SIGTERM` exit) and
-  operators should prefer `omp-conductor stop` / `systemctl stop` over a raw
-  `kill`, so `Restart=on-failure` cannot misread a deliberate stop as a crash.
+- **`stop` is a bounded best-effort drain.** A signal stops new ticks and the
+  daemon waits for its active worker pool before closing the store. The CLI
+  escalates to `SIGKILL` after 10 seconds, so a worker that needs longer is
+  orphaned and salvaged on restart. Use `pause`, wait for `workers 0 / N`, then
+  stop when a clean drain matters. A supervising unit should set
+  `SuccessExitStatus=0 143`, and operators should prefer `omp-conductor stop` /
+  `systemctl stop` over raw `kill`, so `Restart=on-failure` cannot misread a
+  deliberate stop as a crash.
 - **A failed orchestrator degrades quietly.** The daemon logs a warning and keeps
   running, but tier-1 escalations then land in issue comments — which is exactly the
   "nobody reads it until morning" path the orchestrator exists to avoid. The warning
   is in `daemon.log`; nothing pages you about it.
-- **Workers are not terminal panes, so you cannot watch them.** A worker is an
-  in-process omp session inside the daemon, started by `createSession` and driven
-  concurrently via `Promise.allSettled`. Herdr therefore shows exactly one pane
-  (the orchestrator's) no matter how many workers are running, and no amount of
-  `maxConcurrentWorkers` changes that.
+- **Workers are not terminal panes, so you cannot watch them there.** Each
+  worker is an in-process omp session started by `createSession`. The resident
+  daemon tracks workers in a background pool so the five-minute loop keeps
+  settling PRs and checking capacity; shutdown waits for that pool. Herdr still
+  shows exactly one pane (the orchestrator's) regardless of concurrency.
 
   The cap does work. The admission loop (`admitCandidates` in `src/daemon.ts`) computes
   `slots = maxConcurrentWorkers - live workers`, admits at most that many issues
