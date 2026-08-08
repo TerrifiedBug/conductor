@@ -556,56 +556,49 @@ authority confirms; the worker model; the Telegram chat id for tier 2; the
 escalation fallback; whether an orchestrator session already runs elsewhere; the
 report scope; and finally whether to write `ORCHESTRATOR.md` + `POLICY.md`.
 
-Two things about the end of it that you must not smooth over:
+The end of the wizard is load-bearing:
 
-- **The dry run is the point.** Before the confirm, it reads the tracker through
-  the same routing code the loop uses and prints exactly what the next tick would
-  pick up, which repo each issue routes to, the branch it would cut, and every
-  issue it cannot route. Walk the operator through that output. Unroutable issues
-  here are the single most useful signal in the whole onboarding: they mean the
-  labels and the routing config disagree, and it is far cheaper to see it now.
-- **Nothing is mutated until they answer.** No label created, no config written,
-  no state database, no arm. If they decline, the machine is untouched. Never
-  answer that confirm on their behalf.
+- **The dry run is the point.** Before consent, setup reads the tracker with the
+  daemon's routing code. It shows each routable and unroutable issue. Walk the
+  operator through that output. An unroutable issue means that the labels and
+  routing configuration disagree.
+- **Nothing changes before consent.** Setup creates no label, file, database, or
+  arm marker before the operator agrees. Never answer that consent prompt for
+  the operator.
+- **The host plan is part of consent.** For an external orchestrator, setup names
+  the heartbeat file and both safety gates. It also names the staged systemd
+  unit. An invalid existing heartbeat stops setup before any write.
+- **The smoke is automatic and paused.** After consent, setup holds dispatch,
+  runs one daemon tick, proves `/healthz`, reads stored status, and stops the
+  temporary daemon. A running daemon is health-checked and safely restarted only
+  when no worker is live.
+- **External arming proves the real channel.** Setup preserves a valid arm marker.
+  If none exists, it sends the inbound Telegram challenge. A failed proof leaves
+  dispatch paused and prints the recovery commands.
 
-Say yes to writing `ORCHESTRATOR.md` + `POLICY.md`, then **immediately apply the edits you
-drafted in Steps 3, 4 and 5** to the file it wrote, and tell them the path. Note
-the trap for later: a future `/conductor setup` re-run offers to overwrite that
-file, and accepting loses every tailored word. Their brief is now a file worth
-keeping a copy of.
+Ask the operator to approve the `ORCHESTRATOR.md` and `POLICY.md` write. After
+the wizard completes, apply the edits from Steps 3, 4, and 5 to `POLICY.md`.
+Tell the operator its path. A later wizard run asks before it replaces these files.
 
-### Then walk arm, pause, and disarm — they are three different things
+### Then explain hold, pause, and disarm
 
-Operators conflate these, and the failure modes are not the same.
+These controls have different effects:
 
-- **Arm** is what that final confirm did, and it is exactly two things: create the
-  state database, and clear the pause flag. It does **not** start the daemon —
-  `omp-conductor start` does, and it does not report success until the daemon
-  answers `GET /healthz`. For a first run, take one tick in the foreground and
-  watch it: `omp-conductor daemon --once`.
-- **Pause is maintenance.** `/conductor pause` (or `omp-conductor pause`) writes a
-  sentinel in the state directory. The dispatch loop checks it first, so no new
-  work is claimed from the next tick; runs already in flight finish rather than
-  being killed. The orchestrator heartbeat reads the *same* flag, so pausing the
-  fleet also silences its heartbeat — one flag, not two. This is the switch for
-  touching a repo, rotating a credential, a release window, or a holiday.
-  `resume` undoes it. Nothing is torn down, nothing is forgotten.
-- **Disarm is channel teardown, and it is not a subcommand.** It is removing the
-  `armedFile` that `.conductor-tick.json` names — the heartbeat then sends nothing
-  and the supervising session simply stops being prompted. Be precise about the
-  asymmetry: **disarming stops the heartbeat, not the dispatch loop.** A disarmed
-  fleet whose daemon is still up keeps claiming issues with nobody supervising, so
-  "stop the fleet" is `pause` (or `omp-conductor stop`) — disarm is "stop waking
-  the orchestrator".
-- **And the gate that disarms itself.** If `.conductor-tick.json` names an
-  `accessFile`, every tick re-reads the Telegram bridge's `access.json` and
-  requires `enabled: true` with exactly **one** paired owner. It fails closed on
-  everything else: missing, unreadable, not JSON, disabled, nobody paired, or
-  several paired (it refuses to guess which human is on the hook). Unattended
-  dispatch is only defensible while a tier-2 escalation can reach a person, so a
-  channel that goes away disarms the heartbeat whether or not anyone intended it.
-  **A fleet deploy always sets `accessFile`.** Leaving it unset passes the gate —
-  that is for ordinary dev sessions, not an off switch.
+- **Setup readiness** means that the paused smoke passed. For external
+  orchestration, the Telegram arm proof also passed. Setup then clears the
+  dispatch pause. It does not install the staged systemd unit. Run the printed
+  install commands on systemd, or run `omp-conductor start` on another host.
+- **Hold** (`omp-conductor hold`) pauses claims and disarms ticks. The daemon and
+  pane stay active. Use this command for maintenance or an overnight stop.
+- **Pause** (`omp-conductor pause`) stops new claims only. Active workers finish,
+  and an armed heartbeat continues its triage and reporting duties.
+- **Disarm** (`omp-conductor disarm`) removes the marker named by
+  `.conductor-tick.json`. The heartbeat stops, but the daemon can still claim
+  work. Use `hold`, not `disarm`, when no orchestrator can supervise dispatch.
+- **The channel gate can stop ticks.** Every fleet heartbeat config names the
+  Telegram `access.json`. Each tick requires `enabled: true` and exactly one
+  paired owner. Missing, invalid, disabled, empty, or ambiguous access stops the
+  heartbeat.
 
 ---
 

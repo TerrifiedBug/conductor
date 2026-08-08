@@ -21,17 +21,18 @@ import {
   repairPolicyBannerCrumbs,
   writeMergedBrief,
 } from "./brief-upgrade.ts";
-import { configPath, expandHome, findProject, loadConfig, saveConfig } from "./config.ts";
+import { configPath, expandHome, findProject, loadConfig, resolveCaps, saveConfig } from "./config.ts";
 import { hostRamBytes, recommendedMaxWorkers } from "./host.ts";
 import {
-  armConductor,
   isPaused,
-  previewQueue,
+  prepareConductor,
+  previewProject,
   setPaused,
   type QueuePreview,
 } from "./daemon.ts";
 import {
   armTicks,
+  armedMarkerPath,
   clearPaneHalt,
   disarmTicks,
   halt,
@@ -40,8 +41,15 @@ import {
   releaseHold,
   renderStatus,
 } from "./fleet.ts";
+import { restartDaemon } from "./lifecycle.ts";
 
 import { defaultGraphRoot } from "./graph.ts";
+import {
+  formatHostRuntimePlan,
+  planHostRuntime,
+  runSetupSmoke,
+  writeHostRuntime,
+} from "./setup-host.ts";
 import {
   AMEND_AREAS,
   ORCHESTRATOR_BRIEF_NAME,
@@ -820,20 +828,6 @@ function formatPreview(p: QueuePreview): string[] {
   return lines;
 }
 
-/**
- * The dry run needs a saved config to read, and before the confirm there may
- * not be one — that is the normal first run, not a failure. So the reason is
- * reported inline and the wizard carries on; the post-write preview is the one
- * that always has something to say.
- */
-async function tryPreview(project: string): Promise<string[]> {
-  try {
-    return formatPreview(await previewQueue(project));
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return [`  (not available yet: ${message.split("\n")[0] ?? message})`];
-  }
-}
 
 /** What the whole conversation produced: the answers, and which area an amend
  *  narrowed it to. `amend` absent means every question was asked. */
@@ -870,11 +864,10 @@ export async function collectSetup(
 /**
  * The onboarding wizard, and — for a project it already knows — the amend.
  *
- * The invariant that makes this safe to run against a live tracker: nothing is
- * written or created before the confirm below returns true. Reading the config,
- * asking questions, `checkTokenScopes`, `planLabels` and `previewQueue` are all
- * reads. The four mutations — `createMissingLabels`, `saveConfig`,
- * `writeOrchestratorBrief`, `armConductor` — all live after it. Keep it that way.
+ * The invariant that makes this safe against a live tracker: no mutation occurs
+ * before the consent below. Config, tracker, and host-runtime planning are
+ * read-only. The paused state, labels, config, brief, runtime files, smoke, and
+ * arm proof all follow the same consent gate.
  *
  * An amend changes which questions are asked and what the summary leads with,
  * and nothing else: the same answers, the same `buildConfig`, the same single
@@ -901,8 +894,46 @@ async function setup(ctx: CommandContext, projectArg: string | undefined): Promi
   const { answers, amend } = collected;
 
   const scopes = await checkTokenScopes();
+  if (!scopes.ok) {
+    ctx.ui.notify(
+      `Setup stopped before writing anything. The gh token needs repo and project scopes. ` +
+        `Run \`gh auth refresh -s repo,project\`, then run setup again.`,
+      "error",
+    );
+    return;
+  }
   const labels = await planLabels(answers.trackerRepo, answers);
   const telegram = detectTelegram();
+  const nextConfig = buildConfig(answers, existing);
+  const project = findProject(nextConfig, answers.projectName);
+  if (
+    project.escalation.orchestrator === "external" &&
+    !answers.writeOrchestratorBrief &&
+    (!existsSync(briefPathForProject(project)) || !existsSync(policyPathForProject(project)))
+  ) {
+    ctx.ui.notify(
+      `Setup stopped before writing anything. External orchestration needs ${ORCHESTRATOR_BRIEF_NAME} and ${POLICY_BRIEF_NAME}. ` +
+        `Run setup again and approve the brief write.`,
+      "error",
+    );
+    return;
+  }
+  const runtime = planHostRuntime(
+    project,
+    resolveCaps(project, nextConfig.defaults),
+    telegram.stateDir,
+  );
+  let queuePreview: string[];
+  try {
+    queuePreview = formatPreview(await previewProject(project));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    ctx.ui.notify(
+      `Setup stopped before writing anything because the proposed queue could not be read: ${message}`,
+      "error",
+    );
+    return;
+  }
 
   ctx.ui.notify(
     [
@@ -911,10 +942,10 @@ async function setup(ctx: CommandContext, projectArg: string | undefined): Promi
       ...(amend === undefined ? [] : [summariseAmend(amend.area, amend.before, answers)]),
       summarisePlan(answers, scopes, labels, telegram),
       "",
-      existing === undefined
-        ? "Dry run: available once the config is written."
-        : "Dry run against the CURRENTLY SAVED config:",
-      ...(existing === undefined ? [] : await tryPreview(answers.projectName)),
+      formatHostRuntimePlan(runtime),
+      "",
+      "Dry run against the PROPOSED config:",
+      ...queuePreview,
       "",
       "Nothing has been changed yet.",
     ].join("\n"),
@@ -928,14 +959,22 @@ async function setup(ctx: CommandContext, projectArg: string | undefined): Promi
       toCreate.length > 0
         ? `Creates ${toCreate.length} label(s) in ${answers.trackerRepo}: ${toCreate.join(", ")}.`
         : "Creates no labels.",
-      `Writes ${path}, creates the state database and clears the pause flag.`,
-      scopes.missing.length > 0
-        ? `WARNING: the gh token is missing ${scopes.missing.join(", ")} — the daemon will fail to label issues.`
-        : "",
+      `Writes ${path}, prepares a paused state database, then runs a paused daemon smoke.`,
+      runtime.service.action === "keep"
+        ? `Keeps the staged systemd unit at ${runtime.service.path}.`
+        : `${runtime.service.action === "create" ? "Creates" : "Updates"} the staged systemd unit at ${runtime.service.path}.`,
+      runtime.tick === undefined
+        ? ""
+        : runtime.tick.action === "keep"
+          ? `Keeps the external heartbeat config at ${runtime.tick.path}.`
+          : `${runtime.tick.action === "create" ? "Creates" : "Updates"} the external heartbeat config at ${runtime.tick.path}.`,
       answers.writeOrchestratorBrief
         ? `Writes ${orchestratorBriefPath(answers)}, which is then yours to edit.`
         : "",
-      "Issues are only claimed once the daemon runs.",
+      project.escalation.orchestrator === "external"
+        ? "Dispatch stays paused until the existing arm marker or a new inbound Telegram proof makes the heartbeat live."
+        : "Dispatch resumes after the smoke succeeds.",
+      "Issues are only claimed after every setup gate succeeds.",
     ]
       .filter((s) => s.length > 0)
       .join(" "),
@@ -945,25 +984,85 @@ async function setup(ctx: CommandContext, projectArg: string | undefined): Promi
     return;
   }
 
-  // Labels first: a config pointing at labels that do not exist is a daemon
-  // that starts and then fails on its first claim.
+  // Hold first. Any later filesystem, tracker, smoke, or channel error leaves a
+  // partially applied setup unable to claim work.
+  prepareConductor();
   const created = await createMissingLabels(answers.trackerRepo, labels);
-  saveConfig(buildConfig(answers, existing));
+  saveConfig(nextConfig);
   const briefPath = answers.writeOrchestratorBrief ? writeOrchestratorBrief(answers) : undefined;
-  armConductor();
+  const runtimeFiles = writeHostRuntime(runtime);
+  const smoke = await runSetupSmoke(project.name);
+  let smokeLine =
+    `paused daemon --once; temporary /healthz on :${smoke.daemon.port}; ` +
+    `stored status for ${smoke.status.project}`;
+  let restartVia: "systemctl" | "cli" | undefined;
+  if (smoke.mode === "existing") {
+    if (smoke.status.liveWorkers > 0) {
+      ctx.ui.notify(
+        [
+          `Setup files are updated, but ${smoke.status.liveWorkers} live worker(s) still use the old daemon config.`,
+          "Dispatch remains paused. Let those workers finish.",
+          `Then run \`omp-conductor restart --project ${project.name}\`.`,
+          project.escalation.orchestrator === "external"
+            ? `Run \`omp-conductor arm --project ${project.name}\` if ticks are disarmed, then run \`omp-conductor resume\`.`
+            : "Then run `omp-conductor resume`.",
+        ].join("\n"),
+        "warning",
+      );
+      return;
+    }
+    const restarted = await restartDaemon({ project: project.name });
+    restartVia = restarted.via;
+    smokeLine =
+      `existing /healthz and stored status; restarted through ${restarted.via}; ` +
+      `new /healthz on :${restarted.record.port}`;
+  }
+
+  let armLine = "embedded orchestrator — no heartbeat arm marker";
+  if (project.escalation.orchestrator === "external") {
+    const marker = armedMarkerPath(project.name);
+    if (existsSync(marker)) {
+      armLine = `existing heartbeat arm preserved at ${marker}`;
+    } else {
+      ctx.ui.notify("Setup smoke passed. Sending the inbound Telegram arm challenge…", "info");
+      try {
+        const armed = await armTicks(project.name);
+        armLine = `heartbeat armed for owner ${armed.owner} at ${armed.path}`;
+      } catch (err) {
+        ctx.ui.notify(
+          [
+            "Setup files passed the paused daemon smoke, but the fleet remains held.",
+            err instanceof Error ? err.message : String(err),
+            `Start the external orchestrator in ${project.workspaceRoot}, then run \`omp-conductor arm --project ${project.name}\`.`,
+            "After the arm proof succeeds, run `omp-conductor resume`.",
+          ].join("\n"),
+          "warning",
+        );
+        return;
+      }
+    }
+  }
+  setPaused(false);
 
   ctx.ui.notify(
     [
-      created.length > 0 ? `Created label(s): ${created.join(", ")}` : "No labels needed creating.",
-      `Wrote ${path} and armed the conductor.`,
+      created.length > 0 ? `Created label(s): ${created.join(", ")}` : "All required labels already existed.",
+      `Wrote ${path}; dispatch is ready.`,
       briefPath === undefined
-        ? "No orchestrator brief written — the conductor stops at green PRs; merges and releases stay human."
-        : `Wrote ${briefPath} + POLICY.md — edit POLICY.md (Releases/Reporting); floor refreshes each tick.`,
+        ? "Kept the existing orchestrator brief."
+        : `Wrote ${briefPath} + POLICY.md. Edit POLICY.md for Releases and Reporting.`,
+      runtimeFiles.length === 0
+        ? "Host runtime files were already current."
+        : `Wrote host runtime file(s): ${runtimeFiles.join(", ")}`,
+      `Smoke passed: ${smokeLine}.`,
+      `Heartbeat: ${armLine}.`,
       "",
-      "Dry run against the config just written:",
-      ...(await tryPreview(answers.projectName)),
+      "On a systemd host, install and start the supervised daemon:",
+      ...(restartVia === "cli" ? ["  omp-conductor stop"] : []),
+      ...runtime.installCommands.map((command) => `  ${command}`),
       "",
-      "Start the loop with `omp-conductor daemon`, or `omp-conductor daemon --once` for a single tick.",
+      "Without systemd, run `omp-conductor start`.",
+      "Use the documented toy-issue drill to prove one complete worker path.",
     ].join("\n"),
     "info",
   );

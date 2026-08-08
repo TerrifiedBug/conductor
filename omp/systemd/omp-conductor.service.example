@@ -16,8 +16,10 @@
 #      fleet on a ≤8 GB box.
 #
 # Install:
-#   sudo cp omp-conductor.service.example /etc/systemd/system/omp-conductor.service
-#   sudo systemctl daemon-reload && sudo systemctl enable --now omp-conductor
+#   sudo install -m 0644 omp-conductor.service.example /etc/systemd/system/omp-conductor.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable omp-conductor.service
+#   sudo systemctl restart omp-conductor.service
 
 [Unit]
 Description=omp-conductor dispatch daemon
@@ -38,7 +40,7 @@ WorkingDirectory=/home/fleet
 
 # Foreground daemon so systemd tracks MainPID. `omp-conductor start` backgrounds;
 # under a unit, call `daemon` directly.
-ExecStart=/home/fleet/.local/bin/omp-conductor daemon --port 7432
+ExecStart=/home/fleet/.local/bin/omp-conductor daemon --port 8787
 
 Restart=on-failure
 # Handled SIGTERM exits 143; without this, Restart=on-failure brings the unit

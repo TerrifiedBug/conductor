@@ -197,8 +197,8 @@ Onboarding this package has two layers, and installing it gives you both.
 
 | Layer | What it is | What it owns |
 | --- | --- | --- |
-| **`/conductor setup`** | The deterministic wizard. Closed questions, a label plan, a dry run, one confirm. On a project it already knows, it offers to amend one area instead of re-asking everything — see [Changing one setting](#changing-one-setting). | **Mechanical config.** It is the only thing that writes `config.json`, and it mutates nothing before you confirm. |
-| **`skill://conductor-onboarding`** | A skill bundled in this package (`skills/conductor-onboarding/SKILL.md`), discovered automatically by any omp session once the plugin is installed. | **Brief authoring.** The judgement the wizard cannot prompt for. |
+| **`/conductor setup`** | The deterministic wizard. It shows the label, runtime, and dry-run plans before one consent step. A configured project can amend one area. | **Mechanical setup.** It writes `config.json`, labels, the brief, an external heartbeat config, and a staged systemd unit. It also completes the paused smoke and arm gates. |
+| **`skill://conductor-onboarding`** | A skill bundled in this package (`skills/conductor-onboarding/SKILL.md`). Any omp session can discover it after plugin installation. | **Brief authoring.** It supplies the judgment that fixed prompts cannot. |
 
 The split exists because the two halves fail differently. A wrong config value is
 a run that errors on the next tick; a wrong release boundary is a fleet that
@@ -348,66 +348,81 @@ time Telegram approval, `POLICY.md`-only edit, Hard-boundary prohibition, and
 
 ## Quick start
 
-1. Write a config (see [Configuration](#configuration)) at
-   `~/.omp/conductor/config.json`.
-2. From an omp session:
+1. Install `omp-conductor` and `omp-telegram`. Pair the Telegram bot and enable its bridge.
+2. Open the long-lived omp session in the fleet workspace.
+
+   The default workspace is `~/.omp/conductor/worktrees`. The wizard shows the actual path before it writes files.
+
+3. Run the wizard:
 
    ```text
    /conductor setup
    ```
 
-   This is a **dry run first**. It reads the tracker through the same routing code
-   the loop uses and prints exactly what the next tick would pick up, which repo
-   each issue routes to, the branch it would cut, and every issue that cannot be
-   routed. **Nothing is mutated** — no label written, no run row, no worktree —
-   until you answer the "Arm omp-conductor?" confirmation. Arming does exactly two
-   things: create the state database, and clear the pause flag. Declining leaves
-   the machine untouched.
+   The wizard reads the tracker with the same routing code as the daemon. It shows every issue that the next tick can route.
 
-   Two of its questions are about you rather than the fleet: how loud the
-   orchestrator should be (`reporting.scope`), and whether to write an
-   `ORCHESTRATOR.md` you then own. See
-   [Your workflow vs. the package](#your-workflow-vs-the-package). If you would
-   rather be interviewed through those two, and have the brief tailored and your
-   gates read out of your CI config, start from
-   [Onboarding](#onboarding) instead.
+   Nothing changes before the consent step. After consent, setup does these actions:
 
-3. Start the daemon in the background:
+   - creates the required labels;
+   - writes `config.json` and the selected brief;
+   - writes `.conductor-tick.json` for external orchestration;
+   - stages `omp-conductor.service` under the conductor state directory;
+   - runs `daemon --once` while dispatch is paused;
+   - starts a temporary daemon and proves `/healthz` and stored status;
+   - stops the temporary daemon;
+   - proves the inbound Telegram path before it arms an external heartbeat;
+   - clears the dispatch pause only after all required gates pass.
+
+   If the arm proof cannot complete, setup keeps dispatch paused. The result shows the exact recovery commands.
+
+4. On a systemd host, run the install commands that setup prints.
+
+   The commands install the staged unit, reload systemd, enable the unit, and restart it. The generated unit contains the current user, paths, project, port, and memory ceiling.
+
+   On a host without systemd, start the daemon directly:
 
    ```bash
    omp-conductor start
    ```
 
-   `start` first starts `herdr-fleet.service` when that optional unit is installed,
-   clearing a previous `halt --pane` recovery pin so Herdr can resume the exact
-   conductor pane. Hosts without systemd or without that unit keep the standalone
-   daemon behaviour. It then waits until the daemon actually answers
-   `GET /healthz`; spawning is not starting. A daemon whose config is broken,
-   whose port is taken or whose database is locked exits within a second, and the
-   command fails with the tail of `daemon.log` instead of printing a false
-   success. It refuses to start a second daemon, naming the live pid. Starting
-   processes does not clear `pause` or arm ticks; those remain explicit operator
-   decisions.
-
-   Pane recovery spans two separately installed plugins: npm ships the omp
-   heartbeat/status half, while `herdr-conductor` supplies `recover.sh`. After an
-   npm upgrade, refresh the Herdr plugin from `TerrifiedBug/conductor/herdr` as
-   well; publishing or installing npm alone cannot add the recovery-side tick
-   request.
-
-   For a first run, take a single tick in the foreground and watch it:
+5. Read the layered status:
 
    ```bash
-   omp-conductor daemon --once
+   omp-conductor status
    ```
 
-The loop ticks every 5 minutes even while workers remain active; merge
-settlement and capacity checks no longer wait for the longest worker from the
-previous tick. `omp-conductor stop` stops scheduling and waits for active
-workers rather than abandoning them. When systemd owns the process, stop goes
-through `systemctl stop`; otherwise it sends `SIGTERM`, then `SIGKILL` after 10
-seconds. An example unit (with `SuccessExitStatus=0 143` and `MemoryMax=5G`)
-ships as
+   The result must show a running daemon, a healthy `/healthz`, armed ticks for external orchestration, and the configured project.
+
+### First worker drill
+
+Use a disposable target repository for this drill. Replace the values below with labels that the wizard showed.
+
+```bash
+TRACKER=acme/planning
+QUEUE=ready-for-agent
+ROUTE=repo:api
+
+gh issue create --repo \"$TRACKER\" \
+  --title \"Conductor setup drill: add a marker file\" \
+  --body $'Add `conductor-smoke.txt` to the target repository.\\n\\nAcceptance: the file contains `setup path verified` and the pull request checks pass.' \
+  --label \"$ROUTE\" \
+  --label \"$QUEUE\"
+```
+
+The daemon claims the issue, creates a worktree, runs the configured gates, and opens a pull request. Follow it with:
+
+```bash
+omp-conductor status
+omp-conductor tail <issue-number>
+```
+
+Merge the green pull request. Then make sure that status moves the run to `merged` and frees its worker slot.
+
+The loop ticks every 5 minutes while workers remain active. Merge settlement and capacity checks do not wait for the longest worker.
+
+`omp-conductor stop` drains active workers before it stops. On systemd, it uses `systemctl stop` to prevent an automatic restart.
+
+The package also ships a generic unit at
 [`systemd/omp-conductor.service.example`](systemd/omp-conductor.service.example).
 
 
@@ -1093,9 +1108,9 @@ running its loop. A 24/7 omp session with a standing brief and nobody typing int
 it never gets prompted, so it never runs anything. Installing
 `omp plugin install omp-conductor` also installs a heartbeat that prompts it.
 
-The heartbeat is **inert unless the session's cwd contains
-`.conductor-tick.json`**, so it costs an ordinary session nothing. Drop the file
-in the orchestrator's working directory:
+The heartbeat is **inert unless the session cwd contains
+`.conductor-tick.json`**, so an ordinary session has no timer. `/conductor setup`
+writes this file for external orchestration. A manual configuration has this form:
 
 ```json
 {

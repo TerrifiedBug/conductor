@@ -1679,14 +1679,15 @@ export interface QueuePreview {
  * label, run row or worktree. This is what makes `/conductor setup` honest: the
  * dry run is the same routing code the loop uses, not a description of it.
  */
-export async function previewQueue(project?: string): Promise<QueuePreview> {
-  const cfg = loadConfig();
-  const p = findProject(cfg, project);
+export async function previewProject(
+  p: ProjectConfig,
+  path: string = configPath(),
+): Promise<QueuePreview> {
   const { routed, unroutable } = route(await makeTracker(p).listReady(), p);
   const states = Object.values(p.stateLabels).join(", ");
   return {
     project: p.name,
-    configPath: configPath(),
+    configPath: path,
     queueDescription:
       `open issues in ${p.tracker.repo} labelled "${p.queueLabel}", ` +
       `minus anything already labelled ${states}, ` +
@@ -1707,14 +1708,20 @@ export async function previewQueue(project?: string): Promise<QueuePreview> {
   };
 }
 
+export async function previewQueue(project?: string): Promise<QueuePreview> {
+  const cfg = loadConfig();
+  return previewProject(findProject(cfg, project));
+}
+
 /**
- * The one mutation `/conductor setup` performs, and only after the operator has
- * seen the dry run: create the state directory and schema, then clear the pause
- * flag so the daemon is allowed to claim work.
+ * Creates the state store and holds dispatch while setup verifies the host.
+ *
+ * Setup calls this immediately after consent. Every later setup error therefore
+ * leaves the fleet paused instead of exposing a partially written runtime.
  */
-export function armConductor(): void {
+export function prepareConductor(): void {
   openStore(dbPath()).close();
-  setPaused(false);
+  setPaused(true);
 }
 
 /**
