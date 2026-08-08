@@ -112,6 +112,8 @@ function makeStore() {
     runsStartedSince: () => 0,
     spendSince: () => 0,
     wasNotified: (key: string) => notified.has(key),
+    recordDispatch: () => {},
+    latestDispatch: () => undefined,
     markNotified: (key: string) => {
       notified.add(key);
       marked.push(key);
