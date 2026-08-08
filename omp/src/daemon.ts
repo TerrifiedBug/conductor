@@ -793,6 +793,10 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
       await removeWorktree(mirrorPath, worktreePath);
     }
   } catch (err) {
+    // Dispatch setup can fail after the controller opens but before runWorker's
+    // inner settlement guard exists. Latch it before any terminal write or await.
+    turnLimit?.close();
+    turnLimit = undefined;
     const detail = errText(err);
     log(`#${issue} errored: ${detail}`);
     if (run) {
