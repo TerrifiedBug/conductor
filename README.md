@@ -44,9 +44,11 @@ is not a thing, and there is no `plugin update`. Reinstalling from GitHub is how
 you refresh the managed checkout.
 
 After the first install, say “update conductor” from an external maintenance omp
-session. The bundled `skill://conductor-update` drains work, stops the exact fleet
-pane, refreshes both install surfaces, restarts, re-arms through Telegram proof,
-and verifies the resulting version and live status.
+session. The bundled `skill://conductor-update` pauses new claims, drains work,
+pins one npm release across the Bun-global CLI, omp plugin, and Herdr plugin,
+reloads the processes, verifies twice, and restores the prior pause state. It also
+converts an old locally linked Herdr plugin to a managed pinned checkout. Tick
+arming is preserved, so an ordinary update needs no halt or new Telegram proof.
 
 ### Prerequisites
 
