@@ -160,27 +160,54 @@ test("a prUrl that is not a pull request URL is never handed to gh", async () =>
   expect(spawned).toBe(0);
 });
 
-test("a linked sub-issue reports its parent number", () => {
-  // Shape verified live on gh 2.97.0 via `gh issue view --json parent` after
-  // `--add-sub-issue` (conductor #60 briefly under #47 for this measurement).
-  const raw = JSON.stringify({
-    parent: {
-      id: "I_kwDOExample",
-      number: 47,
-      state: "OPEN",
-      title: "Epic",
-      url: "https://github.com/acme/planning/issues/47",
-    },
-  });
+function parentReply(parent: unknown): string {
+  return JSON.stringify({ data: { repository: { issue: { parent } } } });
+}
+
+test("a linked sub-issue reports its parent number from raw GraphQL", () => {
+  const raw = parentReply({ number: 47 });
   expect(parentNumberFrom(raw)).toBe(47);
 });
 
 test("an issue with no parent is not epic-serialized", () => {
-  expect(parentNumberFrom(JSON.stringify({ parent: null }))).toBeUndefined();
+  expect(parentNumberFrom(parentReply(null))).toBeUndefined();
 });
 
 test("a parent payload without a usable number fails closed", () => {
-  expect(() => parentNumberFrom(JSON.stringify({ parent: { title: "Epic" } }))).toThrow(
+  expect(() => parentNumberFrom(parentReply({ title: "Epic" }))).toThrow(
     /unexpected parent number/,
   );
+});
+
+test("parent lookup uses raw GraphQL supported by gh 2.86", async () => {
+  const calls: string[][] = [];
+  const tracker = makeTracker(
+    {
+      name: "demo",
+      tracker: { kind: "github", repo: "acme/planning" },
+      queueLabel: "ready-for-agent",
+      stateLabels: {
+        inProgress: "agent:in-progress",
+        blocked: "agent:blocked",
+        failed: "agent:failed",
+      },
+      routing: { labelPrefix: "repo:", repos: {} },
+      caps: {},
+      escalation: { fallbackToIssueComment: true, orchestrator: "embedded" },
+      authority: { ...DEFAULT_AUTHORITY },
+      workspaceRoot: "/tmp/conductor/work",
+      mirrorRoot: "/tmp/conductor/mirrors",
+    },
+    async (argv) => {
+      calls.push(argv);
+      return parentReply({ number: 47 });
+    },
+  );
+
+  expect(await tracker.parentOf(305)).toBe(47);
+  expect(calls).toHaveLength(1);
+  expect(calls[0]?.slice(0, 2)).toEqual(["api", "graphql"]);
+  expect(calls[0]).not.toContain("view");
+  expect(calls[0]).not.toContain("parent");
+  expect(calls[0]).toContain("n=305");
 });

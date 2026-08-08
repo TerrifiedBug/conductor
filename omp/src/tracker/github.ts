@@ -53,6 +53,12 @@ const CLOSERS_QUERY = `query($owner:String!,$repo:String!,$n:Int!){
   }
 }`;
 
+const PARENT_QUERY = `query($owner:String!,$repo:String!,$n:Int!){
+  repository(owner:$owner,name:$repo){
+    issue(number:$n){ parent{ number } }
+  }
+}`;
+
 /** The `gh api graphql` envelope for {@link CLOSERS_QUERY}. Every level is
  *  nullable: a deleted or wrong-numbered issue answers `null`, not an error. */
 interface ClosersResponse {
@@ -190,27 +196,30 @@ export function prStateFrom(raw: string): PrState | undefined {
 }
 
 /**
- * Parent number from a `gh issue view --json parent` payload, or undefined
- * when the issue has no parent. Throws on a payload that claims a parent but
- * does not carry a usable number — admission would otherwise treat garbage as
- * "no parent" and skip the epic soft-cap.
+ * Parent number from a raw GraphQL response, or undefined when the issue has
+ * no parent. Throws when the issue or claimed parent is malformed — admission
+ * must not turn an unknown relationship into permission to run siblings.
  */
 export function parentNumberFrom(raw: string): number | undefined {
-  const parsed = JSON.parse(raw) as { parent: { number?: unknown } | null };
-  if (parsed.parent == null) return undefined;
-  const n = parsed.parent.number;
+  const parsed = JSON.parse(raw) as {
+    data?: { repository?: { issue?: { parent?: { number?: unknown } | null } | null } | null };
+  };
+  const issue = parsed.data?.repository?.issue;
+  if (issue == null) throw new Error("unexpected missing issue in parent response");
+  if (issue.parent == null) return undefined;
+  const n = issue.parent.number;
   if (typeof n !== "number" || !Number.isInteger(n) || n <= 0) {
     throw new Error(`unexpected parent number ${JSON.stringify(n)}`);
   }
   return n;
 }
 
-export function makeTracker(p: ProjectConfig): Tracker {
+export function makeTracker(p: ProjectConfig, runGh: typeof gh = gh): Tracker {
   const repo = p.tracker.repo;
 
   return {
     async listReady(): Promise<ReadyIssue[]> {
-      const raw = await gh([
+      const raw = await runGh([
         "issue",
         "list",
         "--repo",
@@ -246,7 +255,7 @@ export function makeTracker(p: ProjectConfig): Tracker {
 
     async addLabel(issue: number, label: string): Promise<void> {
       try {
-        await gh(["issue", "edit", String(issue), "--repo", repo, "--add-label", label]);
+        await runGh(["issue", "edit", String(issue), "--repo", repo, "--add-label", label]);
       } catch (err) {
         if (!isLabelNoop(err, "add")) throw err;
       }
@@ -254,7 +263,7 @@ export function makeTracker(p: ProjectConfig): Tracker {
 
     async removeLabel(issue: number, label: string): Promise<void> {
       try {
-        await gh(["issue", "edit", String(issue), "--repo", repo, "--remove-label", label]);
+        await runGh(["issue", "edit", String(issue), "--repo", repo, "--remove-label", label]);
       } catch (err) {
         if (!isLabelNoop(err, "remove")) throw err;
       }
@@ -263,25 +272,37 @@ export function makeTracker(p: ProjectConfig): Tracker {
     async comment(issue: number, body: string): Promise<void> {
       // `--body-file -` reads stdin, so the body is never shell- or argv-
       // mangled and has no length limit worth worrying about.
-      await gh(["issue", "comment", String(issue), "--repo", repo, "--body-file", "-"], body);
+      await runGh(["issue", "comment", String(issue), "--repo", repo, "--body-file", "-"], body);
     },
 
     async close(issue: number): Promise<void> {
-      await gh(["issue", "close", String(issue), "--repo", repo]);
+      await runGh(["issue", "close", String(issue), "--repo", repo]);
     },
 
     async linkParent(child: number, parent: number): Promise<void> {
       // Native sub-issue linkage rather than a body mention: it is what the
       // repo's own epic rollups read, so a human sees the split without us
       // maintaining a second index of it.
-      await gh(["issue", "edit", String(parent), "--repo", repo, "--add-sub-issue", String(child)]);
+      await runGh(["issue", "edit", String(parent), "--repo", repo, "--add-sub-issue", String(child)]);
     },
 
     async parentOf(issue: number): Promise<number | undefined> {
-      // Native sub-issue parent, not a body scrape. Verified on gh 2.97.0:
-      // `parent` is null with no link, otherwise `{ number, title, url, ... }`.
+      // gh 2.86 cannot expose `parent` through `issue view --json`; its raw
+      // GraphQL command can, and is already the adapter's path for PR closers.
+      const [owner = "", name = ""] = repo.split("/");
       return parentNumberFrom(
-        await gh(["issue", "view", String(issue), "--repo", repo, "--json", "parent"]),
+        await runGh([
+          "api",
+          "graphql",
+          "-f",
+          `query=${PARENT_QUERY}`,
+          "-F",
+          `owner=${owner}`,
+          "-F",
+          `repo=${name}`,
+          "-F",
+          `n=${issue}`,
+        ]),
       );
     },
 
@@ -290,7 +311,7 @@ export function makeTracker(p: ProjectConfig): Tracker {
       // that spelling, so an empty half means a hand-edited config: `gh` then
       // errors and the caller holds the candidate rather than guessing.
       const [owner = "", name = ""] = repo.split("/");
-      const raw = await gh([
+      const raw = await runGh([
         "api",
         "graphql",
         "-f",
@@ -316,7 +337,7 @@ export function makeTracker(p: ProjectConfig): Tracker {
       // what the URL already says.
       if (!PR_URL.test(url)) return undefined;
       try {
-        return prStateFrom(await gh(["pr", "view", url, "--json", "state", "--jq", ".state"]));
+        return prStateFrom(await runGh(["pr", "view", url, "--json", "state", "--jq", ".state"]));
       } catch {
         // Never throws, per the port's contract. A deleted PR, a revoked token
         // and a flaky network all mean "could not tell", and the caller's whole
