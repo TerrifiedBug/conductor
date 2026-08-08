@@ -18,11 +18,11 @@ authority are chosen during setup and default to `human`. Granting either action
 to the orchestrator never grants it to a worker or the dispatch daemon. Releases
 remain batched from coherent groups of merged work, never cut one per worker PR.
 
-Code counts every limit that decides whether work starts: concurrency, dollars per
-day, turns and wall clock per worker, attempts per issue. None of it is left to the
-model. A worker asked to respect a budget eventually talks itself out of it, so the
-dispatcher enforces the budget before anything is claimed and kills anything over
-the line.
+Code counts every limit that decides whether work starts: concurrency, dollars
+per day, turns and wall clock per worker, failed implementation attempts, and
+operational continuations per issue. None is left to the model. The dispatcher
+enforces these budgets before anything is claimed and kills workers that exceed
+their per-run limits.
 
 When a run does get stuck, the first responder is not you. A tier-1 escalation is
 injected into a long-lived **orchestrator session** that can read the issue and the
@@ -459,9 +459,10 @@ Per tick, for the daemon's project:
    would let two completed workers stop the fleet.
    If no slot is free, the tick logs and returns.
 8. **Admit issues** up to the free slots, skipping any issue that already has
-   an active run — including a pending or green PR, so a second attempt can never land on a
-   live PR. An issue that has used `maxAttemptsPerIssue` escalates at Tier 1
-   instead of being admitted.
+   an active run — including a pending or green PR, so a second attempt cannot
+   land on a live PR. Repeated implementation failures consume
+   `maxAttemptsPerIssue`; cap kills, daemon orphans and answered blocks consume
+   the independent `maxContinuationsPerIssue`. Exhausting either escalates.
 9. **Ask the tracker whether the work already exists.** For each candidate that
    survived step 8 — so at most one API call per free slot, never one per queued
    issue — the daemon asks whether an **open** PR already closes the issue. If one
@@ -540,8 +541,9 @@ label is the crash guard against double-dispatch — and deciding what the dead
 worker's remains are worth is the orchestrator's drain-duty judgement, spelled
 out in its brief: an open green PR goes to the merge path, a salvaged sha is a
 continuation hand-off, and a clean orphan has its label released so the next
-tick re-claims it. Orphaned attempts still count toward `maxAttemptsPerIssue`,
-so a crash loop escalates instead of redispatching forever.
+tick re-claims it. Orphans consume `maxContinuationsPerIssue`, not failed
+implementation attempts, so crashes cannot starve the retry needed for a real
+code or CI failure — and a crash loop still escalates.
 
 ### Deploying a new package onto a busy fleet
 
@@ -593,12 +595,12 @@ every pushed PR it is still holding:
 | still open | unchanged | The normal steady state. Its issue must stay occupied, or a second attempt lands on the live PR. |
 | could not be determined | unchanged | A flaky network, a revoked token, a deleted PR. An unknown answer never settles a row; the next tick asks again for free. |
 
-The attempt counter is untouched either way, because both were real attempts. Run
-rows are the only thing that changes: a merge normally closes the issue, and a
-human who closed a PR is already looking at it, so what an issue's labels should
-say next is the orchestrator's drain-duty judgement — the same division of labour
-as a restart, above. One unreachable PR costs its own row and nothing else; the
-rest of the sweep still settles.
+Run history is untouched. A PR closed without merging becomes a concrete failed
+attempt; a merge does not spend failure or continuation budget. A merge normally
+closes the issue, and a human who closed a PR is already looking at it, so what
+an issue's labels should say next remains the orchestrator's drain-duty
+judgement. One unreachable PR costs its own row and nothing else; the rest of
+the sweep still settles.
 
 Until this existed, nothing ever revisited a `pushed-green` row: the startup
 reconciler only settles rows that held a process, and `merged` went unwritten. On
@@ -698,7 +700,8 @@ rest. `0` is a real value (a hard stop), not "unset".
 | `dailySpendUsd` | `25` | Rolling-day spend ceiling in USD, or `null` for no spend gate. `0` is a hard stop. Metered from assistant `usage.cost.total`. |
 | `workerMaxTurns` | `120` | Turn ceiling for one worker. Catches a session looping without converging. |
 | `workerWallClockMs` | `5400000` (90 minutes) | Wall-clock ceiling for one worker. A session that is merely stuck spends no turns, so turns alone cannot detect it. |
-| `maxAttemptsPerIssue` | `2` | Retries per issue before it escalates. One clean retry recovers from flaky CI; a third attempt almost always means the issue itself is underspecified. |
+| `maxAttemptsPerIssue` | `2` | Failed implementation or CI attempts before escalation. Operational stops do not consume this budget, so salvage can continue without stealing the retry needed for a real failure. |
+| `maxContinuationsPerIssue` | `2` | Cap-kill, daemon-orphan and answered-block resumes before escalation. This independently bounds crash/resume loops. |
 
 Days are counted from **local midnight**, matching how a human reads "today".
 
@@ -918,7 +921,8 @@ A complete, valid config for one project with two target repos:
     "dailySpendUsd": 25,
     "workerMaxTurns": 120,
     "workerWallClockMs": 5400000,
-    "maxAttemptsPerIssue": 2
+    "maxAttemptsPerIssue": 2,
+    "maxContinuationsPerIssue": 2
   },
   "projects": [
     {
@@ -1236,7 +1240,7 @@ omp-conductor help
 | `disarm [--project NAME]` | Remove the arm marker so ticks skip. Processes untouched. |
 | `release-pane [--project NAME]` | Clear the `halt --pane` recovery pin so herdr-conductor may resume the fleet agent again. |
 | `tail <issue>` | Follow the newest run for that issue: the worker's assistant text as `assistant: …` and each tool it calls as `tool: <name>`, printed as they land. Workers are omp sessions inside the daemon rather than terminals, so this is the only way to watch one live — a herdr pane running it becomes an observation window. Starts from the top of the transcript, not the end, so attaching to a run that is already ten turns in shows those ten turns. Exits `1` with `no run recorded for #N` when the issue has never been dispatched, or `no transcript yet (state: …)` when the attempt has not opened one. Otherwise it runs until `Ctrl-C`, or until the run has finished and its transcript has been silent for five seconds, and prints `run ended: <state>`. |
-| `unblock <issue>` | Remove that issue's `blocked` and `failed` state labels through the tracker, so the next tick can claim it again. This is the supported way back for an escalation you answered: eligibility disqualifies any issue carrying a state label, so an answered issue that keeps one is never re-claimed and the answer is inert. Removing a label the issue does not carry is a no-op, so both are always cleared and neither has to be looked up first. `agent:in-progress` is deliberately not touched — it means a worker process exists, which is not something an answer changes. The run history is left exactly as it is: an answered block still spent a worker, so it still counts toward `maxAttemptsPerIssue`, and the output says how many attempts remain — or warns that the next tick will escalate instead of dispatching, when none do. Exits `2` with `unblock needs an issue number` on a missing or malformed positional. |
+| `unblock <issue>` | Remove that issue's `blocked` and `failed` labels so an answered escalation can be claimed again. `agent:in-progress` is never touched. Run history remains intact: blocks consume the independent continuation budget, not failed implementation attempts. The output reports both budgets and warns when either will make the next tick escalate instead of dispatch. Exits `2` when the issue number is missing or malformed. |
 | `daemon` | Run the loop in the **foreground**, ticking every 5 minutes and serving `/healthz`. This is what `start` launches, and what a systemd unit should call. Writes the pidfile itself, and refuses with `another daemon is alive (pid N); stop it first` rather than becoming a second dispatcher. |
 | `daemon --once` | Run a single tick and exit. No HTTP server, and no pidfile — a drill must not register itself as the daemon, or the next reader believes it and the real daemon's in-flight runs get reconciled as orphans. |
 | `--port N` | Accepted by `start`, `restart` and `daemon`. Both `--port 9000` and `--port=9000` work; missing or out of range exits `2` rather than falling back to the default, because probing the wrong endpoint is worse than a hard failure. |

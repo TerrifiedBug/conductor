@@ -27,9 +27,12 @@ export interface Caps {
   /** Wall-clock ceiling for one worker (90 min): a session that is merely
    *  stuck spends no turns, so turns alone cannot detect it. */
   workerWallClockMs: number;
-  /** Retries per issue before it escalates (2): one clean retry recovers from
-   *  flaky CI, a third almost always means the issue itself is underspecified. */
+  /** Failed implementation/CI attempts allowed before escalation. Operational
+   *  continuations do not consume this budget. */
   maxAttemptsPerIssue: number;
+  /** Cap-kill, daemon-orphan and answered-block continuations allowed before a
+   *  crash/resume loop escalates independently of implementation failures. */
+  maxContinuationsPerIssue: number;
 }
 
 /**
@@ -339,7 +342,12 @@ export interface Store {
   activeRuns(project: string): RunRecord[];
   /** Runs backed by a worker process — what capacity counts. Subset of {@link Store.activeRuns}. */
   liveRuns(project: string): RunRecord[];
+  /** Total run segments, used only for the monotonically increasing run number. */
   attemptsFor(project: string, issue: number): number;
+  /** Terminal implementation failures that consume `maxAttemptsPerIssue`. */
+  failuresFor(project: string, issue: number): number;
+  /** Operational stops that require a bounded continuation resume. */
+  continuationsFor(project: string, issue: number): number;
   /** Newest attempt for one issue, whatever state it reached. `omp-conductor
    *  tail` resolves an issue number to a transcript through this; the number is
    *  what an operator has, the run id is not. */
@@ -382,4 +390,5 @@ export const DEFAULT_CAPS: Caps = {
   workerMaxTurns: 120,
   workerWallClockMs: 90 * 60 * 1000,
   maxAttemptsPerIssue: 2,
+  maxContinuationsPerIssue: 2,
 };

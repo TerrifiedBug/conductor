@@ -383,6 +383,7 @@ test("resolveCaps overrides only the fields a project sets and inherits the rest
     workerMaxTurns: 200,
     workerWallClockMs: 60_000,
     maxAttemptsPerIssue: 4,
+    maxContinuationsPerIssue: 3,
   };
   const p = project("demo");
   p.caps = { workerMaxTurns: 7, dailySpendUsd: 0 };
@@ -394,6 +395,7 @@ test("resolveCaps overrides only the fields a project sets and inherits the rest
     workerMaxTurns: 7,
     workerWallClockMs: 60_000,
     maxAttemptsPerIssue: 4,
+    maxContinuationsPerIssue: 3,
   });
 });
 

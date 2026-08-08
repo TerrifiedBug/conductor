@@ -958,7 +958,8 @@ function formatProjectBody(s: StatusSnapshot): string {
       : `  spend today        $${s.spendTodayUsd.toFixed(2)} / $${s.caps.dailySpendUsd.toFixed(2)}`,
     `  worker max turns   ${s.caps.workerMaxTurns}`,
     `  worker wall clock  ${Math.round(s.caps.workerWallClockMs / 60_000)}m`,
-    `  attempts per issue ${s.caps.maxAttemptsPerIssue}`,
+    `  failed attempts    ${s.caps.maxAttemptsPerIssue}`,
+    `  continuations      ${s.caps.maxContinuationsPerIssue}`,
     "",
   ];
   if (s.activeRuns.length === 0) {

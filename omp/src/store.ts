@@ -192,6 +192,14 @@ export function openStore(dbPath: string): Store {
   const countAttempts = db.query<{ n: number }, [string, number]>(
     `SELECT COUNT(*) AS n FROM runs WHERE project = ? AND issue = ?`,
   );
+  const countFailures = db.query<{ n: number }, [string, number]>(
+    `SELECT COUNT(*) AS n FROM runs
+      WHERE project = ? AND issue = ? AND state = 'failed'`,
+  );
+  const countContinuations = db.query<{ n: number }, [string, number]>(
+    `SELECT COUNT(*) AS n FROM runs
+      WHERE project = ? AND issue = ? AND state IN ('killed', 'orphaned', 'blocked')`,
+  );
   // Newest attempt for one issue. `startedAt` is millisecond-resolution and two
   // attempts could in principle share one, so rowid breaks the tie by insertion
   // order — a `tail` that attached to the older of two same-millisecond attempts
@@ -274,6 +282,14 @@ export function openStore(dbPath: string): Store {
 
     attemptsFor(project: string, issue: number): number {
       return countAttempts.get(project, issue)?.n ?? 0;
+    },
+
+    failuresFor(project: string, issue: number): number {
+      return countFailures.get(project, issue)?.n ?? 0;
+    },
+
+    continuationsFor(project: string, issue: number): number {
+      return countContinuations.get(project, issue)?.n ?? 0;
     },
 
     latestRun(project: string, issue: number): RunRecord | undefined {

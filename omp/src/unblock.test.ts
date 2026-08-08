@@ -98,9 +98,11 @@ test("leaves the attempt history exactly as the last worker left it", async () =
 
   const outcome = await unblockIssue(project, tracker, store, 221);
 
-  // An answered block still spent a worker's whole budget, so it still counts:
-  // a question answered twice is the loop `maxAttemptsPerIssue` exists to stop.
+  // The blocked segment consumes the continuation budget, while the concrete
+  // failed segment alone consumes the implementation-failure budget.
   expect(outcome.attemptsUsed).toBe(2);
+  expect(outcome.failuresUsed).toBe(1);
+  expect(outcome.continuationsUsed).toBe(1);
   expect(store.attemptsFor(project.name, 221)).toBe(2);
   expect(store.getRun(first.id)).toEqual(first);
   expect(store.getRun(second.id)).toEqual(second);
@@ -117,34 +119,54 @@ test("clears an issue the store has never seen, and says so", async () => {
   expect(removed.map((r) => r.issue)).toEqual([999, 999]);
   expect(outcome.latest).toBeUndefined();
   expect(outcome.attemptsUsed).toBe(0);
+  expect(outcome.failuresUsed).toBe(0);
+  expect(outcome.continuationsUsed).toBe(0);
   expect(formatUnblock(999, outcome, project, caps())).toContain("none recorded");
 });
 
 test("promises a re-claim only when the next tick could actually make one", () => {
   const spent: RunRecord = { id: "run_a", ...draft({ attempt: 2 }) };
 
-  const eligible = formatUnblock(221, { cleared: ["agent:blocked"], attemptsUsed: 1, latest: spent }, project, caps());
+  const eligible = formatUnblock(
+    221,
+    { cleared: ["agent:blocked"], attemptsUsed: 1, failuresUsed: 0, continuationsUsed: 1, latest: spent },
+    project,
+    caps(),
+  );
   expect(eligible).toContain("eligible again");
   // The queue label is the other half of eligibility, and this verb does not
   // add it — an operator who took the issue off the queue must be told.
   expect(eligible).toContain("agent-ready");
 
-  // The failure this guards: an operator reads "eligible again", walks away, and
-  // the next tick escalates the attempt cap instead of dispatching anything.
+  // A real implementation failure budget still stops repeated bad attempts.
   const exhausted = formatUnblock(
     221,
-    { cleared: ["agent:blocked"], attemptsUsed: 2, latest: spent },
+    { cleared: ["agent:blocked"], attemptsUsed: 4, failuresUsed: 2, continuationsUsed: 2, latest: spent },
     project,
     caps({ maxAttemptsPerIssue: 2 }),
   );
   expect(exhausted).toContain("not eligible");
-  expect(exhausted).toContain("all 2 attempts are spent");
+  expect(exhausted).toContain("all 2 failed attempts are spent");
+
+  const continuationLoop = formatUnblock(
+    221,
+    { cleared: ["agent:blocked"], attemptsUsed: 3, failuresUsed: 0, continuationsUsed: 3, latest: spent },
+    project,
+    caps({ maxContinuationsPerIssue: 2 }),
+  );
+  expect(continuationLoop).toContain("not eligible");
+  expect(continuationLoop).toContain("2-continuation budget was exceeded");
 });
 
 test("says nothing is re-claimed while a worker still owns the issue", () => {
   const live: RunRecord = { id: "run_b", ...draft({ attempt: 1, state: "running" }) };
 
-  const text = formatUnblock(221, { cleared: ["agent:blocked"], attemptsUsed: 1, latest: live }, project, caps());
+  const text = formatUnblock(
+    221,
+    { cleared: ["agent:blocked"], attemptsUsed: 1, failuresUsed: 0, continuationsUsed: 0, latest: live },
+    project,
+    caps(),
+  );
 
   // The issue keeps agent:running, so eligibility is still false and a promised
   // re-claim would be a lie the operator only discovers by waiting for it.

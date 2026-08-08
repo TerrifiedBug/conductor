@@ -502,6 +502,11 @@ export async function buildBrief(
 
 // ------------------------------------------------------------------- one issue
 
+/** `stops` are the operational ends that each require one resume. */
+export function hasContinuationBudget(stops: number, maxContinuations: number): boolean {
+  return stops <= maxContinuations;
+}
+
 export async function verifyPushedGreenClaim(
   tracker: Pick<Tracker, "verifyPr">,
   claim: Pick<WorkerResult, "prUrl" | "headSha">,
@@ -646,19 +651,21 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
         detail: [`${r.issue.title}`, r.issue.url, "", result.report].join("\n"),
       });
     } else if (state === "failed" || state === "killed") {
-      // Turns-cap with attempts left: salvage, put the issue back on the queue,
-      // and skip the failed label so the next tick reclaims as a continuation
-      // instead of burning a human triage cycle (#50 / #21).
+      // A turns cap consumes the independent continuation budget, not an
+      // implementation-failure attempt. The row is already `killed`, so this
+      // count includes the segment that just ended.
+      const continuation = store.continuationsFor(project.name, issue);
       const continueTurns =
-        result.killedBy === "turns" && attempt < caps.maxAttemptsPerIssue;
+        result.killedBy === "turns" &&
+        hasContinuationBudget(continuation, caps.maxContinuationsPerIssue);
       const salvaged = await salvage(issue, attempt, endedBy(result.killedBy), worktreePath);
 
       if (continueTurns) {
         await tracker.removeLabel(issue, inProgress);
         await tracker.addLabel(issue, project.queueLabel);
         log(
-          `#${issue} turns-cap on attempt ${attempt}/${caps.maxAttemptsPerIssue} — ` +
-            `salvaged and re-queued for continuation`,
+          `#${issue} turns-cap on run ${attempt}, continuation ` +
+            `${continuation}/${caps.maxContinuationsPerIssue} — salvaged and re-queued`,
         );
         await safeEscalate(d, {
           tier: 1,
@@ -926,18 +933,35 @@ export async function admitCandidates(
     if (admitted.length >= slots) break;
     if (busy.has(r.issue.number)) continue;
 
-    const prior = store.attemptsFor(project.name, r.issue.number);
-    if (prior >= caps.maxAttemptsPerIssue) {
+    const priorRuns = store.attemptsFor(project.name, r.issue.number);
+    const failures = store.failuresFor(project.name, r.issue.number);
+    if (failures >= caps.maxAttemptsPerIssue) {
       await safeEscalate(d, {
         tier: 1,
         project: project.name,
         issue: r.issue.number,
-        summary: `#${r.issue.number} has used all ${caps.maxAttemptsPerIssue} attempts`,
+        summary: `#${r.issue.number} has used all ${caps.maxAttemptsPerIssue} failed attempts`,
         detail: [
           r.issue.title,
           r.issue.url,
-          "Another attempt almost always means the issue itself is underspecified.",
+          "Another implementation attempt almost always means the issue itself is underspecified.",
           "Rewrite the acceptance criteria, or take it off the queue.",
+        ].join("\n"),
+      });
+      continue;
+    }
+
+    const continuations = store.continuationsFor(project.name, r.issue.number);
+    if (!hasContinuationBudget(continuations, caps.maxContinuationsPerIssue)) {
+      await safeEscalate(d, {
+        tier: 1,
+        project: project.name,
+        issue: r.issue.number,
+        summary: `#${r.issue.number} exceeded its ${caps.maxContinuationsPerIssue}-continuation budget`,
+        detail: [
+          r.issue.title,
+          r.issue.url,
+          "Repeated cap kills, daemon orphans, or answered blocks need an operator to inspect progress.",
         ].join("\n"),
       });
       continue;
@@ -990,7 +1014,7 @@ export async function admitCandidates(
       continue;
     }
 
-    admitted.push({ r, attempt: prior + 1 });
+    admitted.push({ r, attempt: priorRuns + 1 });
     if (parent !== undefined) occupiedParents.set(parent, r.issue.number);
   }
 
@@ -1192,7 +1216,8 @@ export function formatStatus(s: StatusSnapshot): string {
       : `  spend today        $${s.spendTodayUsd.toFixed(2)} / $${s.caps.dailySpendUsd.toFixed(2)}`,
     `  worker max turns   ${s.caps.workerMaxTurns}`,
     `  worker wall clock  ${Math.round(s.caps.workerWallClockMs / 60_000)}m`,
-    `  attempts per issue ${s.caps.maxAttemptsPerIssue}`,
+    `  failed attempts    ${s.caps.maxAttemptsPerIssue}`,
+    `  continuations      ${s.caps.maxContinuationsPerIssue}`,
     "",
   ];
   if (s.activeRuns.length === 0) {

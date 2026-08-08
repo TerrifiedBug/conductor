@@ -124,8 +124,8 @@ usage:
   unblock  clear <issue>'s blocked and failed labels so the next tick can claim
            it again — the supported way back for an escalation you answered,
            and why the brief's "never hand-edit a state label" rule can stay
-           absolute. Attempts already spent are kept: an answered block still
-           cost a worker.
+           absolute. Run history is kept; answered blocks consume the separate
+           operational-continuation budget, not failed implementation attempts.
   daemon   run the dispatch loop in the foreground; --once runs a single tick
            and exits. This is what \`start\` launches.
   pause    stop claiming new work only (ticks keep firing if armed). Prefer hold.

@@ -1013,7 +1013,7 @@ export const AMEND_AREAS: {
     // The model rides with the caps because it is the other per-worker knob, and
     // an area no menu offers is a setting only a full re-interview can reach.
     name: "caps & worker model",
-    asks: "concurrency, spend, turns, wall clock, attempts per issue — then the worker model",
+    asks: "concurrency, spend, turns, wall clock, failed attempts, continuations — then the worker model",
     describe: (p) => {
       const c = resolveCaps(p, DEFAULT_CAPS);
       const answered = Object.keys(p.caps).length > 0;
@@ -1022,7 +1022,9 @@ export const AMEND_AREAS: {
       return (
         `${c.maxConcurrentWorkers} workers, ${c.workerMaxTurns} turns, ` +
         `${Math.round(c.workerWallClockMs / 60000)}m, ${spend}, ` +
-        `${c.maxAttemptsPerIssue} attempts${answered ? "" : " (all defaults)"} — ` +
+        `${c.maxAttemptsPerIssue} failed attempt${c.maxAttemptsPerIssue === 1 ? "" : "s"}, ` +
+        `${c.maxContinuationsPerIssue} continuation${c.maxContinuationsPerIssue === 1 ? "" : "s"}` +
+        `${answered ? "" : " (all defaults)"} — ` +
         `${p.workerModel === undefined ? "harness default model" : `model ${p.workerModel}`}`
       );
     },

@@ -22,10 +22,9 @@
  * one event that happens outside every run, so no member fits it — folding it
  * into `merged` or `killed` would make `status` describe a run that never
  * reached either. Eligibility is read off the tracker's labels and never off a
- * run row, so the store has nothing to say here. Leaving the history alone is
- * also what keeps `maxAttemptsPerIssue` honest: an answered block still spent a
- * worker's whole budget, and the same question answered twice is a loop the cap
- * exists to stop.
+ * run row, so the store has nothing to say here. Leaving history alone keeps
+ * both budgets honest: a block consumes an operational continuation, while a
+ * real implementation failure consumes the separate failed-attempt budget.
  */
 
 import { LIVE_STATES } from "./store.ts";
@@ -35,8 +34,10 @@ import type { Caps, ProjectConfig, RunRecord, Store, Tracker } from "./types.ts"
 export interface UnblockOutcome {
   /** State labels the tracker was asked to drop. */
   cleared: string[];
-  /** Attempts this issue has already spent. Unchanged by the unblock. */
+  /** Total run segments, retained for history and sequence numbering. */
   attemptsUsed: number;
+  failuresUsed: number;
+  continuationsUsed: number;
   /** Newest attempt, when the store has one for this issue at all. */
   latest?: RunRecord;
 }
@@ -72,6 +73,8 @@ export async function unblockIssue(
   return {
     cleared,
     attemptsUsed: store.attemptsFor(project.name, issue),
+    failuresUsed: store.failuresFor(project.name, issue),
+    continuationsUsed: store.continuationsFor(project.name, issue),
     ...(latest === undefined ? {} : { latest }),
   };
 }
@@ -82,17 +85,21 @@ export async function unblockIssue(
  * and a spent attempt budget makes the next tick escalate rather than dispatch.
  * Either promised blindly would send someone away believing work had resumed.
  */
-export function formatUnblock(issue: number, o: UnblockOutcome, project: ProjectConfig, caps: Caps): string {
+export function formatUnblock(
+  issue: number,
+  o: UnblockOutcome,
+  project: ProjectConfig,
+  caps: Caps,
+): string {
   const latest = o.latest;
   const lines = [`#${issue}: cleared ${o.cleared.join(", ")}`];
 
   if (latest === undefined) {
-    lines.push("  attempts   none recorded — the labels were cleared anyway; eligibility is read off the tracker");
+    lines.push("  runs       none recorded — the labels were cleared anyway; eligibility is read off the tracker");
   } else {
-    lines.push(
-      `  attempts   ${o.attemptsUsed} of ${caps.maxAttemptsPerIssue} used, newest ${latest.state} — ` +
-        "unchanged, an answered block still spent a worker",
-    );
+    lines.push(`  runs       ${o.attemptsUsed}, newest ${latest.state}`);
+    lines.push(`  failures   ${o.failuresUsed} of ${caps.maxAttemptsPerIssue}`);
+    lines.push(`  continuations ${o.continuationsUsed} of ${caps.maxContinuationsPerIssue}`);
   }
 
   if (latest !== undefined && LIVE_STATES.includes(latest.state)) {
@@ -100,10 +107,15 @@ export function formatUnblock(issue: number, o: UnblockOutcome, project: Project
       `  in flight  attempt ${latest.attempt} is ${latest.state}, so the issue keeps ` +
         `"${project.stateLabels.inProgress}" until it ends — nothing is re-claimed before then`,
     );
-  } else if (o.attemptsUsed >= caps.maxAttemptsPerIssue) {
+  } else if (o.failuresUsed >= caps.maxAttemptsPerIssue) {
     lines.push(
-      `  next tick  not eligible: all ${caps.maxAttemptsPerIssue} attempts are spent, so the next tick escalates ` +
-        "instead of re-claiming. Raise maxAttemptsPerIssue with /conductor setup, or rewrite the issue.",
+      `  next tick  not eligible: all ${caps.maxAttemptsPerIssue} failed attempts are spent. ` +
+        "Rewrite the issue or raise maxAttemptsPerIssue.",
+    );
+  } else if (o.continuationsUsed > caps.maxContinuationsPerIssue) {
+    lines.push(
+      `  next tick  not eligible: the ${caps.maxContinuationsPerIssue}-continuation budget was exceeded. ` +
+        "Inspect progress or raise maxContinuationsPerIssue.",
     );
   } else {
     lines.push(`  next tick  eligible again, as long as the issue still carries "${project.queueLabel}"`);

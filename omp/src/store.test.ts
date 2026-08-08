@@ -97,6 +97,18 @@ describe("openStore", () => {
     expect(store.attemptsFor("other", 7)).toBe(0);
   });
 
+  it("separates implementation failures from operational continuation stops", () => {
+    store.createRun(draft({ issue: 9, attempt: 1, state: "failed" }));
+    store.createRun(draft({ issue: 9, attempt: 2, state: "killed", startedAt: 2_000 }));
+    store.createRun(draft({ issue: 9, attempt: 3, state: "orphaned", startedAt: 3_000 }));
+    store.createRun(draft({ issue: 9, attempt: 4, state: "blocked", startedAt: 4_000 }));
+    store.createRun(draft({ issue: 9, attempt: 5, state: "merged", startedAt: 5_000 }));
+
+    expect(store.attemptsFor(PROJECT, 9)).toBe(5);
+    expect(store.failuresFor(PROJECT, 9)).toBe(1);
+    expect(store.continuationsFor(PROJECT, 9)).toBe(3);
+  });
+
   it("resolves an issue to its newest attempt, tie included", () => {
     store.createRun(draft({ issue: 7, attempt: 1, state: "failed", startedAt: 1_000 }));
     const newest = store.createRun(draft({ issue: 7, attempt: 2, state: "running", startedAt: 2_000 }));
