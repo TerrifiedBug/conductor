@@ -329,6 +329,39 @@ export interface RunRecord {
   lastError?: string;
 }
 
+export type AdmissionHoldReason =
+  | "capacity"
+  | "issue-active"
+  | "failed-attempts"
+  | "continuations"
+  | "parent-lookup-error"
+  | "sibling-active"
+  | "open-pr-lookup-error"
+  | "open-pr"
+  | "daily-spend-cap"
+  | "unroutable:no-repo-label"
+  | "unroutable:multiple-repo-labels"
+  | "unroutable:unknown-repo";
+
+/** One bounded reason group from the latest admission pass. */
+export interface AdmissionHoldSummary {
+  reason: AdmissionHoldReason;
+  count: number;
+  /** Queue-order sample, capped before persistence and rendering. */
+  issues: number[];
+}
+
+/** Persisted outcome of the latest completed dispatch tick. */
+export interface DispatchSummary {
+  completedAt: number;
+  ready: number;
+  routed: number;
+  admitted: number;
+  /** True only for system/API failures, never ordinary policy holds. */
+  degraded: boolean;
+  holds: AdmissionHoldSummary[];
+}
+
 /**
  * Bookkeeping only — GitHub labels remain the source of truth. The store
  * exists to answer cap questions cheaply and to survive a restart; if it is
@@ -357,6 +390,8 @@ export interface Store {
   /** Idempotence guard so a retry loop cannot page a human repeatedly for the
    *  same event. */
   wasNotified(key: string): boolean;
+  recordDispatch(project: string, summary: DispatchSummary): void;
+  latestDispatch(project: string): DispatchSummary | undefined;
   markNotified(key: string): void;
   close(): void;
 }

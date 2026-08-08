@@ -22,7 +22,9 @@ import type { Routed, UnroutableReason } from "./routing.ts";
 import { openStore } from "./store.ts";
 import { makeTracker } from "./tracker/github.ts";
 import type {
+  AdmissionHoldReason,
   Caps,
+  DispatchSummary,
   Escalation,
   PrState,
   ProjectConfig,
@@ -880,9 +882,52 @@ export interface Admission {
   attempt: number;
 }
 
+export interface AdmissionHold {
+  issue: number;
+  reason: AdmissionHoldReason;
+}
+
+export interface AdmissionPass {
+  admitted: Admission[];
+  holds: AdmissionHold[];
+}
+
+const HOLD_SAMPLE_SIZE = 5;
+const DEGRADED_HOLDS: ReadonlySet<AdmissionHoldReason> = new Set([
+  "parent-lookup-error",
+  "open-pr-lookup-error",
+]);
+
+/** Groups transient decisions into the bounded record exposed by status. */
+export function summarizeDispatch(
+  ready: number,
+  routed: number,
+  admitted: number,
+  holds: readonly AdmissionHold[],
+  completedAt = Date.now(),
+): DispatchSummary {
+  const groups = new Map<AdmissionHoldReason, { count: number; issues: number[] }>();
+  for (const hold of holds) {
+    const group = groups.get(hold.reason) ?? { count: 0, issues: [] };
+    group.count += 1;
+    if (group.issues.length < HOLD_SAMPLE_SIZE) group.issues.push(hold.issue);
+    groups.set(hold.reason, group);
+  }
+  return {
+    completedAt,
+    ready,
+    routed,
+    admitted,
+    degraded: holds.some((hold) => DEGRADED_HOLDS.has(hold.reason)),
+    holds: [...groups]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([reason, group]) => ({ reason, ...group })),
+  };
+}
+
 /**
  * Which routed candidates get a worker this tick — in queue order, never more
- * than `slots` of them.
+ * than `slots` of them. Every non-admission receives a stable reason code.
  *
  * Exported so the admission rules can be pinned without spawning a worker.
  * Every one of them exists because of a live incident, and each guards a
@@ -897,10 +942,14 @@ export async function admitCandidates(
   d: Pick<Deps, "project" | "caps" | "tracker" | "store" | "escalate">,
   routed: Routed[],
   slots: number,
-): Promise<Admission[]> {
+): Promise<AdmissionPass> {
   const { project, caps, tracker, store } = d;
   const busyIssues = store.activeRuns(project.name).map((r) => r.issue);
   const busy = new Set(busyIssues);
+  const holds: AdmissionHold[] = [];
+  const hold = (issue: number, reason: AdmissionHoldReason): void => {
+    holds.push({ issue, reason });
+  };
 
   // parent -> blocking issue. Seeded from active runs (including pushed-green),
   // then extended by candidates admitted earlier in this same pass so two
@@ -930,17 +979,25 @@ export async function admitCandidates(
 
   const admitted: Admission[] = [];
   for (const r of routed) {
-    if (admitted.length >= slots) break;
-    if (busy.has(r.issue.number)) continue;
+    const issue = r.issue.number;
+    if (admitted.length >= slots) {
+      hold(issue, "capacity");
+      continue;
+    }
+    if (busy.has(issue)) {
+      hold(issue, "issue-active");
+      continue;
+    }
 
-    const priorRuns = store.attemptsFor(project.name, r.issue.number);
-    const failures = store.failuresFor(project.name, r.issue.number);
+    const priorRuns = store.attemptsFor(project.name, issue);
+    const failures = store.failuresFor(project.name, issue);
     if (failures >= caps.maxAttemptsPerIssue) {
+      hold(issue, "failed-attempts");
       await safeEscalate(d, {
         tier: 1,
         project: project.name,
-        issue: r.issue.number,
-        summary: `#${r.issue.number} has used all ${caps.maxAttemptsPerIssue} failed attempts`,
+        issue,
+        summary: `#${issue} has used all ${caps.maxAttemptsPerIssue} failed attempts`,
         detail: [
           r.issue.title,
           r.issue.url,
@@ -951,13 +1008,14 @@ export async function admitCandidates(
       continue;
     }
 
-    const continuations = store.continuationsFor(project.name, r.issue.number);
+    const continuations = store.continuationsFor(project.name, issue);
     if (!hasContinuationBudget(continuations, caps.maxContinuationsPerIssue)) {
+      hold(issue, "continuations");
       await safeEscalate(d, {
         tier: 1,
         project: project.name,
-        issue: r.issue.number,
-        summary: `#${r.issue.number} exceeded its ${caps.maxContinuationsPerIssue}-continuation budget`,
+        issue,
+        summary: `#${issue} exceeded its ${caps.maxContinuationsPerIssue}-continuation budget`,
         detail: [
           r.issue.title,
           r.issue.url,
@@ -973,17 +1031,17 @@ export async function admitCandidates(
     // slot for unrelated work without spending a closers query.
     let parent: number | undefined;
     try {
-      parent = await resolveParent(r.issue.number);
+      parent = await resolveParent(issue);
     } catch (err) {
-      log(`#${r.issue.number} held: parent check failed (${errText(err)}) — retrying next tick`);
+      hold(issue, "parent-lookup-error");
+      log(`#${issue} held: parent check failed (${errText(err)}) — retrying next tick`);
       continue;
     }
     if (parent !== undefined) {
       const blocker = occupiedParents.get(parent);
       if (blocker !== undefined) {
-        log(
-          `#${r.issue.number} skipped: sibling #${blocker} in flight under epic #${parent}`,
-        );
+        hold(issue, "sibling-active");
+        log(`#${issue} skipped: sibling #${blocker} in flight under epic #${parent}`);
         continue;
       }
     }
@@ -994,31 +1052,33 @@ export async function admitCandidates(
     // like fresh work, and a worker sent at it re-implements a finished PR. The
     // tracker is the only party that remembers, so it is asked. The cost is
     // bounded by free slots, not by queue depth: the call sits behind the two
-    // cheap local filters and the loop stops once the slots are full.
+    // cheap local filters and candidates beyond capacity skip it.
     let closer: string | undefined;
     try {
-      closer = await tracker.openCloserFor(r.issue.number);
+      closer = await tracker.openCloserFor(issue);
     } catch (err) {
       // Fail closed, per candidate. An API error means "unknown whether
       // finished work exists", and admitting on unknown recreates precisely the
       // duplicate-work failure this guard exists to kill: the worst case of
       // holding is a five-minute delay, the worst case of admitting is a burned
       // attempt and a second PR on the same issue. Holding one candidate rather
-      // than aborting the loop is what keeps a transient GitHub failure from
-      // deadlocking the whole dispatcher; the next tick retries by itself.
-      log(`#${r.issue.number} held: open-PR check failed (${errText(err)}) — retrying next tick`);
+      // than aborting the loop keeps a transient GitHub failure from deadlocking
+      // the whole dispatcher; the next tick retries by itself.
+      hold(issue, "open-pr-lookup-error");
+      log(`#${issue} held: open-PR check failed (${errText(err)}) — retrying next tick`);
       continue;
     }
     if (closer !== undefined) {
-      log(`#${r.issue.number} skipped: open PR ${closer} already closes it`);
+      hold(issue, "open-pr");
+      log(`#${issue} skipped: open PR ${closer} already closes it`);
       continue;
     }
 
     admitted.push({ r, attempt: priorRuns + 1 });
-    if (parent !== undefined) occupiedParents.set(parent, r.issue.number);
+    if (parent !== undefined) occupiedParents.set(parent, issue);
   }
 
-  return admitted;
+  return { admitted, holds };
 }
 
 export interface WorkerPool {
@@ -1060,7 +1120,7 @@ export async function dispatchAdmissions(
 
 // ----------------------------------------------------------------------- a tick
 
-async function tick(d: Deps, workers?: WorkerPool): Promise<void> {
+export async function tick(d: Deps, workers?: WorkerPool): Promise<void> {
   // Before the pause check, deliberately. This one is not about dispatch: the
   // orchestrator is a different process, and it can be wedged while this fleet
   // is paused — which is exactly the state the reference fleet was in when the
@@ -1134,7 +1194,18 @@ async function tick(d: Deps, workers?: WorkerPool): Promise<void> {
 
   // route() filters the queue through isEligible() itself, so anything already
   // carrying a state label is gone before it gets here.
-  const { routed, unroutable } = route(await d.tracker.listReady(), project);
+  const ready = await d.tracker.listReady();
+  const { routed, unroutable } = route(ready, project);
+  const routingHolds: AdmissionHold[] = unroutable.map((u) => ({
+    issue: u.issue.number,
+    reason: `unroutable:${u.reason}`,
+  }));
+  const recordDispatch = (admitted: number, holds: readonly AdmissionHold[]): void => {
+    store.recordDispatch(
+      project.name,
+      summarizeDispatch(ready.length, routed.length, admitted, holds),
+    );
+  };
 
   // An issue nobody can route never reaches a worker: guessing the target repo
   // is exactly the kind of improvisation this system exists to prevent. The
@@ -1175,6 +1246,10 @@ async function tick(d: Deps, workers?: WorkerPool): Promise<void> {
         "No further work will be claimed until `omp-conductor resume` (or /conductor resume).",
       ].join("\n"),
     });
+    recordDispatch(0, [
+      ...routingHolds,
+      ...routed.map((r) => ({ issue: r.issue.number, reason: "daily-spend-cap" as const })),
+    ]);
     return;
   }
 
@@ -1186,22 +1261,54 @@ async function tick(d: Deps, workers?: WorkerPool): Promise<void> {
   const slots = caps.maxConcurrentWorkers - live.length;
   if (slots <= 0) {
     log(`at capacity: ${live.length}/${caps.maxConcurrentWorkers} workers`);
+    recordDispatch(0, [
+      ...routingHolds,
+      ...routed.map((r) => ({ issue: r.issue.number, reason: "capacity" as const })),
+    ]);
     return;
   }
 
-  const admitted = await admitCandidates(d, routed, slots);
+  const pass = await admitCandidates(d, routed, slots);
+  recordDispatch(pass.admitted.length, [...routingHolds, ...pass.holds]);
 
-  if (admitted.length === 0) return;
+  if (pass.admitted.length === 0) return;
 
-  log(`dispatching ${admitted.map((a) => `#${a.r.issue.number}`).join(" ")}`);
+  log(`dispatching ${pass.admitted.map((a) => `#${a.r.issue.number}`).join(" ")}`);
   await dispatchAdmissions(
-    admitted,
+    pass.admitted,
     (a) => handleIssue(d, a.r, a.attempt),
     workers,
   );
 }
 
 // --------------------------------------------------------------- read-only views
+
+export interface DaemonHealthSnapshot {
+  ok: true;
+  paused: boolean;
+  activeRuns: number;
+  project: string;
+  /** Resident set of this daemon; workers are in-process omp sessions. */
+  rssBytes: number;
+  dispatch?: DispatchSummary;
+}
+
+export function daemonHealthSnapshot(
+  store: Store,
+  project: string,
+  paused = isPaused(),
+  rssBytes = process.memoryUsage().rss,
+): DaemonHealthSnapshot {
+  const dispatch = store.latestDispatch(project);
+  return {
+    ok: true,
+    paused,
+    activeRuns: store.activeRuns(project).length,
+    project,
+    rssBytes,
+    ...(dispatch === undefined ? {} : { dispatch }),
+  };
+}
 
 export interface StatusSnapshot {
   project: string;
@@ -1215,6 +1322,7 @@ export interface StatusSnapshot {
   liveWorkers: number;
   runsToday: number;
   spendTodayUsd: number;
+  dispatch?: DispatchSummary;
 }
 
 /** Opens and closes its own store handle so the CLI and the plugin can read
@@ -1226,6 +1334,7 @@ export function statusSnapshot(project?: string): StatusSnapshot {
   const store = openStore(dbPath());
   try {
     const since = startOfToday();
+    const dispatch = store.latestDispatch(p.name);
     return {
       project: p.name,
       configPath: configPath(),
@@ -1236,10 +1345,33 @@ export function statusSnapshot(project?: string): StatusSnapshot {
       liveWorkers: store.liveRuns(p.name).length,
       runsToday: store.runsStartedSince(p.name, since),
       spendTodayUsd: store.spendSince(p.name, since),
+      ...(dispatch === undefined ? {} : { dispatch }),
     };
   } finally {
     store.close();
   }
+}
+
+export function formatDispatchSummary(summary?: DispatchSummary): string {
+  if (summary === undefined) return "last dispatch  (none recorded)";
+  const lines = [
+    `last dispatch  ${new Date(summary.completedAt).toISOString()}${summary.degraded ? "  DEGRADED" : ""}`,
+    `  candidates    ${summary.ready} ready / ${summary.routed} routed`,
+    `  admitted      ${summary.admitted}`,
+  ];
+  if (summary.holds.length === 0) {
+    lines.push("  held          0");
+  } else {
+    lines.push("  held");
+    for (const hold of summary.holds) {
+      const sample =
+        hold.issues.length === 0
+          ? ""
+          : ` (#${hold.issues.join(", #")}${hold.count > hold.issues.length ? ", …" : ""})`;
+      lines.push(`    ${hold.reason}  ${hold.count}${sample}`);
+    }
+  }
+  return lines.join("\n");
 }
 
 export function formatStatus(s: StatusSnapshot): string {
@@ -1258,6 +1390,8 @@ export function formatStatus(s: StatusSnapshot): string {
     `  worker wall clock  ${Math.round(s.caps.workerWallClockMs / 60_000)}m`,
     `  failed attempts    ${s.caps.maxAttemptsPerIssue}`,
     `  continuations      ${s.caps.maxContinuationsPerIssue}`,
+    "",
+    formatDispatchSummary(s.dispatch),
     "",
   ];
   if (s.activeRuns.length === 0) {
@@ -1505,15 +1639,7 @@ export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
     fetch(req) {
       const url = new URL(req.url);
       if (req.method === "GET" && url.pathname === "/healthz") {
-        return Response.json({
-          ok: true,
-          paused: isPaused(),
-          activeRuns: store.activeRuns(project.name).length,
-          project: project.name,
-          // Resident set of *this* process: workers are in-process omp sessions,
-          // so the unit's Memory peak is this number, not a separate worker pid.
-          rssBytes: process.memoryUsage().rss,
-        });
+        return Response.json(daemonHealthSnapshot(store, project.name));
       }
       return new Response("not found\n", { status: 404 });
     },

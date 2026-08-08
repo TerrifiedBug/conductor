@@ -779,6 +779,30 @@ test("formatFleetStatus stacks dispatch/ticks/pane/recovery/herdr/daemon", () =>
   expect(text).toContain("project   demo  (PAUSED)");
 });
 
+test("status distinguishes degraded admission from idle capacity", () => {
+  writeMinimalConfig();
+  writeTick();
+  const text = formatFleetStatus(
+    {
+      ...statusSnapshot(),
+      dispatch: {
+        completedAt: Date.parse("2026-08-08T08:41:18Z"),
+        ready: 8,
+        routed: 8,
+        admitted: 0,
+        degraded: true,
+        holds: [{ reason: "parent-lookup-error", count: 8, issues: [321, 320, 318] }],
+      },
+    },
+    fleetLayers(),
+  );
+
+  expect(text).toContain("last dispatch  2026-08-08T08:41:18.000Z  DEGRADED");
+  expect(text).toContain("candidates    8 ready / 8 routed");
+  expect(text).toContain("parent-lookup-error  8 (#321, #320, #318, …)");
+  expect(text).toContain("active runs  (none)");
+});
+
 test("status prints the next scheduled tick and Telegram health", () => {
   writeMinimalConfig();
   const cwd = writeTick();

@@ -41,12 +41,16 @@ import {
   checkStall,
   createWorkerPool,
   dispatchAdmissions,
+  daemonHealthSnapshot,
+  formatDispatchSummary,
   hasContinuationBudget,
   manifestDiff,
   markPaged,
   packageManifest,
   reconcileOrphanedRuns,
   salvageLines,
+  summarizeDispatch,
+  tick,
   settlePushedGreen,
   verifyPushedGreenClaim,
 } from "./daemon.ts";
@@ -467,6 +471,158 @@ describe("dispatchAdmissions", () => {
   });
 });
 
+describe("summarizeDispatch", () => {
+  it("records an empty queue as healthy completed work", () => {
+    expect(summarizeDispatch(0, 0, 0, [], 1_000)).toEqual({
+      completedAt: 1_000,
+      ready: 0,
+      routed: 0,
+      admitted: 0,
+      degraded: false,
+      holds: [],
+    });
+  });
+
+  it("keeps capacity and ordinary policy holds non-degraded", () => {
+    const summary = summarizeDispatch(
+      4,
+      4,
+      0,
+      [
+        { issue: 1, reason: "capacity" },
+        { issue: 2, reason: "capacity" },
+        { issue: 3, reason: "sibling-active" },
+        { issue: 4, reason: "open-pr" },
+      ],
+      2_000,
+    );
+
+    expect(summary.degraded).toBe(false);
+    expect(summary.holds).toEqual([
+      { reason: "capacity", count: 2, issues: [1, 2] },
+      { reason: "open-pr", count: 1, issues: [4] },
+      { reason: "sibling-active", count: 1, issues: [3] },
+    ]);
+  });
+
+  it("keeps healthz ok while exposing structured dispatch degradation", () => {
+    const store = openStore(":memory:");
+    const dispatch = summarizeDispatch(
+      1,
+      1,
+      0,
+      [{ issue: 42, reason: "open-pr-lookup-error" }],
+      3_000,
+    );
+    store.recordDispatch(PROJECT, dispatch);
+
+    expect(daemonHealthSnapshot(store, PROJECT, false, 123)).toEqual({
+      ok: true,
+      paused: false,
+      activeRuns: 0,
+      project: PROJECT,
+      rssBytes: 123,
+      dispatch,
+    });
+    store.close();
+  });
+});
+
+describe("tick dispatch summary", () => {
+  const run = async (
+    store: Store,
+    ready: Routed["issue"][],
+    trackerOverride: Partial<Tracker> = {},
+  ): Promise<void> => {
+    const home = mkdtempSync(join(tmpdir(), "conductor-dispatch-summary-"));
+    const previous = process.env["OMP_CONDUCTOR_HOME"];
+    process.env["OMP_CONDUCTOR_HOME"] = home;
+    try {
+      const tracker = admissionTracker({ ...trackerOverride, listReady: async () => ready });
+      await captureLog(() =>
+        tick(
+          {
+            project: project(),
+            caps: DEFAULT_CAPS,
+            tracker,
+            store,
+            escalate: async () => {},
+            integrity: { baseline: packageManifest(), paged: false },
+            stall: { paged: false },
+          },
+          { launch: () => {}, activeCount: () => 0, drain: async () => {} },
+        ),
+      );
+    } finally {
+      if (previous === undefined) delete process.env["OMP_CONDUCTOR_HOME"];
+      else process.env["OMP_CONDUCTOR_HOME"] = previous;
+      rmSync(home, { recursive: true, force: true });
+    }
+  };
+
+  it("persists a completed empty-queue pass", async () => {
+    const store = openStore(":memory:");
+    await run(store, []);
+
+    expect(store.latestDispatch(PROJECT)).toMatchObject({
+      ready: 0,
+      routed: 0,
+      admitted: 0,
+      degraded: false,
+      holds: [],
+    });
+    store.close();
+  });
+
+  it("persists a normal admission before launching its worker", async () => {
+    const store = openStore(":memory:");
+    await run(store, [candidate(10).issue]);
+
+    expect(store.latestDispatch(PROJECT)).toMatchObject({
+      ready: 1,
+      routed: 1,
+      admitted: 1,
+      degraded: false,
+      holds: [],
+    });
+    store.close();
+  });
+
+  it("persists one candidate API failure as degraded", async () => {
+    const store = openStore(":memory:");
+    await run(store, [candidate(10).issue], {
+      parentOf: async () => {
+        throw new Error("tracker unavailable");
+      },
+    });
+
+    expect(store.latestDispatch(PROJECT)).toMatchObject({
+      ready: 1,
+      routed: 1,
+      admitted: 0,
+      degraded: true,
+      holds: [{ reason: "parent-lookup-error", count: 1, issues: [10] }],
+    });
+    store.close();
+  });
+
+  it("records all-slots-busy as normal policy holds", async () => {
+    const store = openStore(":memory:");
+    store.createRun(draft({ issue: 1, state: "running" }));
+    store.createRun(draft({ issue: 2, state: "running", startedAt: 2_000 }));
+    await run(store, [candidate(10).issue, candidate(11).issue]);
+
+    expect(store.latestDispatch(PROJECT)).toMatchObject({
+      ready: 2,
+      routed: 2,
+      admitted: 0,
+      degraded: false,
+      holds: [{ reason: "capacity", count: 2, issues: [10, 11] }],
+    });
+    store.close();
+  });
+});
+
 describe("admitCandidates", () => {
   let store!: Store;
 
@@ -490,7 +646,8 @@ describe("admitCandidates", () => {
     // was pushed — so the busy set cannot possibly object. Only the tracker
     // knows, and a worker sent here re-implements a finished PR, burns an
     // attempt, and opens a second PR on the same issue.
-    expect(value).toEqual([]);
+    expect(value.admitted).toEqual([]);
+    expect(value.holds).toEqual([{ issue: 288, reason: "open-pr" }]);
     expect(log).toContain(
       "#288 skipped: open PR https://github.com/acme/api/pull/419 already closes it",
     );
@@ -503,10 +660,10 @@ describe("admitCandidates", () => {
     // more; a closed-unmerged one means it was abandoned. Either way there is no
     // live PR to collide with. (That MERGED and CLOSED read as "no closer" is
     // the adapter's contract, pinned in tracker/github.test.ts.)
-    const admitted = await admitCandidates(d, [candidate(260)], 2);
+    const pass = await admitCandidates(d, [candidate(260)], 2);
 
-    expect(admitted.map((a) => a.r.issue.number)).toEqual([260]);
-    expect(admitted[0]?.attempt).toBe(1);
+    expect(pass.admitted.map((a) => a.r.issue.number)).toEqual([260]);
+    expect(pass.admitted[0]?.attempt).toBe(1);
   });
 
   it("holds only the candidate whose check failed, and keeps evaluating the rest", async () => {
@@ -529,7 +686,8 @@ describe("admitCandidates", () => {
     // worst case of holding is a five-minute delay, the worst case of admitting
     // is a burned attempt and a second PR. Holding one candidate rather than
     // aborting is what stops a flaky API from deadlocking the whole dispatcher.
-    expect(value.map((a) => a.r.issue.number)).toEqual([289]);
+    expect(value.admitted.map((a) => a.r.issue.number)).toEqual([289]);
+    expect(value.holds).toEqual([{ issue: 288, reason: "open-pr-lookup-error" }]);
     expect(log).toContain("#288 held: open-PR check failed");
     expect(log).toContain("retrying next tick");
   });
@@ -546,12 +704,16 @@ describe("admitCandidates", () => {
       }),
     );
 
-    const admitted = await admitCandidates(d, [candidate(1), candidate(2), candidate(3)], 1);
+    const pass = await admitCandidates(d, [candidate(1), candidate(2), candidate(3)], 1);
 
     // One call per admitted candidate is the entire cost of the guard. Per
     // queued issue it would scale with the backlog instead: two dozen API calls
     // every five minutes, to admit two.
-    expect(admitted.map((a) => a.r.issue.number)).toEqual([1]);
+    expect(pass.admitted.map((a) => a.r.issue.number)).toEqual([1]);
+    expect(pass.holds).toEqual([
+      { issue: 2, reason: "capacity" },
+      { issue: 3, reason: "capacity" },
+    ]);
     expect(asked).toEqual([1]);
   });
 
@@ -571,13 +733,16 @@ describe("admitCandidates", () => {
       }),
     );
 
-    const admitted = await admitCandidates(d, [candidate(500), candidate(600)], 2);
+    const pass = await admitCandidates(d, [candidate(500), candidate(600)], 2);
 
     // #500 has a live run and #600 has spent both attempts: the store settles
     // both without leaving the process. Order matters for more than cost — an
     // exhausted issue has to escalate to a human, not be silently held.
-    expect(admitted).toEqual([]);
-    expect(asked).toEqual([]);
+    expect(pass.admitted).toEqual([]);
+    expect(pass.holds).toEqual([
+      { issue: 500, reason: "issue-active" },
+      { issue: 600, reason: "failed-attempts" },
+    ]);
     expect(escalated.map((e) => e.issue)).toEqual([600]);
   });
 
@@ -587,9 +752,9 @@ describe("admitCandidates", () => {
     store.createRun(draft({ issue: 700, attempt: 3, state: "failed", startedAt: 3_000 }));
     const { d } = deps(store, admissionTracker());
 
-    const admitted = await admitCandidates(d, [candidate(700)], 1);
+    const pass = await admitCandidates(d, [candidate(700)], 1);
 
-    expect(admitted).toEqual([{ r: candidate(700), attempt: 4 }]);
+    expect(pass.admitted).toEqual([{ r: candidate(700), attempt: 4 }]);
     expect(store.failuresFor(PROJECT, 700)).toBe(1);
     expect(store.continuationsFor(PROJECT, 700)).toBe(2);
   });
@@ -600,9 +765,10 @@ describe("admitCandidates", () => {
     store.createRun(draft({ issue: 701, attempt: 3, state: "blocked", startedAt: 3_000 }));
     const { d, escalated } = deps(store, admissionTracker());
 
-    const admitted = await admitCandidates(d, [candidate(701)], 1);
+    const pass = await admitCandidates(d, [candidate(701)], 1);
 
-    expect(admitted).toEqual([]);
+    expect(pass.admitted).toEqual([]);
+    expect(pass.holds).toEqual([{ issue: 701, reason: "continuations" }]);
     expect(escalated[0]?.summary).toBe("#701 exceeded its 2-continuation budget");
     expect(store.failuresFor(PROJECT, 701)).toBe(0);
   });
@@ -619,7 +785,8 @@ describe("admitCandidates", () => {
       admitCandidates(d, [candidate(305), candidate(306)], 2),
     );
 
-    expect(value.map((a) => a.r.issue.number)).toEqual([305]);
+    expect(value.admitted.map((a) => a.r.issue.number)).toEqual([305]);
+    expect(value.holds).toEqual([{ issue: 306, reason: "sibling-active" }]);
     expect(log).toContain("#306 skipped: sibling #305 in flight under epic #300");
   });
 
@@ -639,7 +806,8 @@ describe("admitCandidates", () => {
       admitCandidates(d, [candidate(306), candidate(400)], 2),
     );
 
-    expect(value.map((a) => a.r.issue.number)).toEqual([400]);
+    expect(value.admitted.map((a) => a.r.issue.number)).toEqual([400]);
+    expect(value.holds).toEqual([{ issue: 306, reason: "sibling-active" }]);
     expect(log).toContain("#306 skipped: sibling #305 in flight under epic #300");
   });
 
@@ -653,7 +821,7 @@ describe("admitCandidates", () => {
       [candidate(306)],
       1,
     );
-    expect(first).toEqual([]);
+    expect(first.admitted).toEqual([]);
 
     // Tick 2: #305 settled out of the active set — #306 is free to go.
     for (const run of store.activeRuns(PROJECT)) {
@@ -664,15 +832,15 @@ describe("admitCandidates", () => {
       [candidate(306)],
       1,
     );
-    expect(second.map((a) => a.r.issue.number)).toEqual([306]);
+    expect(second.admitted.map((a) => a.r.issue.number)).toEqual([306]);
   });
 
   it("lets issues with no parent admit concurrently up to the slot count", async () => {
     const { d } = deps(store, admissionTracker());
 
-    const admitted = await admitCandidates(d, [candidate(10), candidate(11)], 2);
+    const pass = await admitCandidates(d, [candidate(10), candidate(11)], 2);
 
-    expect(admitted.map((a) => a.r.issue.number)).toEqual([10, 11]);
+    expect(pass.admitted.map((a) => a.r.issue.number)).toEqual([10, 11]);
   });
 
   it("holds only the candidate whose parent lookup failed, and keeps evaluating the rest", async () => {
@@ -690,9 +858,46 @@ describe("admitCandidates", () => {
       admitCandidates(d, [candidate(305), candidate(400)], 2),
     );
 
-    expect(value.map((a) => a.r.issue.number)).toEqual([400]);
+    expect(value.admitted.map((a) => a.r.issue.number)).toEqual([400]);
+    expect(value.holds).toEqual([{ issue: 305, reason: "parent-lookup-error" }]);
+    expect(summarizeDispatch(2, 2, 1, value.holds, 3_000).degraded).toBe(true);
     expect(log).toContain("#305 held: parent check failed");
     expect(log).toContain("retrying next tick");
+  });
+
+  it("renders a fleet-wide admission failure as bounded degraded state", async () => {
+    const secret = "token=must-not-reach-status";
+    const { d } = deps(
+      store,
+      admissionTracker({
+        parentOf: async () => {
+          throw new Error(secret);
+        },
+      }),
+    );
+    const routed = Array.from({ length: 8 }, (_, index) => candidate(index + 1));
+
+    const { value: pass } = await captureLog(() => admitCandidates(d, routed, 8));
+    const summary = summarizeDispatch(8, 8, pass.admitted.length, pass.holds, 4_000);
+    const text = formatDispatchSummary(summary);
+
+    expect(summary).toEqual({
+      completedAt: 4_000,
+      ready: 8,
+      routed: 8,
+      admitted: 0,
+      degraded: true,
+      holds: [
+        {
+          reason: "parent-lookup-error",
+          count: 8,
+          issues: [1, 2, 3, 4, 5],
+        },
+      ],
+    });
+    expect(text).toContain("DEGRADED");
+    expect(text).toContain("parent-lookup-error  8 (#1, #2, #3, #4, #5, …)");
+    expect(text).not.toContain(secret);
   });
 
   it("still refuses a sibling that already has an open closer", async () => {
@@ -709,7 +914,8 @@ describe("admitCandidates", () => {
     // give it an open closer and confirm that guard's skip line still fires when
     // the epic is free — here by considering #306 alone.
     const alone = await captureLog(() => admitCandidates(d, [candidate(306)], 1));
-    expect(alone.value).toEqual([]);
+    expect(alone.value.admitted).toEqual([]);
+    expect(alone.value.holds).toEqual([{ issue: 306, reason: "open-pr" }]);
     expect(alone.log).toContain(
       "#306 skipped: open PR https://github.com/acme/api/pull/420 already closes it",
     );
@@ -723,9 +929,10 @@ describe("admitCandidates", () => {
       }),
     );
 
-    const admitted = await admitCandidates(d, [candidate(305), candidate(306)], 2);
+    const pass = await admitCandidates(d, [candidate(305), candidate(306)], 2);
 
-    expect(admitted.map((a) => a.r.issue.number)).toEqual([305]);
+    expect(pass.admitted.map((a) => a.r.issue.number)).toEqual([305]);
+    expect(pass.holds).toEqual([{ issue: 306, reason: "sibling-active" }]);
   });
 });
 

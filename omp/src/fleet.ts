@@ -28,7 +28,7 @@ import { createInterface } from "node:readline";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { findProject, loadConfig, stateDir } from "./config.ts";
-import { isPaused, setPaused, statusSnapshot, type StatusSnapshot } from "./daemon.ts";
+import { formatDispatchSummary, isPaused, setPaused, statusSnapshot, type StatusSnapshot } from "./daemon.ts";
 import {
   healthCheck,
   isAlive,
@@ -960,6 +960,8 @@ function formatProjectBody(s: StatusSnapshot): string {
     `  worker wall clock  ${Math.round(s.caps.workerWallClockMs / 60_000)}m`,
     `  failed attempts    ${s.caps.maxAttemptsPerIssue}`,
     `  continuations      ${s.caps.maxContinuationsPerIssue}`,
+    "",
+    formatDispatchSummary(s.dispatch),
     "",
   ];
   if (s.activeRuns.length === 0) {

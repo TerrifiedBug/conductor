@@ -13,7 +13,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
-import type { RunRecord, RunState, Store } from "./types.ts";
+import type { DispatchSummary, RunRecord, RunState, Store } from "./types.ts";
 
 /**
  * States backed by a worker process. These are what worker capacity counts:
@@ -109,6 +109,11 @@ CREATE TABLE IF NOT EXISTS notifications (
   "key" TEXT    PRIMARY KEY,
   at    INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS dispatch_summaries (
+  project   TEXT PRIMARY KEY,
+  summary   TEXT NOT NULL
+);
 `;
 
 /**
@@ -145,6 +150,35 @@ function toRecord(row: RunRow): RunRecord {
   if (row.endedAt !== null) record.endedAt = row.endedAt;
   if (row.lastError !== null) record.lastError = row.lastError;
   return record;
+}
+
+function toDispatchSummary(text: string): DispatchSummary | undefined {
+  try {
+    const value = JSON.parse(text) as DispatchSummary;
+    const counts = [value.completedAt, value.ready, value.routed, value.admitted];
+    if (
+      !counts.every((count) => Number.isSafeInteger(count) && count >= 0) ||
+      typeof value.degraded !== "boolean" ||
+      !Array.isArray(value.holds) ||
+      value.holds.some(
+        (hold) =>
+          typeof hold !== "object" ||
+          hold === null ||
+          typeof hold.reason !== "string" ||
+          !Number.isSafeInteger(hold.count) ||
+          hold.count < 0 ||
+          !Array.isArray(hold.issues) ||
+          hold.issues.length > 5 ||
+          hold.count < hold.issues.length ||
+          !hold.issues.every((issue) => Number.isSafeInteger(issue) && issue > 0),
+      )
+    ) {
+      return undefined;
+    }
+    return value;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -224,6 +258,13 @@ export function openStore(dbPath: string): Store {
   // paged rather than when the newest retry re-reported the same event.
   const insertNotified = db.query<unknown, [string, number]>(
     `INSERT OR IGNORE INTO notifications ("key", at) VALUES (?, ?)`,
+  );
+  const upsertDispatch = db.query<unknown, [string, string]>(
+    `INSERT INTO dispatch_summaries (project, summary) VALUES (?, ?)
+     ON CONFLICT(project) DO UPDATE SET summary = excluded.summary`,
+  );
+  const selectDispatch = db.query<{ summary: string }, [string]>(
+    `SELECT summary FROM dispatch_summaries WHERE project = ?`,
   );
 
   return {
@@ -314,6 +355,15 @@ export function openStore(dbPath: string): Store {
       // short row per escalation, so it is decades from mattering; prune by
       // `at` if it ever does.
       insertNotified.run(key, Date.now());
+    },
+
+    recordDispatch(project: string, summary: DispatchSummary): void {
+      upsertDispatch.run(project, JSON.stringify(summary));
+    },
+
+    latestDispatch(project: string): DispatchSummary | undefined {
+      const row = selectDispatch.get(project);
+      return row === null ? undefined : toDispatchSummary(row.summary);
     },
 
     close(): void {

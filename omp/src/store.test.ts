@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { openStore } from "./store.ts";
-import type { RunRecord, Store } from "./types.ts";
+import type { DispatchSummary, RunRecord, Store } from "./types.ts";
 
 const PROJECT = "demo";
 
@@ -165,6 +165,26 @@ describe("openStore", () => {
     // Re-marking is the whole point of the guard: it must stay idempotent.
     expect(() => store.markNotified("demo/42/tier2")).not.toThrow();
     expect(store.wasNotified("demo/42/tier2")).toBe(true);
+  });
+
+  it("persists only the latest dispatch summary per project", () => {
+    const summary: DispatchSummary = {
+      completedAt: 4_000,
+      ready: 8,
+      routed: 8,
+      admitted: 0,
+      degraded: true,
+      holds: [{ reason: "parent-lookup-error", count: 8, issues: [1, 2, 3, 4, 5] }],
+    };
+
+    expect(store.latestDispatch(PROJECT)).toBeUndefined();
+    store.recordDispatch(PROJECT, summary);
+
+    expect(store.latestDispatch(PROJECT)).toEqual(summary);
+    expect(store.latestDispatch("other")).toBeUndefined();
+    store.recordDispatch(PROJECT, { ...summary, completedAt: 5_000, admitted: 1 });
+    expect(store.latestDispatch(PROJECT)?.completedAt).toBe(5_000);
+    expect(store.latestDispatch(PROJECT)?.admitted).toBe(1);
   });
 
   it("adds headSha to a pre-0.3.19 run database without losing rows", () => {

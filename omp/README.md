@@ -475,7 +475,11 @@ Per tick, for the daemon's project:
    retried next tick: the cost of holding is five minutes, the cost of admitting
    on an unknown is a burned attempt and a duplicate PR. Only that candidate is
    held, so a flaky API cannot stall the rest of the queue.
-10. **Dispatch** the admitted issues concurrently.
+10. **Record the pass.** Persist ready/routed/admitted counts and group every hold
+    under a stable reason code with at most five sample issue numbers. Tracker
+    failures mark the summary `DEGRADED`; capacity, sibling, open-PR and budget
+    holds remain normal policy state.
+11. **Dispatch** the admitted issues concurrently.
 
 Then, per admitted issue:
 
@@ -1234,7 +1238,7 @@ omp-conductor help
 | `start` | Start `herdr-fleet.service` when that optional unit is installed, clearing a previous pane-recovery pin, then spawn the dispatch loop in the background and wait until it answers `GET /healthz` on `:8787`. Without systemd or that unit it keeps the standalone daemon behaviour. It never clears pause or arms ticks. Refuses if a daemon is already live, naming its pid; if the process dies or never serves, it cleans up and quotes the tail of `daemon.log`. |
 | `stop` | Prefer `systemctl stop omp-conductor.service` when that unit's MainPID is the live daemon — systemd then owns the stop and will not schedule a restart for the exit it just requested. Otherwise `SIGTERM`, then `SIGKILL` after a 10-second grace period. Prints `not running` when there is nothing to stop, and tags the confirmation with `(via systemctl)` when the unit path was used. |
 | `restart` | Prefer `systemctl restart` when the unit owns the live pid so the replacement stays supervised; otherwise `stop` then `start`, inheriting the running daemon's port and project unless a flag overrides them. The new process **salvages dirty live worktrees before orphaning** those rows — see [Deploying a new package onto a busy fleet](#deploying-a-new-package-onto-a-busy-fleet). |
-| `status [--project NAME]` | Layered fleet report first: `dispatch` / `ticks` / next scheduled tick / `pane` / `recovery` / `herdr` / `telegram` / `daemon`, then the project body. The next time comes from the live heartbeat process, not a guess from log timestamps. Telegram health uses `getMe` to prove API authentication without sending a message and reports inbound bridge configuration separately. The daemon block includes `rss` from `/healthz`; live workers add a busy-deploy warning. A `.conductor-stalled` marker adds an `orchestrator STALLED since …` line. |
+| `status [--project NAME]` | Layered fleet report first: `dispatch` / `ticks` / next scheduled tick / `pane` / `recovery` / `herdr` / `telegram` / `daemon`, then the project body. The project body includes the latest completed dispatch timestamp, ready/routed/admitted counts, and bounded hold groups; API failures are marked `DEGRADED` so queue starvation cannot look idle. The next tick comes from the live heartbeat process, not a guess from log timestamps. Telegram health uses `getMe` to prove API authentication without sending a message and reports inbound bridge configuration separately. The daemon block includes `rss` from `/healthz`; live workers add a busy-deploy warning. A `.conductor-stalled` marker adds an `orchestrator STALLED since …` line. |
 | `hold [--project NAME]` | Soft stop: pause claiming **and** disarm ticks. Daemon and pane stay up. Prefer this over `pause` when the intent is "stop the conductor" without killing processes. See [Stop the conductor](#stop-the-conductor-hold--halt). |
 | `halt [--pane] [--project NAME]` | `hold`, then stop the dispatch daemon (systemctl-aware). Pane stays up unless `--pane` is passed. `halt --pane` also pins herdr-conductor recovery off for the conductor agent only — it does **not** stop `herdr-fleet.service` or any other herdr session. Fail-closed: exits nonzero unless the agent is proven gone. |
 | `arm [--project NAME]` | Proof-gated: send a Telegram challenge and write the arm marker only after your reply appears as a user turn in the orchestrator transcript. Never auto-armed by `resume` / `hold`. |
@@ -1275,17 +1279,29 @@ curl -s localhost:8787/healthz
 ```
 
 ```json
-{ "ok": true, "paused": false, "activeRuns": 1, "project": "demo" }
+{
+  "ok": true,
+  "paused": false,
+  "activeRuns": 1,
+  "project": "demo",
+  "rssBytes": 123456789,
+  "dispatch": {
+    "completedAt": 1786185678000,
+    "ready": 8,
+    "routed": 8,
+    "admitted": 0,
+    "degraded": true,
+    "holds": [
+      { "reason": "parent-lookup-error", "count": 8, "issues": [321, 320, 318] }
+    ]
+  }
+}
 ```
 
-Any other path or method returns `404`. Note that `ok` reports only that the
-process is serving. It does not report that the fleet is doing work: read
-`paused` to tell those apart.
-
-`activeRuns` counts occupied issues — live workers plus green PRs still awaiting a
-merge — and each of those is settled by the tick once its PR resolves, so the
-number goes back down on its own. A count that only ever grows is the bug this
-used to have: read [what settles a green PR](#what-settles-a-green-pr).
+Any other path or method returns `404`. `ok` reports process liveness only.
+Nonfatal admission errors keep it `true` so a supervisor does not restart-loop;
+inspect `dispatch.degraded` and its bounded reason groups for queue starvation.
+`activeRuns` counts occupied issues — live workers plus green PRs awaiting merge.
 
 ## What a worker may and may not do
 
