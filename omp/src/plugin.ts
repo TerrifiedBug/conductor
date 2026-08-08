@@ -74,6 +74,7 @@ import {
   type ConductorConfig,
   type OrchestratorMode,
   type ProjectConfig,
+  type ReleasePolicy,
   type ReportScope,
 } from "./types.ts";
 
@@ -339,6 +340,20 @@ async function askAuthority(
       `${prior.release === "orchestrator" ? " — currently delegated, answer no to take it back" : ""}.`,
   );
   return { merge: merge ? "orchestrator" : "human", release: release ? "orchestrator" : "human" };
+}
+
+async function askReleasePolicy(
+  ctx: CommandContext,
+  prior: ReleasePolicy,
+): Promise<ReleasePolicy> {
+  const open = await ctx.ui.confirm(
+    "Release tool gate",
+    "Allow worker and orchestrator sessions to invoke release/deploy-shaped tools? Only enable this " +
+      "when the operator brief contains the release procedure they must follow. Default: no, block " +
+      "git tags, tag pushes, package publishing, GitHub release creation and deploy commands" +
+      `${prior === "operator-brief" ? " — currently enabled, answer no to close it" : ""}.`,
+  );
+  return open ? "operator-brief" : "none";
 }
 
 /**
@@ -627,7 +642,11 @@ const askWorkerModel: AreaAsker = async (ctx, a) => {
 
 /** Both grants, asked together because they are the two questions that decide
  *  what an unattended fleet may do without asking anybody. */
-const askAuthorityArea: AreaAsker = async (ctx, a) => ({ ...a, authority: await askAuthority(ctx, a.authority) });
+const askAuthorityArea: AreaAsker = async (ctx, a) => ({
+  ...a,
+  authority: await askAuthority(ctx, a.authority),
+  releasePolicy: await askReleasePolicy(ctx, a.releasePolicy),
+});
 
 /** How a stuck run reaches a human, and who triages it when it does. */
 const askEscalation: AreaAsker = async (ctx, a) => {

@@ -8,7 +8,15 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { configPath, findProject, loadConfig, resolveCaps, saveConfig, stateDir } from "./config.ts";
+import {
+  configPath,
+  findProject,
+  loadConfig,
+  resolveCaps,
+  resolveReleasePolicy,
+  saveConfig,
+  stateDir,
+} from "./config.ts";
 import {
   CONFIG_VERSION,
   DEFAULT_CAPS,
@@ -56,6 +64,7 @@ function project(name: string): ProjectConfig {
     caps: { workerMaxTurns: 7 },
     escalation: { telegramChatId: "123456", fallbackToIssueComment: true, orchestrator: "embedded" },
     authority: { merge: "human", release: "human" },
+    releasePolicy: "none",
     reporting: { scope: "escalations" },
     workspaceRoot: join(home, "worktrees"),
     mirrorRoot: join(home, "mirrors"),
@@ -151,6 +160,25 @@ test("loadConfig rejects an unknown reporting scope by name instead of defaultin
   // Silently folding a typo to "material" would read as configured on the day
   // the operator meant to turn the volume down.
   expect(() => loadConfig()).toThrow(/reporting\.scope must be "escalations" or "material", found "materal"/);
+});
+
+test("an omitted release policy loads fail-closed", () => {
+  const { releasePolicy, ...withoutPolicy } = project("demo");
+  writeRawConfig({ version: CONFIG_VERSION, defaults: { ...DEFAULT_CAPS }, projects: [withoutPolicy] });
+
+  const loaded = loadConfig().projects[0]!;
+  expect(resolveReleasePolicy(loaded)).toBe("none");
+  expect(releasePolicy).toBe("none");
+});
+
+test("loadConfig rejects an unknown release policy instead of opening the gate", () => {
+  writeRawConfig({
+    version: CONFIG_VERSION,
+    defaults: { ...DEFAULT_CAPS },
+    projects: [{ ...project("demo"), releasePolicy: "operator" }],
+  });
+
+  expect(() => loadConfig()).toThrow(/releasePolicy must be \"none\" or \"operator-brief\", found \"operator\"/);
 });
 
 test("a project that never answered the authority question keeps both with the human", () => {

@@ -20,14 +20,17 @@ import {
   CONFIG_VERSION,
   DEFAULT_AUTHORITY,
   DEFAULT_CAPS,
+  DEFAULT_RELEASE_POLICY,
   DEFAULT_REPORT_SCOPE,
   ORCHESTRATOR_MODES,
   READABLE_CONFIG_VERSIONS,
+  RELEASE_POLICIES,
   REPORT_SCOPES,
   type Caps,
   type ConductorConfig,
   type ProjectConfig,
   type ReportScope,
+  type ReleasePolicy,
   type RepoTarget,
 } from "./types.ts";
 
@@ -154,6 +157,11 @@ export function resolveCaps(p: ProjectConfig, defaults: Caps): Caps {
   };
 }
 
+/** Old configs and omitted keys are fail-closed at the enforcement boundary. */
+export function resolveReleasePolicy(p: ProjectConfig): ReleasePolicy {
+  return p.releasePolicy ?? DEFAULT_RELEASE_POLICY;
+}
+
 /**
  * Resolves a project by name, or the only project when the name is omitted.
  * Refuses to guess between several: picking one silently would spend the wrong
@@ -274,6 +282,14 @@ function normalizeProject(
 
   const escalation = normalizeEscalation(raw["escalation"], label, problems);
   const authority = normalizeAuthority(raw["authority"], label, problems);
+  const releasePolicy = pickLiteral(
+    raw["releasePolicy"],
+    RELEASE_POLICIES,
+    DEFAULT_RELEASE_POLICY,
+    `${label}: releasePolicy`,
+    RELEASE_POLICIES.map((value) => JSON.stringify(value)).join(" or "),
+    problems,
+  );
 
   const caps = coerceCaps(raw["caps"], `${label}: caps`, problems, legacyCaps);
   const reporting = normalizeReporting(raw["reporting"], label, problems);
@@ -299,6 +315,7 @@ function normalizeProject(
     ...(workerModel === undefined ? {} : { workerModel }),
     escalation,
     authority,
+    releasePolicy,
     reporting,
     workspaceRoot: expandHome(pickString(raw["workspaceRoot"], join(stateDir(), "worktrees"))),
     mirrorRoot: expandHome(pickString(raw["mirrorRoot"], join(stateDir(), "mirrors"))),

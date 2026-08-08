@@ -97,6 +97,18 @@ export type ReportScope = (typeof REPORT_SCOPES)[number];
 export const DEFAULT_REPORT_SCOPE: ReportScope = "material";
 
 /**
+ * Mechanical permission for release-shaped tool calls. `authority.release`
+ * says who owns the decision; this key is the enforcement gate that decides
+ * whether an autonomous session may invoke the tools at all.
+ */
+export const RELEASE_POLICIES = ["none", "operator-brief"] as const;
+
+export type ReleasePolicy = (typeof RELEASE_POLICIES)[number];
+
+/** Safe for old and partial configs: release/deploy tools stay closed. */
+export const DEFAULT_RELEASE_POLICY: ReleasePolicy = "none";
+
+/**
  * Who holds an authority the daemon itself never exercises. Declared as data
  * for the same reason as {@link REPORT_SCOPES}: the validator, the wizard and
  * the brief renderer all enumerate the same two holders, so a third one cannot
@@ -161,6 +173,12 @@ export interface ProjectConfig {
    * them is holding the merge button.
    */
   authority: { merge: AuthorityHolder; release: AuthorityHolder };
+  /**
+   * Tool-call enforcement for releases and deploys. Optional only for configs
+   * written before the tripwire existed; omission resolves fail-closed to
+   * {@link DEFAULT_RELEASE_POLICY}.
+   */
+  releasePolicy?: ReleasePolicy;
   /**
    * How loud the orchestrator is. Optional on disk — a config written before
    * this key existed loads as {@link DEFAULT_REPORT_SCOPE} — so read it through

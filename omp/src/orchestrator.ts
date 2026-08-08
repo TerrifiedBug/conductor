@@ -33,7 +33,8 @@ import { stateDir } from "./config.ts";
 import { formatEscalation } from "./escalate.ts";
 import { createSession, disposeSession } from "./omp.ts";
 import type { AgentSessionLike } from "./omp.ts";
-import type { Escalation } from "./types.ts";
+import type { ReleaseShape } from "./release-policy.ts";
+import type { Escalation, ReleasePolicy } from "./types.ts";
 
 /**
  * The session factory {@link startOrchestrator} uses. Named so the test seam
@@ -44,6 +45,8 @@ export type CreateSessionFn = (opts: {
   sessionDir?: string;
   model?: string;
   resume?: boolean;
+  releasePolicy?: ReleasePolicy;
+  onReleaseBlocked?: (shape: ReleaseShape) => void;
 }) => Promise<AgentSessionLike>;
 
 /**
@@ -76,6 +79,8 @@ export interface OrchestratorOpts {
   cwd: string;
   sessionDir?: string;
   model?: string;
+  releasePolicy?: ReleasePolicy;
+  onReleaseBlocked?: (shape: ReleaseShape) => void;
   /**
    * Standing orders — which repo, which labels, what the fleet is. Prepended to
    * the *first* injection rather than sent as its own prompt on startup: a
@@ -159,6 +164,8 @@ export async function startOrchestrator(o: OrchestratorOpts): Promise<Orchestrat
     cwd: o.cwd,
     sessionDir,
     ...(o.model === undefined ? {} : { model: o.model }),
+    ...(o.releasePolicy === undefined ? {} : { releasePolicy: o.releasePolicy }),
+    ...(o.onReleaseBlocked === undefined ? {} : { onReleaseBlocked: o.onReleaseBlocked }),
     // The whole point of a persistent orchestrator: a daemon restart must not
     // reset what it knows it has already escalated, or the first tick after a
     // deploy re-litigates every parked issue from scratch.

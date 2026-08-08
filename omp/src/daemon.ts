@@ -10,13 +10,14 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
-import { configPath, findProject, loadConfig, resolveCaps, stateDir } from "./config.ts";
+import { configPath, findProject, loadConfig, resolveCaps, resolveReleasePolicy, stateDir } from "./config.ts";
 import { createEscalator, escalationIssueRef } from "./escalate.ts";
 import { graphHint } from "./graph.ts";
 import { livingDaemon } from "./lifecycle.ts";
 import { STALL_MARKER_FILE } from "./orchestrator-tick.ts";
 import { startOrchestrator } from "./orchestrator.ts";
 import type { OrchestratorHandle } from "./orchestrator.ts";
+import { recordReleaseBlock } from "./release-policy.ts";
 import { branchName, route } from "./routing.ts";
 import type { Routed, UnroutableReason } from "./routing.ts";
 import { openStore } from "./store.ts";
@@ -667,6 +668,8 @@ async function handleIssue(d: Deps, r: Routed, attempt: number): Promise<void> {
         maxTurns: () => turnLimit?.maxTurns() ?? caps.workerMaxTurns,
         sessionDir,
         ...(project.workerModel === undefined ? {} : { model: project.workerModel }),
+        releasePolicy: resolveReleasePolicy(project),
+        onReleaseBlocked: (shape) => recordReleaseBlock(project.name, "worker", shape),
         onTurn: (n) => store.updateRun(runId, { turns: n }),
         onSpend: (usd) => store.updateRun(runId, { spendUsd: usd }),
         onKilled: () => {
@@ -1706,6 +1709,10 @@ export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
         "a time, freshness-checked against the base branch, per the Releases section of your POLICY.md."
       : "You never edit product code, push a branch, or merge a PR — a worker session edits and pushes, and a " +
         "human merges.",
+    `Release tool gate: releasePolicy=${resolveReleasePolicy(project)}. ` +
+      (resolveReleasePolicy(project) === "none"
+        ? "Release and deploy tool calls are mechanically blocked."
+        : "Release and deploy tool calls are permitted only by the operator brief."),
     "Handle each escalation below before the next one.",
   ].join("\n");
 
@@ -1723,7 +1730,12 @@ export async function runDaemon(o: DaemonOpts = {}): Promise<void> {
     log("orchestrator: external — tier-1 escalations post as issue comments for the external session's drain duty");
   } else {
     try {
-      orchestrator = await startOrchestrator({ cwd: stateDir(), brief });
+      orchestrator = await startOrchestrator({
+        cwd: stateDir(),
+        brief,
+        releasePolicy: resolveReleasePolicy(project),
+        onReleaseBlocked: (shape) => recordReleaseBlock(project.name, "orchestrator", shape),
+      });
       const transcript = orchestrator.sessionFile();
       log(`orchestrator session ready${transcript === undefined ? "" : ` · ${transcript}`}`);
     } catch (err) {

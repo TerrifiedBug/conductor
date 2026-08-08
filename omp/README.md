@@ -134,8 +134,11 @@ number of code repos, and both label names are yours to configure.
 omp plugin install omp-conductor
 ```
 
-From a checkout of the monorepo, `./setup.sh` links this plugin and the Herdr half
-after checking everything below.
+From a checkout of the monorepo, `./setup.sh` checks both plugins. It preserves
+an existing npm-managed `omp-conductor` and links only the Herdr half, so running
+setup on a release-based fleet cannot silently switch omp to mutable source.
+`./setup.sh install --force-link` is the explicit opt-in to link both checkout
+directories.
 
 ### Prerequisites
 
@@ -897,7 +900,9 @@ The config lives at `$OMP_CONDUCTOR_HOME/config.json`, or
 `~/.omp/conductor/config.json` when that variable is unset. It is written with mode
 `0600` in a directory created `0700`, because it carries chat ids and clone URLs.
 That same directory holds the SQLite store (`conductor.db`), the `paused` sentinel,
-the `sessions/` worker transcripts and the `orchestrator/` session directory.
+the `sessions/` worker transcripts, the `orchestrator/` session directory, and
+`release-policy-blocks.jsonl`, the append-only audit of mechanically rejected
+release/deploy calls.
 
 Runtime state lives elsewhere, under `$OMP_CONDUCTOR_RUNTIME_DIR` (default
 `~/.omp/run/daemons/omp-conductor`): `daemon.json`, a mode-`0600` pidfile written
@@ -984,6 +989,7 @@ A complete, valid config for one project with two target repos:
         "merge": "human",
         "release": "human"
       },
+      "releasePolicy": "none",
       "reporting": {
         "scope": "material"
       },
@@ -1011,6 +1017,7 @@ Field notes:
 | `escalation.fallbackToIssueComment` | Defaults to `true`. Absent means "yes, still tell me". |
 | `escalation.orchestrator` | Optional; `"embedded"` (default) or `"external"`. `external` means an orchestrator session already runs elsewhere: the daemon starts none, and tier-1 escalations post as issue comments for that session to drain. Any other value is an error. |
 | `authority` | Optional; `{ "merge": …, "release": … }`, each `"human"` (default) or `"orchestrator"`. It grants nothing to the daemon — it words the orchestrator's standing orders and the Releases paragraph of the rendered brief, so the config and the prompt cannot disagree about who holds the merge button. Unknown keys and any other value are errors, never folded to the default. |
+| `releasePolicy` | Optional; `"none"` (default) or `"operator-brief"`. `none` installs a pre-tool-call tripwire in worker, embedded-orchestrator and external-orchestrator sessions. It blocks `git tag`, tag pushes, package publishing, GitHub release creation and recognised deploy commands before execution. `operator-brief` opens that gate only for the procedure in the operator-owned brief. Unknown values are errors. Every rejection is written to `release-policy-blocks.jsonl`; the heartbeat carries that day's count into the daily digest so configured intent and observed behaviour cannot drift silently. This is the mechanical gate; `authority.release` still says who owns the decision. |
 | `reporting.scope` | Optional; `"material"` (default) or `"escalations"`. Every orchestrator tick appends the matching constraint line to its prompt, re-read from this file each tick — see [Your workflow vs. the package](#your-workflow-vs-the-package). It constrains what the session is told to report; it is not an outbound filter. A config written without the key keeps reporting material events. Any other value is an error, never folded to the default. |
 | `workspaceRoot` / `mirrorRoot` | Optional; default to `worktrees/` and `mirrors/` under the state directory. `~` is expanded. |
 
@@ -1326,7 +1333,7 @@ dispatcher. The brief is explicit about the boundary:
 | Run the repo's configured cheap gates, each from its listed `cwd`, over the whole tree. | Run docker or image builds, production builds, browser/e2e suites, or the full test suite on the shared host — CI owns the heavy gates. |
 | Review its whole diff, then commit and **push once**. One corrective push if CI is red. | Force-push, `git add -f`, or add AI/co-author attribution. Red twice means stop and report, not push a third time. |
 | Open a PR that links the issue, and watch CI to a verdict with `gh pr checks --watch`. | Run `gh pr merge`. **A worker never merges** — that one is absolute, whoever else holds the authority — so PRs land one at a time with a freshness re-check; two workers merging concurrently is how agent PRs clobber each other. Who *may* merge is the [`authority`](#configuration) answer, and it is never the worker. |
-| Escalate: ambiguity, a cross-repo contract, a needed credential, a product or data-migration decision, a blocking existing test, CI red twice, or most of the wall-clock budget burned. | **Cut a release**, push a tag, publish to npm, edit a deployment pin, deploy, or touch infrastructure or secrets — permanently out of scope. Releases are batched and decided outside this loop, so "this needs releasing" is a thing to report, never a task to take on. |
+| Escalate: ambiguity, a cross-repo contract, a needed credential, a product or data-migration decision, a blocking existing test, CI red twice, or most of the wall-clock budget burned. | **Under the default `releasePolicy: "none"`:** cut a release, push a tag, publish to npm, edit a deployment pin, deploy, or touch infrastructure or secrets. The harness blocks recognised release/deploy tool calls before they run and audits the attempt. A project may deliberately set `operator-brief` only after its operator-owned brief contains the exact release procedure; that opens the tool gate but does not change `authority.release`. |
 
 The worker ends with a seven-line evidence report (issue, PR, observed head SHA,
 state, gates, changed, next). A textual `pushed-green` claim is not success: the
@@ -1342,10 +1349,11 @@ which installs an inline harness extension that blocks `write` / `edit` /
 `routing.repos` is ever checked out — and the caps still bound *how much* work
 happens.
 
-**`bash` is not gated.** Its argument is an opaque shell string; pretending to
-parse it would be a false sense of security. The brief still forbids escaping
-via the shell, and the deploy-level answer is a least-privilege worker uid
-(below).
+General shell access is not confined to the worktree. Its argument is an opaque
+program, so the brief still forbids path escape and the deploy-level answer is a
+least-privilege worker uid (below). The narrower release-policy tripwire does
+inspect explicit command shapes such as `git tag`, `npm publish`, and deploy
+verbs; it blocks those before execution when `releasePolicy` is `none`.
 
 #### Integrity tripwire (package self-hash)
 

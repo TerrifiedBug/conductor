@@ -43,13 +43,19 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
-import { findProject, loadConfig } from "./config.ts";
+import { findProject, loadConfig, resolveReleasePolicy } from "./config.ts";
 import {
   briefPathForProject,
   policyPathForProject,
   refreshComposedBriefForProject,
 } from "./setup.ts";
-import { DEFAULT_REPORT_SCOPE, type ReportScope } from "./types.ts";
+import {
+  recordReleaseBlock,
+  releaseDecision,
+  releaseDriftDigestLine,
+  type ReleaseDecision,
+} from "./release-policy.ts";
+import { DEFAULT_RELEASE_POLICY, DEFAULT_REPORT_SCOPE, type ReportScope } from "./types.ts";
 
 /** The activation file. Absent means "this is not an orchestrator session". */
 export const TICK_CONFIG_FILE = ".conductor-tick.json";
@@ -982,17 +988,22 @@ function tick(pi: TickApi, ctx: TickContext, config: TickConfig, session: TickSe
   // expects ORCHESTRATOR.md / AGENTS.md to track the installed package.
   refreshComposedBriefBestEffort();
 
-  // A configured message owns the whole contract, reporting and delivery clauses
-  // included: an operator who wrote their own prompt did not ask for ours
-  // appended to it.
+  const scope = resolveTickScope();
+  // A configured message owns the ordinary reporting and delivery clauses. The
+  // mechanical release-policy drift line is different: it is the evidence that
+  // configured intent and observed tool use diverged, so no custom heartbeat may
+  // silently suppress it.
   let content = currentMessage(ctx.cwd, config);
   if (content === undefined) {
-    const scope = resolveTickScope();
     if (scope.fallback !== undefined && !session.scopeFallbackLogged) {
       session.scopeFallbackLogged = true;
       pi.logger.info(`[omp-conductor] tick reporting scope: using ${DEFAULT_REPORT_SCOPE} — ${scope.fallback}`);
     }
     content = `${defaultTickMessage(new Date(), scope.briefPath, scope.policyPath)}\n${TICK_SCOPE_CONSTRAINTS[scope.scope]}\n${TICK_DELIVERY_RULE}`;
+  }
+  if (scope.projectName !== undefined) {
+    const drift = releaseDriftDigestLine(scope.projectName);
+    if (drift !== undefined) content = `${content}\n${drift}`;
   }
 
   pi.sendMessage(
@@ -1056,6 +1067,58 @@ export default function orchestratorTickExtension(pi: TickApi): void {
   // counter is about this session's own queue. A second session in the same
   // process starts with both at zero.
   const session: TickSession = { scopeFallbackLogged: false, pendingSkips: 0 };
+  let releaseGateArmed = false;
+  const armReleaseGate = (): void => {
+    if (releaseGateArmed) return;
+    releaseGateArmed = true;
+    (pi as TickApi & {
+      on(
+        event: "tool_call",
+        handler: (
+          event: { toolName: string; input: Record<string, unknown> },
+          ctx: unknown,
+        ) => ReleaseDecision | undefined,
+      ): void;
+    }).on("tool_call", (event) => {
+      // Most tool calls are ordinary tracker/file work. Detect shape first so
+      // they do not re-read config or emit policy diagnostics.
+      const candidate = releaseDecision(DEFAULT_RELEASE_POLICY, event.toolName, event.input);
+      if (candidate === undefined) return undefined;
+      let projectName: string | undefined;
+      let policy = DEFAULT_RELEASE_POLICY;
+      let external = true;
+      try {
+        const project = findProject(loadConfig());
+        projectName = project.name;
+        policy = resolveReleasePolicy(project);
+        external = project.escalation.orchestrator === "external";
+      } catch (err) {
+        // A missing/unreadable config cannot open a release gate. Log only when
+        // a release-shaped call actually reaches this handler.
+        pi.logger.error(
+          `[omp-conductor] release policy unreadable; enforcing ${DEFAULT_RELEASE_POLICY}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+      if (policy === "operator-brief") return undefined;
+      // Embedded orchestrators carry the same tripwire inline through
+      // `createSession`; registering it here too would audit one rejection twice.
+      if (!external) return undefined;
+      if (projectName !== undefined) {
+        try {
+          recordReleaseBlock(projectName, "orchestrator", candidate.shape);
+        } catch (err) {
+          pi.logger.error(
+            `[omp-conductor] could not record release-policy block: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+      }
+      return candidate.decision;
+    });
+  };
 
   pi.on("session_start", (_event, ctx) => {
     if (decided) return;
@@ -1138,6 +1201,7 @@ export default function orchestratorTickExtension(pi: TickApi): void {
           return;
         }
         if (next.note !== undefined) pi.logger.error(`[omp-conductor] tick ownership: ${next.note}`);
+        armReleaseGate();
         armTickHeartbeat(pi, ctx, config, session);
         pi.logger.info(`[omp-conductor] orchestrator tick active: ownership resolved on retry`, { agentName });
       }, retryMs);
@@ -1151,6 +1215,7 @@ export default function orchestratorTickExtension(pi: TickApi): void {
       return;
     }
     if (ownership.note !== undefined) pi.logger.error(`[omp-conductor] tick ownership: ${ownership.note}`);
+    armReleaseGate();
     armTickHeartbeat(pi, ctx, config, session);
     decided = true;
     // Both gates are named at startup: "why is it not ticking?" is answered by

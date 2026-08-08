@@ -163,6 +163,7 @@ function fullAnswers(overrides: Partial<SetupAnswers> = {}): SetupAnswers {
     fallbackToIssueComment: false,
     reportScope: "escalations",
     authority: { merge: "orchestrator", release: "orchestrator" },
+    releasePolicy: "operator-brief",
     orchestratorMode: "external",
     writeOrchestratorBrief: false,
     ...overrides,
@@ -251,6 +252,7 @@ test("a first run asks no amend question and collects what it always collected",
     "confirm: Caps",
     "confirm: Merge authority",
     "confirm: Release authority",
+    "confirm: Release tool gate",
     "input: Worker model pattern (blank = harness default)",
     "confirm: Escalation fallback",
     "confirm: Orchestrator session",
@@ -280,6 +282,7 @@ test("a first run asks no amend question and collects what it always collected",
     caps: expectedDefaultCaps(),
     fallbackToIssueComment: true,
     authority: { merge: "human", release: "human" },
+    releasePolicy: "none",
     orchestratorMode: "embedded",
     reportScope: "material",
     writeOrchestratorBrief: false,
@@ -402,11 +405,11 @@ test("the amend menu shows each area's current value", async () => {
 
   const menu = d.menus.find((m) => m.title.startsWith("Which area"));
   expect(menu?.labels).toEqual([
-    `tracker & repos — veltrosecurity/veltro, queue "queued", "module:" → chad, vectorflow`,
+    "tracker & repos — veltrosecurity/veltro, queue \"queued\", \"module:\" → chad, vectorflow",
     "gates — chad: ruff check . @ backend, pnpm lint @ frontend; vectorflow: pnpm lint",
     "caps & worker model — 3 workers, 200 turns, 90m, $40/day, 1 failed attempt, 2 continuations — model anthropic/claude-…",
     "code graph — not configured — workers grep",
-    "authority — merge=orchestrator, release=orchestrator",
+    "authority — merge=orchestrator, release=orchestrator, releasePolicy=operator-brief",
     "escalation & triage — tier 2 pages Telegram 8236653927, no comment fallback, triage external",
     "reporting scope — escalations — escalations when they happen, plus one daily digest — silent otherwise",
     `orchestrator brief — none at ${join(project.workspaceRoot, ORCHESTRATOR_BRIEF_NAME)}`,
@@ -424,7 +427,11 @@ test("only the chosen area's questions are asked, whichever area it is", async (
     return d.asked.filter((a) => !a.startsWith("select:"));
   };
 
-  expect(await asked("authority")).toEqual(["confirm: Merge authority", "confirm: Release authority"]);
+  expect(await asked("authority")).toEqual([
+    "confirm: Merge authority",
+    "confirm: Release authority",
+    "confirm: Release tool gate",
+  ]);
   expect(await asked("caps & worker model")).toEqual([
     "confirm: Caps",
     "input: Worker model pattern (blank = harness default)",
@@ -444,10 +451,12 @@ test("re-interviewing a configured project pre-fills every prompt from it", asyn
   const d = dialogs({
     select: { "already configured": "Walk every question again" },
     confirm: {
-      // The two grants and the triage answer are the only questions whose "no" is
-      // a change: they start on no by design, so Enter revokes rather than renews.
+      // The grants, tool gate and triage answer are the only questions whose
+      // "no" is a change: they start on no by design, so Enter revokes rather
+      // than renews.
       "Merge authority": true,
       "Release authority": true,
+      "Release tool gate": true,
       "Orchestrator session": true,
       "Another repo?": [true, false],
     },
