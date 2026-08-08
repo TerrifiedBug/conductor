@@ -19,19 +19,22 @@ import {
   haltWithPane,
   hold,
   type KillFn,
+  paneLayerFromAgents,
   ompPidsFromProcessInfo,
   PANE_HALT_FILE,
   paneHaltPath,
   pidLiveness,
   pinPaneHalt,
+  probeTelegramHealth,
   releaseHold,
   resolvePaneHaltPath,
   sessionDirForCwd,
+  startHerdrFleet,
   stopConductorPane,
   transcriptHasUserCode,
 } from "./fleet.ts";
 import { setSystemctlForTest } from "./lifecycle.ts";
-import { TICK_CONFIG_FILE } from "./orchestrator-tick.ts";
+import { TICK_CONFIG_FILE, TICK_STATUS_FILE } from "./orchestrator-tick.ts";
 import { statusSnapshot } from "./daemon.ts";
 
 const HOME_KEY = "HOME";
@@ -666,6 +669,77 @@ test("fleetLayers separates pane liveness from recovery pin", () => {
   expect(["live", "missing", "unknown"]).toContain(layers.pane);
 });
 
+test("pane status uses the configured Herdr identity, not unrelated omp processes", () => {
+  const agents = [
+    { name: "other", paneId: "1", agent: "omp" },
+    {
+      name: "fleet",
+      paneId: "2",
+      agent: "omp",
+      sessionPath: "/root/.omp/agent/sessions/-.omp-conductor/session.jsonl",
+    },
+  ];
+  expect(paneLayerFromAgents(agents, "fleet")).toEqual({
+    kind: "live",
+    summary: "agent fleet pane 2",
+  });
+  expect(paneLayerFromAgents(agents, "missing")).toEqual({ kind: "missing" });
+});
+
+test("startHerdrFleet starts the installed unit and clears the pane recovery pin", () => {
+  writeMinimalConfig();
+  writeTick();
+  pinPaneHalt();
+  const calls: string[][] = [];
+  const result = startHerdrFleet(undefined, {
+    systemctl: (args) => {
+      calls.push(args);
+      if (args[0] === "show") return { ok: true, stdout: "loaded\n", stderr: "" };
+      if (args[0] === "start") return { ok: true, stdout: "", stderr: "" };
+      if (args[0] === "is-active") return { ok: true, stdout: "active\n", stderr: "" };
+      return { ok: false, stdout: "", stderr: `unexpected ${args.join(" ")}` };
+    },
+  });
+  expect(result).toEqual({ kind: "active", unit: "herdr-fleet.service", recoveryReleased: true });
+  expect(existsSync(paneHaltPath())).toBe(false);
+  expect(calls.map((args) => args[0])).toEqual(["show", "start", "is-active"]);
+});
+
+test("startHerdrFleet preserves standalone startup when the optional unit is absent", () => {
+  const result = startHerdrFleet(undefined, {
+    systemctl: () => ({ ok: true, stdout: "not-found\n", stderr: "" }),
+  });
+  expect(result).toEqual({ kind: "unmanaged", unit: "herdr-fleet.service", reason: "unit not installed" });
+});
+
+test("Telegram status proves API authentication and reports inbound degradation", async () => {
+  writeMinimalConfig();
+  writeTick();
+  writeChannel();
+  const ok = await probeTelegramHealth(undefined, async () =>
+    Response.json({ ok: true, result: { id: 1, is_bot: true, username: "fleet_bot" } }),
+  );
+  expect(ok).toEqual({ kind: "ok", detail: "@fleet_bot; inbound configured" });
+
+  writeFileSync(
+    join(process.env[TG_KEY]!, "access.json"),
+    JSON.stringify({ enabled: false, allowFrom: ["8236653927"] }),
+  );
+  const degraded = await probeTelegramHealth(undefined, async () =>
+    Response.json({ ok: true, result: { id: 1, is_bot: true, username: "fleet_bot" } }),
+  );
+  expect(degraded).toEqual({
+    kind: "degraded",
+    detail: "@fleet_bot; inbound bridge disabled (enabled !== true)",
+  });
+
+  const down = await probeTelegramHealth(undefined, async () =>
+    Response.json({ ok: false, error_code: 401, description: "Unauthorized" }, { status: 401 }),
+  );
+  expect(down.kind).toBe("down");
+  expect(down.detail).toContain("Unauthorized");
+});
+
 test("formatFleetStatus stacks dispatch/ticks/pane/recovery/herdr/daemon", () => {
   writeMinimalConfig();
   writeTick();
@@ -679,6 +753,27 @@ test("formatFleetStatus stacks dispatch/ticks/pane/recovery/herdr/daemon", () =>
   expect(text).toMatch(/herdr\s+/);
   expect(text).toContain("daemon    not running");
   expect(text).toContain("project   demo  (PAUSED)");
+});
+
+test("status prints the next scheduled tick and Telegram health", () => {
+  writeMinimalConfig();
+  const cwd = writeTick();
+  const nextTickAt = "2026-08-08T08:30:00.000Z";
+  writeFileSync(
+    join(cwd, TICK_STATUS_FILE),
+    JSON.stringify({ pid: process.pid, intervalSeconds: 600, nextTickAt }),
+  );
+  const layers = fleetLayers();
+  expect(layers.nextTickAt).toBe(nextTickAt);
+  const text = formatFleetStatus(
+    statusSnapshot(),
+    layers,
+    undefined,
+    { kind: "ok", detail: "@fleet_bot; inbound configured" },
+    Date.parse("2026-08-08T08:20:00.000Z"),
+  );
+  expect(text).toContain(`next tick ${nextTickAt}  (in 10m)`);
+  expect(text).toContain("telegram  ok  (@fleet_bot; inbound configured)");
 });
 
 test("formatFleetStatus prints daemon rss from /healthz when present", () => {

@@ -41,7 +41,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { findProject, loadConfig } from "./config.ts";
 import {
@@ -106,6 +106,43 @@ export const STALL_TICKS = 2;
  * the request until gates pass (or a human removes the file).
  */
 export const TICK_REQUESTED_FILE = ".conductor-tick-requested";
+
+/** Runtime heartbeat schedule consumed by `omp-conductor status`. */
+export const TICK_STATUS_FILE = ".conductor-tick-status.json";
+
+export interface TickRuntimeStatus {
+  pid: number;
+  intervalSeconds: number;
+  nextTickAt: string;
+}
+
+export function readTickRuntimeStatus(cwd: string): TickRuntimeStatus | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(join(cwd, TICK_STATUS_FILE), "utf8"));
+  } catch {
+    return undefined;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const row = parsed as Record<string, unknown>;
+  if (
+    typeof row["pid"] !== "number" ||
+    !Number.isInteger(row["pid"]) ||
+    row["pid"] <= 1 ||
+    typeof row["intervalSeconds"] !== "number" ||
+    !Number.isInteger(row["intervalSeconds"]) ||
+    row["intervalSeconds"] < MIN_INTERVAL_SECONDS ||
+    typeof row["nextTickAt"] !== "string" ||
+    !Number.isFinite(Date.parse(row["nextTickAt"]))
+  ) {
+    return undefined;
+  }
+  return {
+    pid: row["pid"],
+    intervalSeconds: row["intervalSeconds"],
+    nextTickAt: row["nextTickAt"],
+  };
+}
 
 /**
  * The marker's one line after its ISO timestamp, and the middle of the error
@@ -971,6 +1008,23 @@ function tick(pi: TickApi, ctx: TickContext, config: TickConfig, session: TickSe
   clearTickRequest(pi, ctx.cwd);
 }
 
+function writeTickRuntimeStatus(pi: TickApi, cwd: string, intervalSeconds: number): void {
+  const path = join(cwd, TICK_STATUS_FILE);
+  const tmp = `${path}.${process.pid}.tmp`;
+  const status: TickRuntimeStatus = {
+    pid: process.pid,
+    intervalSeconds,
+    nextTickAt: new Date(Date.now() + intervalSeconds * 1000).toISOString(),
+  };
+  try {
+    writeFileSync(tmp, `${JSON.stringify(status)}\n`);
+    renameSync(tmp, path);
+  } catch (err) {
+    rmSync(tmp, { force: true });
+    pi.logger.error(`[omp-conductor] could not write ${path}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 /**
  * Arm the interval heartbeat, then honour a recover poke if one is waiting.
  * Extracted so the ownership-retry path and the immediate-accept path cannot
@@ -978,7 +1032,14 @@ function tick(pi: TickApi, ctx: TickContext, config: TickConfig, session: TickSe
  * behaviour.
  */
 function armTickHeartbeat(pi: TickApi, ctx: TickContext, config: TickConfig, session: TickSession): void {
-  ctx.setInterval(() => tick(pi, ctx, config, session), config.intervalSeconds * 1000);
+  writeTickRuntimeStatus(pi, ctx.cwd, config.intervalSeconds);
+  ctx.setInterval(() => {
+    try {
+      tick(pi, ctx, config, session);
+    } finally {
+      writeTickRuntimeStatus(pi, ctx.cwd, config.intervalSeconds);
+    }
+  }, config.intervalSeconds * 1000);
   if (!existsSync(join(ctx.cwd, TICK_REQUESTED_FILE))) return;
   pi.logger.info("[omp-conductor] tick requested by recover — firing without waiting for the interval");
   tick(pi, ctx, config, session);

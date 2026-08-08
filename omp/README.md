@@ -331,12 +331,22 @@ The **Learning loop** proposes diffs against `POLICY.md` for you to approve over
    omp-conductor start
    ```
 
-   `start` does not report success until the daemon actually answers
-   `GET /healthz`. Spawning is not starting: a daemon whose config is broken, whose
-   port is taken or whose database is locked exits within a second, and a `start`
-   that printed "started" for it would hand you a lie you discover only when work
-   silently fails to be picked up. On failure the error quotes the tail of
-   `daemon.log`. It refuses to start a second daemon, naming the pid of the live one.
+   `start` first starts `herdr-fleet.service` when that optional unit is installed,
+   clearing a previous `halt --pane` recovery pin so Herdr can resume the exact
+   conductor pane. Hosts without systemd or without that unit keep the standalone
+   daemon behaviour. It then waits until the daemon actually answers
+   `GET /healthz`; spawning is not starting. A daemon whose config is broken,
+   whose port is taken or whose database is locked exits within a second, and the
+   command fails with the tail of `daemon.log` instead of printing a false
+   success. It refuses to start a second daemon, naming the live pid. Starting
+   processes does not clear `pause` or arm ticks; those remain explicit operator
+   decisions.
+
+   Pane recovery spans two separately installed plugins: npm ships the omp
+   heartbeat/status half, while `herdr-conductor` supplies `recover.sh`. After an
+   npm upgrade, refresh the Herdr plugin from `TerrifiedBug/conductor/herdr` as
+   well; publishing or installing npm alone cannot add the recovery-side tick
+   request.
 
    For a first run, take a single tick in the foreground and watch it:
 
@@ -366,7 +376,7 @@ Four control planes used to answer "stop" differently. The package verbs:
 
 `resume` clears pause only and **never re-arms**. `arm` is proof-gated: it sends a Telegram challenge and writes the arm marker only after your reply appears as a *user* turn in the orchestrator transcript. `halt --pane` targets the configured conductor agent only — it does **not** run `systemctl stop herdr-fleet`.
 
-`status` prints a layered header (`dispatch` / `ticks` / `pane` / `recovery` / `herdr` / `daemon`) so a paused fleet cannot hide an armed orchestrator still spending turns.
+`status` prints a layered header (`dispatch` / `ticks` / next tick time / `pane` / `recovery` / `herdr` / `telegram` / `daemon`) so a paused fleet cannot hide an armed orchestrator still spending turns. The Telegram line calls the official `getMe` endpoint to prove the token and API are usable without sending a message, then separately reports whether the inbound bridge is configured.
 
 `halt --pane` is **fail-closed**: it exits `0` only when the conductor agent is
 *proven* gone. It writes the recovery pin first, so a failed stop still cannot be
@@ -1164,6 +1174,7 @@ least of all on a fleet whose session lives somewhere else.
 
 ```bash
 omp-conductor start [--port N] [--project NAME]
+omp-conductor --version
 omp-conductor stop
 omp-conductor restart [--port N] [--project NAME]
 omp-conductor status [--project NAME]
@@ -1184,10 +1195,10 @@ omp-conductor help
 
 | Command | Behaviour |
 | --- | --- |
-| `start` | Spawn the loop in the background, detached, and wait until it answers `GET /healthz` on `:8787`. Refuses if one is already live, naming its pid. If the process dies or never serves, `start` cleans up after it and quotes the tail of `daemon.log`. |
+| `start` | Start `herdr-fleet.service` when that optional unit is installed, clearing a previous pane-recovery pin, then spawn the dispatch loop in the background and wait until it answers `GET /healthz` on `:8787`. Without systemd or that unit it keeps the standalone daemon behaviour. It never clears pause or arms ticks. Refuses if a daemon is already live, naming its pid; if the process dies or never serves, it cleans up and quotes the tail of `daemon.log`. |
 | `stop` | Prefer `systemctl stop omp-conductor.service` when that unit's MainPID is the live daemon — systemd then owns the stop and will not schedule a restart for the exit it just requested. Otherwise `SIGTERM`, then `SIGKILL` after a 10-second grace period. Prints `not running` when there is nothing to stop, and tags the confirmation with `(via systemctl)` when the unit path was used. |
 | `restart` | Prefer `systemctl restart` when the unit owns the live pid so the replacement stays supervised; otherwise `stop` then `start`, inheriting the running daemon's port and project unless a flag overrides them. The new process **salvages dirty live worktrees before orphaning** those rows — see [Deploying a new package onto a busy fleet](#deploying-a-new-package-onto-a-busy-fleet). |
-| `status [--project NAME]` | Layered fleet report first: `dispatch` / `ticks` / `pane` / `recovery` / `herdr` / `daemon`, then the project body (caps, active runs, today's usage). The `daemon` block includes `rss` from `/healthz` when the process is up (workers share that PID — see [host sizing](#host-sizing-and-memory)). While live workers > 0, prints a `deploy` line naming the count so a busy restart is visible before you take it. A `.conductor-stalled` marker in the state directory adds an `orchestrator   STALLED since …` line — see [the stall marker](#a-wedged-session-and-the-marker-that-notices). Reads while a daemon in another process writes. |
+| `status [--project NAME]` | Layered fleet report first: `dispatch` / `ticks` / next scheduled tick / `pane` / `recovery` / `herdr` / `telegram` / `daemon`, then the project body. The next time comes from the live heartbeat process, not a guess from log timestamps. Telegram health uses `getMe` to prove API authentication without sending a message and reports inbound bridge configuration separately. The daemon block includes `rss` from `/healthz`; live workers add a busy-deploy warning. A `.conductor-stalled` marker adds an `orchestrator STALLED since …` line. |
 | `hold [--project NAME]` | Soft stop: pause claiming **and** disarm ticks. Daemon and pane stay up. Prefer this over `pause` when the intent is "stop the conductor" without killing processes. See [Stop the conductor](#stop-the-conductor-hold--halt). |
 | `halt [--pane] [--project NAME]` | `hold`, then stop the dispatch daemon (systemctl-aware). Pane stays up unless `--pane` is passed. `halt --pane` also pins herdr-conductor recovery off for the conductor agent only — it does **not** stop `herdr-fleet.service` or any other herdr session. Fail-closed: exits nonzero unless the agent is proven gone. |
 | `arm [--project NAME]` | Proof-gated: send a Telegram challenge and write the arm marker only after your reply appears as a user turn in the orchestrator transcript. Never auto-armed by `resume` / `hold`. |
@@ -1201,6 +1212,7 @@ omp-conductor help
 | `--project NAME` | Pick the project to service. One daemon process serves exactly one project; with several configured projects the name is required. |
 | `pause` | Stop claiming new work only. The running daemon notices on its next tick; runs already in flight finish. The orchestrator heartbeat keeps ticking if armed — its gate is the arm marker, not this flag. Prefer `hold` to silence both. |
 | `resume` | Clear pause only — does **not** re-arm. Run `arm` after an inbound Telegram proof to resume ticks. |
+| `--version`, `-V`, `version` | Print the installed `omp-conductor` package version and exit `0`. Works from the global binary and npm/plugin install because it reads the package metadata beside the shipped CLI. |
 | `graph-setup` | Print how to set up the code-graph indexes workers query instead of grepping: a `git clone` for every index-only clone that does not exist yet, the one-shot index command per repo, and a `cbm-reindex.service` + `cbm-reindex.timer` pair generated from the project's own repos and branches. Reads only, so it is safe on a host where you are not root. Exits `1` when no repo in the project has [`graphProject`](#configuration) set, because the fix is a wizard answer rather than a flag. See [Code-graph discovery](#code-graph-discovery). |
 | `--write` | Only for `graph-setup`. Writes the refresh script into the state directory and the two units into `/etc/systemd/system`, then prints the exact `systemctl daemon-reload && systemctl enable --now cbm-reindex.timer` to run. It never runs `systemctl` itself and never enables anything: that needs root, and a package that enables system timers behind your back is one you cannot audit by reading its output. |
 | `brief-upgrade` | Inspect the package-floor + `POLICY.md` overlay. Reports by default; see [Keeping a brief current](#keeping-a-brief-current). |
