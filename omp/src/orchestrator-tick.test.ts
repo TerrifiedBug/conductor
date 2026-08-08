@@ -1194,6 +1194,7 @@ test("a `herdr agent list` that exits non-zero withholds the heartbeat but keeps
   expect(pi.logs.join("\n")).toContain("cannot yet prove this pane is the fleet agent");
   expect(pi.logs.join("\n")).toContain("tick pending");
   expect(pi.logs.join("\n")).not.toContain("tick active");
+  expect(pi.callTool("bash", { command: "npm publish --provenance" })).toMatchObject({ block: true });
 });
 
 test("a herdr blip costs a retry, not the fleet: the heartbeat arms once it answers", () => {

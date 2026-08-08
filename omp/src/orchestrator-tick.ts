@@ -1068,6 +1068,10 @@ export default function orchestratorTickExtension(pi: TickApi): void {
   // process starts with both at zero.
   const session: TickSession = { scopeFallbackLogged: false, pendingSkips: 0 };
   let releaseGateArmed = false;
+  // An activation file makes this a fleet directory before Herdr can prove
+  // which pane owns it. The gate therefore starts closed and only honours an
+  // operator-brief policy after ownership is accepted.
+  let releaseAuthorityAccepted = false;
   const armReleaseGate = (): void => {
     if (releaseGateArmed) return;
     releaseGateArmed = true;
@@ -1101,10 +1105,11 @@ export default function orchestratorTickExtension(pi: TickApi): void {
           }`,
         );
       }
-      if (policy === "operator-brief") return undefined;
+      if (releaseAuthorityAccepted && policy === "operator-brief") return undefined;
       // Embedded orchestrators carry the same tripwire inline through
-      // `createSession`; registering it here too would audit one rejection twice.
-      if (!external) return undefined;
+      // `createSession`; suppress this second copy only after this session has
+      // proved it owns the external heartbeat.
+      if (releaseAuthorityAccepted && !external) return undefined;
       if (projectName !== undefined) {
         try {
           recordReleaseBlock(projectName, "orchestrator", candidate.shape);
@@ -1143,6 +1148,10 @@ export default function orchestratorTickExtension(pi: TickApi): void {
       pi.logger.info(`[omp-conductor] orchestrator tick inactive: no ${TICK_CONFIG_FILE} in ${ctx.cwd}`);
       return;
     }
+
+    // Present but invalid still identifies a fleet directory. Install the
+    // fail-closed handler before validation or ownership can return early.
+    armReleaseGate();
 
     if (result.kind === "invalid") {
       const detail = `${result.path}: ${result.problem}`;
@@ -1201,7 +1210,7 @@ export default function orchestratorTickExtension(pi: TickApi): void {
           return;
         }
         if (next.note !== undefined) pi.logger.error(`[omp-conductor] tick ownership: ${next.note}`);
-        armReleaseGate();
+        releaseAuthorityAccepted = true;
         armTickHeartbeat(pi, ctx, config, session);
         pi.logger.info(`[omp-conductor] orchestrator tick active: ownership resolved on retry`, { agentName });
       }, retryMs);
@@ -1215,7 +1224,7 @@ export default function orchestratorTickExtension(pi: TickApi): void {
       return;
     }
     if (ownership.note !== undefined) pi.logger.error(`[omp-conductor] tick ownership: ${ownership.note}`);
-    armReleaseGate();
+    releaseAuthorityAccepted = true;
     armTickHeartbeat(pi, ctx, config, session);
     decided = true;
     // Both gates are named at startup: "why is it not ticking?" is answered by
