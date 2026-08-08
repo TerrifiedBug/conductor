@@ -604,14 +604,17 @@ test("disarm removes marker; arm requires inbound user-turn proof", async () => 
   expect(existsSync(r.path)).toBe(true);
 });
 
-test("arm refuses when channel is down — no force path", async () => {
+test("arm revalidation refuses a stale marker when the channel is down", async () => {
   writeMinimalConfig();
-  writeTick();
+  const cwd = writeTick();
+  const marker = join(cwd, "armed");
+  writeFileSync(marker, "stale\n");
   writeFileSync(
     join(process.env[TG_KEY]!, "access.json"),
     JSON.stringify({ enabled: false, allowFrom: ["1"] }),
   );
   await expect(armTicks()).rejects.toThrow(/channel is not up/);
+  expect(existsSync(marker)).toBe(true);
 });
 
 test("arm refuses when there is no tick config", async () => {
